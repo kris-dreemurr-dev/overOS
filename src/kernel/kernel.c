@@ -896,7 +896,7 @@ void kernel_main(void) {
     tty_init_core();
     sched_init();
 
-    task_create_kernel(tty1_task_entry, "tty1_shelel")->tty_id = 0;
+    task_create_kernel(tty1_task_entry, "tty1_shell")->tty_id = 0;
 
     __asm__ volatile ("sti");
     tsc_calibrate();
