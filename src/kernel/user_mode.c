@@ -238,7 +238,10 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
                     kputs("[!] sys_brk: Out of physical memory!\n", 0x00FF5555);
                     return (uint64_t)-1;
                 }
-                vmm_map_page((uint64_t*)curr->cr3, cur_page, (uint64_t)phys, VMM_FLAG_USER | VMM_FLAG_WRITABLE);
+                if (!vmm_map_page((uint64_t*)curr->cr3, cur_page, (uint64_t)phys, VMM_FLAG_USER | VMM_FLAG_WRITABLE)) {
+                    pmm_free_page(phys);   // не замапилась (нет памяти или адрес в identity-области ядра) — не теряем страницу
+                    return (uint64_t)-1;
+                }
                 curr->mem_size += 4096;
                 cur_page += 4096;
             }

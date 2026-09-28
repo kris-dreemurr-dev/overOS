@@ -8,7 +8,8 @@ typedef enum {
     TASK_READY,
     TASK_RUNNING,
     TASK_SLEEPING,
-    TASK_DEAD
+    TASK_DEAD,
+    TASK_ZOMBIE      // завершился, ждёт wait() от родителя
 } task_state_t;
 
 typedef struct task {
@@ -31,6 +32,13 @@ typedef struct task {
     uint64_t        saved_krsp;    // saved_kernel_rsp: низ ring0-стека для входа из Ring 3
     int             in_user;       // 1 = задача в Ring 3 или внутри своего сисколла
     char            open83[12];    // файл, открытый sys_open (свой у каждой программы)
+
+    // Самостоятельный процесс Ring 3 (свой ядерный стек), см. sched_spawn_process
+    struct task*    parent;        // кто ждёт завершения (оболочка, запустившая программу)
+    int             exit_code;
+    int             is_process;    // 1 = процесс Ring 3, а не поток ядра
+    uint64_t        user_entry;    // стартовый RIP в Ring 3
+    uint64_t        user_stack_top;// стартовый RSP в Ring 3
 } task_t;
 
 int  sched_tty_is_active(void);
@@ -52,6 +60,12 @@ task_t* sched_register_user_task(const char* name, uint64_t cr3, uint64_t mem_si
 void    sched_remove_user_task(task_t* task);
 
 task_t* task_create_user_process(void (*entry_point)(void), uint64_t cr3_val, const char* name);
+
+// Процессы (модель Unix: spawn + wait + exit)
+task_t* sched_spawn_process(const char* name, uint64_t cr3, uint64_t mem_size,
+                            uint64_t user_entry, uint64_t user_stack_top, uint64_t heap_start);
+int     sched_wait_child(task_t* child);   // родитель спит до завершения; освобождает всё, возвращает код выхода
+void    sched_exit_current(int code);      // завершает текущий процесс (не возвращается)
 
 void sched_set_current_task(task_t* t);
 

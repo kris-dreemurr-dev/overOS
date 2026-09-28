@@ -16,7 +16,7 @@ extern int fat16_read_file(const char* filename, uint8_t* buffer, uint32_t max_s
 uint8_t kernel_temp_buf[1024 * 1024 * 4] __attribute__((aligned(4096)));
 
 // Общий kernel_temp_buf: одновременно грузить программу может только одна задача
-static volatile int g_load_lock __attribute__((section(".data"))) = 0;
+static volatile int g_load_lock = 0;
 
 static void format_to_83(const char* src, char* dst) {
     for (int i = 0; i < 11; i++) dst[i] = ' ';
@@ -191,6 +191,12 @@ int prog_load_module(const char* filename, const char* args) {
     uint64_t old_task_cr3 = cur_task ? cur_task->cr3 : original_cr3;
     tty_t* my_tty = (cur_task && cur_task->tty_id >= 0) ? tty_get(cur_task->tty_id) : NULL;
 
+    // Страницы кучи (sys_brk) считаются в mem_size задачи, которая реально исполняется (оболочка).
+    // После выхода возвращаем прежние значения — иначе счётчик оболочки растёт с каждым запуском.
+    uint64_t sv_mem        = cur_task ? cur_task->mem_size   : 0;
+    uint64_t sv_heap_start = cur_task ? cur_task->heap_start : 0;
+    uint64_t sv_heap_end   = cur_task ? cur_task->heap_end   : 0;
+
     __asm__ volatile("cli");        // от смены cr3 до iretq вытеснять нельзя
     if (cur_task) {
         cur_task->cr3        = (uint64_t)proc_pml4;
@@ -206,7 +212,13 @@ int prog_load_module(const char* filename, const char* args) {
 
     // Сюда возвращаемся из сисколла exit (IF = 0)
     __asm__ volatile("cli");
-    if (cur_task) cur_task->cr3 = old_task_cr3;
+    if (cur_task) {
+        cur_task->cr3        = old_task_cr3;
+        cur_task->mem_size   = sv_mem;
+        cur_task->heap_start = sv_heap_start;
+        cur_task->heap_end   = sv_heap_end;
+        cur_task->open83[0]  = '\0';
+    }
     sched_set_foreground_task(NULL);
     if (my_tty) my_tty->gfx_mode = 0;
 

@@ -34,7 +34,7 @@ PART_SIZE_MB := 256
 # ==============================================================================
 # СИСТЕМНЫЕ МОДУЛИ (.SYS, Ring 0)
 # ==============================================================================
-MODULES     := mc redactor
+MODULES     := mc redactor memedit stress gpu cpu hwinfo
 MODULE_BINS := $(patsubst %, $(BUILD_DIR)/%.sys, $(MODULES))
 
 # ==============================================================================
@@ -69,6 +69,7 @@ C_SRC   := $(SRC_DIR)/kernel/kernel.c \
 
 OBJS    := $(BUILD_DIR)/entry_kernel.o \
            $(BUILD_DIR)/switch.o \
+		   $(BUILD_DIR)/smp_trampoline.o \
 		   $(BUILD_DIR)/interrupts.o \
            $(filter %.o, $(C_SRC:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o))
 
@@ -89,6 +90,10 @@ $(BUILD_DIR)/entry_kernel.o: $(SRC_DIR)/asm/entry_kernel.asm
 	$(NASM) -f elf64 $< -o $@
 
 $(BUILD_DIR)/switch.o: $(SRC_DIR)/asm/switch.asm
+	@mkdir -p $(dir $@)
+	$(NASM) -f elf64 $< -o $@
+
+$(BUILD_DIR)/smp_trampoline.o: $(SRC_DIR)/asm/smp_trampoline.asm
 	@mkdir -p $(dir $@)
 	$(NASM) -f elf64 $< -o $@
 

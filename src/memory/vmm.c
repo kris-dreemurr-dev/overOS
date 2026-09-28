@@ -145,6 +145,11 @@ int vmm_map_page(uint64_t* phys_pml4, uint64_t virt_addr, uint64_t phys_addr, ui
     }
 
     // 3. Уровень PD -> PT
+    // Запись PD может быть 2 МБ-страницей (identity-область ядра, бит PS = 0x80):
+    // принимать её за таблицу PT нельзя — PTE запишутся прямо в физическую память,
+    // а выделенные страницы потеряются.
+    if ((pd[pd_i] & VMM_FLAG_PRESENT) && (pd[pd_i] & 0x80)) return 0;
+
     uint64_t* pt;
     if (!(pd[pd_i] & VMM_FLAG_PRESENT)) {
         void* phys_pt = pmm_alloc_page();
@@ -189,12 +194,14 @@ uint64_t* vmm_clone_address_space(uint64_t* parent_pml4_phys) {
         
         for (int j = 0; j < 512; j++) {
             if (!(parent_pdpt[j] & VMM_FLAG_PRESENT)) continue;
+            if (i == 0 && j < 4) continue;   // общие с ядром PD identity-области: они уже есть у ребёнка
             
             uint64_t parent_pd_phys = parent_pdpt[j] & ~0xFFF;
             uint64_t* parent_pd = (uint64_t*)PHYS_TO_VIRT(parent_pd_phys);
             
             for (int k = 0; k < 512; k++) {
                 if (!(parent_pd[k] & VMM_FLAG_PRESENT)) continue;
+                if (parent_pd[k] & 0x80) continue;   // 2 МБ-страница, это не таблица PT
                 
                 uint64_t parent_pt_phys = parent_pd[k] & ~0xFFF;
                 uint64_t* parent_pt = (uint64_t*)PHYS_TO_VIRT(parent_pt_phys);
