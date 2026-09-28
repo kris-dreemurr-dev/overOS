@@ -7,6 +7,7 @@
 #include "sys_loader.h"
 #include "prog_loader.h"
 #include "sched.h"
+#include "config.h"
 
 #define MAX_INPUT 256
 extern char input_buffer[MAX_INPUT];
@@ -414,7 +415,7 @@ void execute_command(void) {
         }
         cmd_self_update(force_raw, update_boot);
     } else if (strcmp(cmd, "ver") == 0) {
-        kputs("devOS x86_64 (process patch) 1.0\n", 0xFFFF55);
+        kputs(OS_NAME " " OS_ARCH " (process patch) 1.0\n", 0xFFFF55);
     } else if (strcmp(cmd, "rus") == 0) {
         kputs("lang turned to russian\n", 0xFFFF55);
         kbd_layout = 1;

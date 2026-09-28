@@ -208,6 +208,11 @@ $(PART_IMG): $(BUILD_DIR)/kernel.bin $(BUILD_DIR)/boot_stage1.bin $(MODULE_BINS)
 	        echo ">>> Скопирован DOOM1.WAD в корень FAT16"; \
 	    fi; \
 	    mmd -i $@ ::CODE 2>/dev/null || true; \
+	    mmd -i $@ ::SYS 2>/dev/null || true; \
+	    if [ -f "$(SRC_DIR)/files/image/logo.bmp" ]; then \
+	        mcopy -i $@ $(SRC_DIR)/files/image/logo.bmp ::SYS/LOGO.BMP; \
+	        echo ">>> Скопирован LOGO.BMP в папку SYS на FAT16"; \
+	    fi; \
 	fi
 
 # ------------------------------------------------------------------------------

@@ -1,33 +1,21 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "../font/font.h"
-#include "../files/image/image.h"
 #include "../drivers/display.h"
 #include "../drivers/pci.h"
-#include "../files/image/sprite.h"
 #include "../fs/fat16.h"
 #include "../memory/pmm.h"
 #include "../memory/vmm.h"
 #include "user_mode.h"
 #include "sched.h"
 #include "tty.h"
+#include "config.h"
 
-#ifndef IMAGE_WIDTH
-#define IMAGE_WIDTH  320
-#endif
-#ifndef IMAGE_HEIGHT
-#define IMAGE_HEIGHT 240
-#endif
+#include "../files/image/sprite.h"
+#include "../files/image/image.h"
 
-// ==================== [ OS System Config ] ====================
-#define  OS_NAME            "overOS"
-#define  OS_LOWER_NAME      "overos"
-#define  OS_ARCH            "x86_64"
-#define  OS_VERSION         "0.0.1"
-int      kernel_debug =     1;
+int kernel_debug = 1;
 uint32_t current_bg_color = 0x000000;
-// =================================================================
-
 int mc_mode = 0;
 void init_mc_monitor(void) {}
 
@@ -527,7 +515,7 @@ uint32_t get_back_pixel(int x, int y) {
 }
 
 void print_prompt(void) {
-    kputs("root@devos:", 0x55FF55);
+    kputs("root@" OS_LOWER_NAME ":", 0x55FF55);
     kputs(current_path, 0x55FFFF);
     kputs("$ ", 0xFFFFFF);
     flush_buffer();
@@ -620,14 +608,14 @@ void cmd_fastfetch(void) {
     int text_x = sprite_x + FASTFETCH_WIDTH + 20;
     int text_y = start_y;
 
-    kputs_at(text_x, text_y, "root@devos", 0xFFFFFF); text_y += 18;
+    kputs_at(text_x, text_y, "root@" OS_LOWER_NAME, 0xFFFFFF); text_y += 18;
     kputs_at(text_x, text_y, "----------", 0xAAAAAA); text_y += 18;
 
     kputs_at(text_x, text_y, "OS:         ", 0x55FFFF);
-    kputs_at(text_x + 12 * 8, text_y, "devOS (x86_64)", 0xFFFFFF); text_y += 18;
+    kputs_at(text_x + 12 * 8, text_y, OS_NAME, 0xFFFFFF); text_y += 18;
 
     kputs_at(text_x, text_y, "Kernel:     ", 0x55FFFF);
-    kputs_at(text_x + 12 * 8, text_y, "devOS Custom VBE", 0xFFFFFF); text_y += 18;
+    kputs_at(text_x + 12 * 8, text_y, OS_NAME " (" OS_ARCH ")", 0xFFFFFF); text_y += 18;
 
     kputs_at(text_x, text_y, "Uptime:     ", 0x55FFFF);
     char uptime_msg[64] = "";
@@ -816,6 +804,123 @@ void print_tty_banner(int tty_id) {
     itoa(tty_id + 1, num_buf);
     kputs(num_buf, 0x55FFFF);
     kputs("\n\n", 0xFFFFFF);
+
+    kputs("Защита от ДОЛБАЁБОВ!!! не вытаскивайте флешку с ОС а если и вытащили не втыкайте, не поможет.\n\n", 0x00AA00);
+    fat16_dir();
+    kputs("\n", 0xFFFFFF);
+}
+
+// Вспомогательная функция форматирования под стандарт 8.3 для FAT16
+static void format_to_83(const char* src, char* dst) {
+    for (int i = 0; i < 11; i++) dst[i] = ' ';
+    int i = 0, d = 0;
+    while (src[i] && src[i] != '.' && d < 8) {
+        char c = src[i++];
+        if (c >= 'a' && c <= 'z') c -= 32;
+        dst[d++] = c;
+    }
+    if (src[i] == '.') {
+        i++;
+        d = 8;
+        while (src[i] && d < 11) {
+            char c = src[i++];
+            if (c >= 'a' && c <= 'z') c -= 32;
+            dst[d++] = c;
+        }
+    }
+}
+
+// Статический буфер для загрузки логотипа (512 КБ с запасом)
+static uint8_t bmp_load_buffer[512 * 1024];
+
+void render_boot_logo(void) {
+    char sys_dir[11];
+    format_to_83("SYS", sys_dir);
+    fat16_change_dir(sys_dir); // Переходим в системную папку SYS
+
+    char name83[11];
+    format_to_83("LOGO.BMP", name83);
+    int bytes = fat16_read_file(name83, bmp_load_buffer, sizeof(bmp_load_buffer));
+
+    fat16_go_root(); // Возвращаемся в корень файловой системы[cite: 26]
+
+    clear_screen(0x000000); // Чёрный экран по умолчанию 
+
+    // Если файл не найден или меньше минимального размера заголовка BMP (54 байта)
+    if (bytes <= 54) {
+        int text_x = (screen_width - (13 * 8)) / 2; 
+        int text_y = (screen_height / 2) - 8; 
+        kputs_at(text_x, text_y, "LOGO NOT FOUND", 0xFF5555); 
+        flush_buffer(); 
+        sleep_ms(3500); 
+        clear_screen(0x000000); 
+        flush_buffer(); 
+        return;
+    }
+
+    // Проверяем сигнатуру 'BM' (0x4D42)
+    uint16_t* signature = (uint16_t*)bmp_load_buffer;
+    if (*signature != 0x4D42) {
+        kputs_at(100, 100, "INVALID BMP FORMAT", 0xFF5555); 
+        flush_buffer(); 
+        sleep_ms(3500); 
+        clear_screen(0x000000); 
+        flush_buffer(); 
+        return;
+    }
+
+    // Читаем параметры из заголовка BMP
+    uint32_t data_offset = *(uint32_t*)(bmp_load_buffer + 10);
+    int32_t  bmp_width   = *(int32_t*)(bmp_load_buffer + 18);
+    int32_t  bmp_height  = *(int32_t*)(bmp_load_buffer + 22);
+    uint16_t bpp         = *(uint16_t*)(bmp_load_buffer + 28);
+
+    if (bpp != 24 && bpp != 32) {
+        kputs_at(100, 100, "UNSUPPORTED BMP BPP", 0xFF5555); 
+        flush_buffer(); 
+        sleep_ms(3500); 
+        clear_screen(0x000000); 
+        flush_buffer(); 
+        return;
+    }
+
+    int start_x = (screen_width - bmp_width) / 2; 
+    int start_y = (screen_height - (bmp_height < 0 ? -bmp_height : bmp_height)) / 2; 
+
+    uint8_t* pixel_data = bmp_load_buffer + data_offset;
+    int row_stride = ((bmp_width * (bpp / 8) + 3) & ~3);
+
+    int is_top_down = (bmp_height < 0);
+    int abs_height = is_top_down ? -bmp_height : bmp_height;
+
+    for (int y = 0; y < abs_height; y++) {
+        int src_y = is_top_down ? y : (abs_height - 1 - y);
+        int screen_y = start_y + y;
+
+        if (screen_y < 0 || screen_y >= screen_height) continue; 
+
+        uint8_t* row_ptr = pixel_data + (src_y * row_stride);
+
+        for (int x = 0; x < bmp_width; x++) {
+            int screen_x = start_x + x;
+            if (screen_x < 0 || screen_x >= screen_width) continue; 
+
+            uint8_t b = row_ptr[x * (bpp / 8) + 0];
+            uint8_t g = row_ptr[x * (bpp / 8) + 1];
+            uint8_t r = row_ptr[x * (bpp / 8) + 2];
+
+            uint32_t color = (r << 16) | (g << 8) | b;
+
+            if (color != 0x000000) {
+                put_pixel(screen_x, screen_y, color); 
+            }
+        }
+    }
+
+    flush_buffer(); 
+    sleep_ms(1500); 
+    clear_screen(0x000000); 
+    flush_buffer(); 
 }
 
 void kernel_main(void) {
@@ -846,7 +951,6 @@ void kernel_main(void) {
 
     lfb = (uint32_t*)lfb_phys;
 
-
     g_term_hook = 0;
     de_stream_idx = 0;
     de_stream_line[0] = '\0';
@@ -860,6 +964,9 @@ void kernel_main(void) {
     uint8_t pic_mask = inb(0x21);
     outb(0x21, pic_mask & ~0x01);  // Разрешаем IRQ0 (таймер) на контроллере PIC
 
+    __asm__ volatile ("sti");
+    tsc_calibrate();
+
     init_mc_monitor();
     init_ps2_mouse();
     clear_screen(0x000000);
@@ -867,27 +974,21 @@ void kernel_main(void) {
     ehci_init();
     clear_screen(0x000000);
     flush_buffer();
-    kputs("[", 0xFFFFFF); kputs(" OK ", 0x55FF55); kputs("] EHCI init\n", 0xFFFFFF);
+    kputs("[", 0xFFFFFF); kputs(" OK ", 0x00AA00); kputs("] EHCI init\n", 0xFFFFFF);
     flush_buffer();
-    sleep_ms(100);
-    kputs("[", 0xFFFFFF); kputs(" OK ", 0x55FF55); kputs("] Display driver init\n", 0xFFFFFF);
+    sleep_ms(250);
+    kputs("[", 0xFFFFFF); kputs(" OK ", 0x00AA00); kputs("] File System mounted\n", 0xFFFFFF);
     flush_buffer();
-    intel_set_backlight(100, 1);
-    sleep_ms(100);
-    kputs("[", 0xFFFFFF); kputs(" OK ", 0x55FF55); kputs("] File System mounted\n", 0xFFFFFF);
-    flush_buffer();
-    //fat16_dir();
     kputs("\n", 0xFFFFFF);
     flush_buffer();
-    sleep_ms(100);
-    kbd_layout = 0;
+    sleep_ms(250);
+    render_boot_logo();
+    sleep_ms(250);
+    kputs("[", 0xFFFFFF); kputs(" OK ", 0x00AA00); kputs("] Display driver init\n", 0xFFFFFF);
+    flush_buffer();
+    intel_set_backlight(100, 1);
+    sleep_ms(250);
 
-    kputs("DevOS (Дев-Билд) теперь на ", 0x55FF55);
-    kputs("ру", 0xFFFFFF);
-    kputs("сск", 0x2277FF);
-    kputs("ом\n\n", 0xFF2222);
-
-    kputs("Защита от ДОЛБАЁБОВ!!! не вытаскивайте флешку с ОС а если и вытащили не втыкайте, не поможет.\n\n", 0x55FF55);
 
     input_len = 0;
     for (int i = 0; i < MAX_INPUT; i++) {
@@ -899,8 +1000,7 @@ void kernel_main(void) {
 
     task_create_kernel(tty1_task_entry, "tty1_shell")->tty_id = 0;
 
-    __asm__ volatile ("sti");
-    tsc_calibrate();
+    kbd_layout = 0;
 
     uint8_t cursor_visible = 1;
     uint32_t last_blink = 0;
