@@ -13,15 +13,15 @@ typedef enum {
 } task_state_t;
 
 typedef struct task {
-    uint64_t        rsp;           // Смещение 0: текущий стек (для switch.asm)[cite: 16]
-    uint64_t        cr3;           // Смещение 8: физ. адрес PML4 (для switch.asm)[cite: 16]
-    uint64_t        kstack_top;    // Смещение 16: вершина стека[cite: 16]
-    uint64_t        kstack_bottom; // Физическое начало стека в RAM[cite: 16]
-    uint64_t        mem_size;      // Выделенная память (в байтах)[cite: 16]
-    uint64_t        pid;           // Идентификатор процесса[cite: 16]
-    char            name[16];      // Имя задачи[cite: 16]
-    task_state_t    state;         // Состояние[cite: 16]
-    struct task*    next;          // Следующий в Round-Robin[cite: 16]
+    uint64_t        rsp;           // Смещение 0: текущий стек (для switch.asm)
+    uint64_t        cr3;           // Смещение 8: физ. адрес PML4 (для switch.asm)
+    uint64_t        kstack_top;    // Смещение 16: вершина стека
+    uint64_t        kstack_bottom; // Физическое начало стека в RAM
+    uint64_t        mem_size;      // Выделенная память (в байтах)
+    uint64_t        pid;           // Идентификатор процесса
+    char            name[16];      // Имя задачи
+    task_state_t    state;         // Состояние
+    struct task*    next;          // Следующий в Round-Robin
     
     // Границы динамической памяти (Heap / brk)
     uint64_t        heap_start;    // Начало кучи (сразу за кодом)

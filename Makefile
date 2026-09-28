@@ -1,6 +1,6 @@
 # ==============================================================================
-# devOS Master Makefile
-# Архитектура: x86_64 Bare-Metal (64-bit Long Mode, MBR + FAT16)
+# overOS Master Makefile
+# Архитектура: x86_64 Bare-Metal (64-bit Long Mode, Two-Stage MBR + FAT16)
 # ==============================================================================
 
 BUILD_DIR    := build
@@ -10,7 +10,7 @@ CC    := gcc
 LD    := ld
 NASM  := nasm
 
-# Флаги компиляции 64-битного ядра и программ devOS
+# Флаги компиляции 64-битного ядра и программ overOS
 CFLAGS       := -m64 -std=c99 -ffreestanding -fno-pic -fno-pie -fno-stack-protector \
                 -mno-red-zone -mcmodel=kernel -U_FORTIFY_SOURCE -O2 -Wall -Wextra \
                 -mno-sse -mno-sse2 -mno-mmx
@@ -25,7 +25,6 @@ CFLAGS_PROG  := -m64 -std=c99 -ffreestanding -fno-pic -fno-pie -fno-stack-protec
 
 LDFLAGS      := -m elf_x86_64 -T linker.ld --oformat binary -no-pie
 PROG_LDFLAGS := -m elf_x86_64 -T user.ld --oformat binary -no-pie
-
 
 DISK_IMG     := $(BUILD_DIR)/os.img
 PART_IMG     := $(BUILD_DIR)/fat16_part.img
@@ -49,7 +48,7 @@ PROG_BINS   := $(patsubst $(PROG_DIR)/%.c, $(BUILD_DIR)/%.prg, $(PROG_SRCS))
 # ==============================================================================
 C_SRC   := $(SRC_DIR)/kernel/kernel.c \
            $(SRC_DIR)/kernel/main.c \
-		   $(SRC_DIR)/kernel/tty.c \
+           $(SRC_DIR)/kernel/tty.c \
            $(SRC_DIR)/kernel/sched.c \
            $(SRC_DIR)/kernel/user_mode.c \
            $(SRC_DIR)/kernel/sys_loader.c \
@@ -69,8 +68,8 @@ C_SRC   := $(SRC_DIR)/kernel/kernel.c \
 
 OBJS    := $(BUILD_DIR)/entry_kernel.o \
            $(BUILD_DIR)/switch.o \
-		   $(BUILD_DIR)/smp_trampoline.o \
-		   $(BUILD_DIR)/interrupts.o \
+           $(BUILD_DIR)/smp_trampoline.o \
+           $(BUILD_DIR)/interrupts.o \
            $(filter %.o, $(C_SRC:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o))
 
 # ==============================================================================
@@ -113,11 +112,17 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # ------------------------------------------------------------------------------
-# Загрузочный сектор (MBR / Bootsector, всегда 16 бит бинарник)
+# Двухстадийный загрузчик (Two-Stage Boot)
 # ------------------------------------------------------------------------------
-$(BUILD_DIR)/boot.bin: $(SRC_DIR)/asm/boot.asm
+$(BUILD_DIR)/boot_stage1.bin: $(SRC_DIR)/asm/boot_stage1.asm
 	@mkdir -p $(BUILD_DIR)
 	$(NASM) -f bin $< -o $@
+
+$(BUILD_DIR)/boot_stage2.bin: $(SRC_DIR)/asm/boot_stage2.asm
+	@mkdir -p $(BUILD_DIR)
+	$(NASM) -f bin $< -o $@
+	@# Строго выравниваем Stage 2 до 32 секторов (16 384 байт, LBA 1..32)
+	@truncate -s 16384 $@
 
 # ------------------------------------------------------------------------------
 # Двухпроходная сборка ядра с автоматической таблицей символов (ksyms)
@@ -181,15 +186,14 @@ $(BUILD_DIR)/%.prg: $(PROG_DIR)/%.c $(BUILD_DIR)/crt0.o user.ld
 # ------------------------------------------------------------------------------
 # Создание раздела FAT16 и упаковка софта
 # ------------------------------------------------------------------------------
-$(PART_IMG): $(BUILD_DIR)/kernel.bin $(BUILD_DIR)/boot.bin $(MODULE_BINS) $(PROG_BINS)
+$(PART_IMG): $(BUILD_DIR)/kernel.bin $(BUILD_DIR)/boot_stage1.bin $(MODULE_BINS) $(PROG_BINS)
 	@mkdir -p $(BUILD_DIR)
 	@echo ">>> Создаем раздел FAT16 на $(PART_SIZE_MB) МБ..."
 	@rm -f $@
 	@truncate -s $(PART_SIZE_MB)M $@
-	@mkfs.vfat -F 16 -n "DEVOS" $@ >/dev/null
+	@mkfs.vfat -F 16 -n "OVEROS" $@ >/dev/null
 	@if command -v mcopy >/dev/null 2>&1; then \
 	    mcopy -i $@ $(BUILD_DIR)/kernel.bin ::KERNEL.BIN; \
-	    mcopy -i $@ $(BUILD_DIR)/boot.bin ::BOOT.BIN; \
 	    for mod in $(MODULE_BINS); do \
 	        fname=$$(basename $$mod | tr 'a-z' 'A-Z'); \
 	        mcopy -i $@ $$mod ::$$fname; \
@@ -209,19 +213,26 @@ $(PART_IMG): $(BUILD_DIR)/kernel.bin $(BUILD_DIR)/boot.bin $(MODULE_BINS) $(PROG
 # ------------------------------------------------------------------------------
 # Сборка финального RAW-образа диска
 # ------------------------------------------------------------------------------
-$(DISK_IMG): $(BUILD_DIR)/boot.bin $(BUILD_DIR)/kernel.bin $(PART_IMG)
-	@echo ">>> Собираем полный образ диска с двумя разделами..."
+$(DISK_IMG): $(BUILD_DIR)/boot_stage1.bin $(BUILD_DIR)/boot_stage2.bin $(BUILD_DIR)/kernel.bin $(PART_IMG)
+	@echo ">>> Собираем полный образ диска с Two-Stage Boot..."
 	@rm -f $@
-	@cp $(BUILD_DIR)/boot.bin $@
+	@# 1. Записываем Stage 1 (LBA 0, 512 байт)
+	@cp $(BUILD_DIR)/boot_stage1.bin $@
+	@# 2. Выделяем ровно 1 МБ (2048 секторов) под загрузочную область
 	@truncate -s 1M $@
-	@dd if=$(BUILD_DIR)/kernel.bin of=$@ bs=512 seek=1 conv=notrunc status=none
+	@# 3. Записываем Stage 2 на LBA 1 (занимает ровно 32 сектора: 1..32)
+	@dd if=$(BUILD_DIR)/boot_stage2.bin of=$@ bs=512 seek=1 conv=notrunc status=none
+	@# 4. Записываем ядро kernel.bin строго начиная с LBA 33 (до 2047 сектора)
+	@dd if=$(BUILD_DIR)/kernel.bin of=$@ bs=512 seek=33 conv=notrunc status=none
+	@# 5. Прописываем стандартную таблицу MBR (Partition 1: Boot RAW, Partition 2: FAT16 с LBA 2048)
 	@python3 -c "import struct; f=open('$@','r+b'); \
 	    f.seek(446); \
 	    p1 = struct.pack('<BBBBBBBBII', 0x80, 0x00, 0x02, 0x00, 0x7F, 0x20, 0x20, 0x00, 1, 2047); \
 	    p2 = struct.pack('<BBBBBBBBII', 0x00, 0x20, 0x21, 0x00, 0x0E, 0xFE, 0xFF, 0xFF, 2048, $(PART_SIZE_MB)*2048); \
 	    f.write(p1 + p2 + b'\x00'*32 + b'\x55\xAA')"
+	@# 6. Дописываем раздел FAT16 (начиная ровно с 1 МБ / LBA 2048)
 	@cat $(PART_IMG) >> $@
-	@echo ">>> Готово: $(DISK_IMG) (x86_64) успешно собран."
+	@echo ">>> Готово: $(DISK_IMG) (overOS Two-Stage) успешно собран."
 
 # ------------------------------------------------------------------------------
 # Запуск в QEMU x86_64
@@ -237,7 +248,9 @@ run: all
 	    -no-shutdown \
 	    -device usb-ehci,id=ehci \
 	    -drive if=none,id=usb_drive,file=$(DISK_IMG),format=raw \
-	    -device usb-storage,bus=ehci.0,drive=usb_drive
+	    -device usb-storage,bus=ehci.0,drive=usb_drive \
+        -vga std -global VGA.vgamem_mb=2
+
 
 run-usb: all
 	qemu-system-x86_64 \
@@ -250,7 +263,8 @@ run-usb: all
 	    -no-shutdown \
 	    -device usb-ehci,id=ehci \
 	    -drive if=none,id=usb_drive,file=/dev/sdc,format=raw \
-	    -device usb-storage,bus=ehci.0,drive=usb_drive
+	    -device usb-storage,bus=ehci.0,drive=usb_drive \
+        -vga std -global VGA.vgamem_mb=2
 
 # ------------------------------------------------------------------------------
 # Быстрое обновление модулей и программ на уже размеченной флешке

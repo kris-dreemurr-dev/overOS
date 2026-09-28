@@ -127,8 +127,10 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
             char ebuf[16];
             itoa((int)arg1, ebuf);
             kputs(ebuf, 0xFFFFFF);
-            kputs("\n>>> [KERNEL 64] Restoring shell state...\n", 0x55FF55);
             flush_buffer();
+            // Настоящий процесс: становится ZOMBIE, будит родителя (wait) и не возвращается
+            if (caller && caller->is_process) sched_exit_current((int)arg1);
+            // Старый путь (run_in_user_mode): возврат в оболочку через saved_kernel_rsp
             kernel_exit_code = arg1; // Сохраняем код выхода в глобальную переменную
             return arg1;
 
@@ -365,7 +367,7 @@ case 22: return g_tsc_per_ms;
             str_to_fat83(filename, name83);
 
             // Читаем новый исполняемый файл в статический временный буфер ядра
-            extern uint8_t kernel_temp_buf[]; // Объявлен в prog_loader.c[cite: 28]
+            extern uint8_t kernel_temp_buf[]; // Объявлен в prog_loader.c
             int bytes = fat16_read_file(name83, kernel_temp_buf, 1024 * 1024 * 4);
             if (bytes <= 0) return (uint64_t)-1;
 
@@ -380,10 +382,10 @@ case 22: return g_tsc_per_ms;
             current->cr3 = (uint64_t)new_pml4;
             vmm_switch_directory(new_pml4);
 
-            // Мапим память под новый код (8 МБ)[cite: 28]
+            // Мапим память под новый код (8 МБ)
             uint32_t num_pages = (8 * 1024 * 1024) / 4096;
             for (uint32_t p = 0; p < num_pages; p++) {
-                uint64_t v_addr = PROG_LOAD_BASE + (p * 4096); // PROG_LOAD_BASE = 0x01000000[cite: 29]
+                uint64_t v_addr = PROG_LOAD_BASE + (p * 4096); // PROG_LOAD_BASE = 0x01000000
                 void* p_addr = pmm_alloc_page();
                 vmm_map_page(new_pml4, v_addr, (uint64_t)p_addr, VMM_FLAG_USER | VMM_FLAG_WRITABLE);
             }
@@ -532,6 +534,10 @@ void handle_user_crash_c(uint64_t fault_rip, uint64_t fault_rsp, uint64_t err_co
     print_hex64(fault_rsp);
     kputs("\n * Action:    Process killed. Safely returning to kernel shell.\n\n", 0x0055FF55);
     flush_buffer();
+
+    // Процесс с собственным стеком: завершаем как exit(-1), родитель получит код из wait
+    task_t* t = sched_get_current_task();
+    if (t && t->is_process) sched_exit_current(-1);   // не возвращается
 }
 
 __attribute__((naked)) static void default_isr_stub(void) {

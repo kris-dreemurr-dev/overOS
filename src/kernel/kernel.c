@@ -19,11 +19,12 @@
 #define IMAGE_HEIGHT 240
 #endif
 
-// ==================== [ devOS System Config ] ====================
-#define OS_NAME         "devOS"
-#define OS_ARCH         "x86_64"
-#define OS_VERSION      "0.0.1 tty patch"
-int kernel_debug = 1;
+// ==================== [ OS System Config ] ====================
+#define  OS_NAME            "overOS"
+#define  OS_LOWER_NAME      "overos"
+#define  OS_ARCH            "x86_64"
+#define  OS_VERSION         "0.0.1"
+int      kernel_debug =     1;
 uint32_t current_bg_color = 0x000000;
 // =================================================================
 
@@ -868,17 +869,17 @@ void kernel_main(void) {
     flush_buffer();
     kputs("[", 0xFFFFFF); kputs(" OK ", 0x55FF55); kputs("] EHCI init\n", 0xFFFFFF);
     flush_buffer();
-    sleep_ms(20);
+    sleep_ms(100);
     kputs("[", 0xFFFFFF); kputs(" OK ", 0x55FF55); kputs("] Display driver init\n", 0xFFFFFF);
     flush_buffer();
     intel_set_backlight(100, 1);
-    sleep_ms(20);
+    sleep_ms(100);
     kputs("[", 0xFFFFFF); kputs(" OK ", 0x55FF55); kputs("] File System mounted\n", 0xFFFFFF);
     flush_buffer();
-    fat16_dir();
+    //fat16_dir();
     kputs("\n", 0xFFFFFF);
     flush_buffer();
-    sleep_ms(20);
+    sleep_ms(100);
     kbd_layout = 0;
 
     kputs("DevOS (Дев-Билд) теперь на ", 0x55FF55);

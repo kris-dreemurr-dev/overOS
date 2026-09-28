@@ -40,15 +40,6 @@ static void format_to_83(const char* src, char* dst) {
 int prog_load_module(const char* filename, const char* args) {
     (void)args;
 
-    {
-    char b[16];
-    itoa((int)g_load_lock, b);
-    kputs("[dbg] lock=", 0xFFFF55);
-    kputs(b, 0xFFFFFF);
-    kputs("\n", 0xFFFFFF);
-    flush_buffer();
-    }
-
     while (__sync_lock_test_and_set(&g_load_lock, 1)) sched_yield();
 
     char name83[11];
@@ -151,7 +142,8 @@ int prog_load_module(const char* filename, const char* args) {
     }
 
     // 7. Копируем тело программы и зануляем секцию .bss
-    __asm__ volatile("cli");
+    uint64_t cp_flags;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(cp_flags) :: "memory");
     vmm_switch_directory(proc_pml4); 
 
     uint8_t* target = (uint8_t*)load_base;
@@ -167,71 +159,45 @@ int prog_load_module(const char* filename, const char* args) {
 
     __asm__ volatile("mov %0, %%cr3" :: "r"(original_cr3) : "memory"); 
     __sync_lock_release(&g_load_lock);   // kernel_temp_buf больше не нужен
-    __asm__ volatile("sti");
+    __asm__ volatile("pushq %0; popfq" :: "r"(cp_flags) : "memory", "cc");
 
-    // 8. Регистрация в планировщике
-    uint64_t total_mem = (num_image_pages + num_stack_pages) * 4096;
-    task_t* proc_task = sched_register_user_task(filename, (uint64_t)proc_pml4, total_mem);
+    // 8. Запускаем ОТДЕЛЬНЫЙ процесс: свой ядерный стек, своё адресное пространство.
+    //    Оболочка (текущая задача) остаётся сама собой и просто ждёт его завершения.
+    task_t* shell = sched_get_current_task();
+    tty_t*  my_tty = (shell && shell->tty_id >= 0) ? tty_get(shell->tty_id) : NULL;
 
-    if (proc_task) {
-        proc_task->heap_start = load_base + (num_image_pages * 4096);
-        proc_task->heap_end   = proc_task->heap_start;
-        
-        kputs("\n[devOS] Process registered in Scheduler! PID: ", 0x0055FF55);
-        itoa((int)proc_task->pid, bbuf);
-        kputs(bbuf, 0x00FFFFFF);
-        kputs("\n", 0x00FFFFFF);
+    uint64_t total_mem  = (uint64_t)(num_image_pages + num_stack_pages) * 4096;
+    uint64_t heap_start = load_base + (uint64_t)num_image_pages * 4096;
+
+    task_t* proc = sched_spawn_process(filename, (uint64_t)proc_pml4, total_mem,
+                                       entry_vaddr, stack_top, heap_start);
+    if (!proc) {
+        kputs("[!] Failed to spawn process\n", 0x00FF5555);
+        flush_buffer();
+        vmm_destroy_address_space(proc_pml4);
+        return -1;
     }
-    flush_buffer(); 
 
-    sched_dump_tasks();
+    kputs("[devOS] Process started, PID: ", 0x00AAAAAA);
+    itoa((int)proc->pid, bbuf);
+    kputs(bbuf, 0x00FFFFFF);
+    kputs("\n", 0x00FFFFFF);
+    flush_buffer();
 
-    // 9. Запуск процесса в Ring 3 (в задаче оболочки текущего TTY)
-    task_t* cur_task = sched_get_current_task();
-    uint64_t old_task_cr3 = cur_task ? cur_task->cr3 : original_cr3;
-    tty_t* my_tty = (cur_task && cur_task->tty_id >= 0) ? tty_get(cur_task->tty_id) : NULL;
+    if (my_tty) my_tty->gfx_mode = 1;      // курсор консоли не рисуем поверх программы
+    sched_set_foreground_task(proc);
 
-    // Страницы кучи (sys_brk) считаются в mem_size задачи, которая реально исполняется (оболочка).
-    // После выхода возвращаем прежние значения — иначе счётчик оболочки растёт с каждым запуском.
-    uint64_t sv_mem        = cur_task ? cur_task->mem_size   : 0;
-    uint64_t sv_heap_start = cur_task ? cur_task->heap_start : 0;
-    uint64_t sv_heap_end   = cur_task ? cur_task->heap_end   : 0;
+    // 9. Ждём завершения. Внутри: адресное пространство, ядерный стек и task_t
+    //    процесса освобождаются, из планировщика он убирается.
+    int exit_code = sched_wait_child(proc);
 
-    __asm__ volatile("cli");        // от смены cr3 до iretq вытеснять нельзя
-    if (cur_task) {
-        cur_task->cr3        = (uint64_t)proc_pml4;
-        cur_task->heap_start = load_base + (uint64_t)num_image_pages * 4096;
-        cur_task->heap_end   = cur_task->heap_start;
-        cur_task->open83[0]  = '\0';
-    }
-    if (my_tty) my_tty->gfx_mode = 1;   // курсор консоли не рисуем поверх программы
-    vmm_switch_directory(proc_pml4);
-    sched_set_foreground_task(proc_task);
-
-    int exit_code = run_in_user_mode((void (*)(void))entry_vaddr, (void*)stack_top);
-
-    // Сюда возвращаемся из сисколла exit (IF = 0)
-    __asm__ volatile("cli");
-    if (cur_task) {
-        cur_task->cr3        = old_task_cr3;
-        cur_task->mem_size   = sv_mem;
-        cur_task->heap_start = sv_heap_start;
-        cur_task->heap_end   = sv_heap_end;
-        cur_task->open83[0]  = '\0';
-    }
     sched_set_foreground_task(NULL);
     if (my_tty) my_tty->gfx_mode = 0;
 
-    // 10. Очистка ресурсов
-    __asm__ volatile("mov %0, %%cr3" :: "r"(original_cr3) : "memory");
-    if (proc_task) sched_remove_user_task(proc_task);
-    vmm_destroy_address_space(proc_pml4);
     kputs("\n[devOS] Process finished with exit code: ", 0x00AAAAAA);
     itoa(exit_code, bbuf);
     kputs(bbuf, 0x0055FF55);
     kputs("\n", 0x00AAAAAA);
     flush_buffer();
-
-    __asm__ volatile("sti");   // после сисколла IF остаётся 0 — возвращаем
     return exit_code;
 }
