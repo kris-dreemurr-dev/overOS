@@ -23,15 +23,14 @@
 #define VS_TEXT      0xD4D4D4
 
 typedef struct {
-    char name[16];
-    char fat_name[12];
-    char dir_path[64]; // Путь директории файла
+    char name[64];           // Полноценное длинное имя файла (LFN)
+    char dir_path[64];       // Путь директории файла
     char text[EDITOR_MAX_LINES][EDITOR_MAX_COLS];
     int cursor_row;
     int cursor_col;
     int scroll_row;
     int is_modified;
-    int file_type; // 0 = Text, 1 = .c, 2 = .h
+    int file_type;           // 0 = Text, 1 = .c, 2 = .h
 } editor_tab_t;
 
 static editor_tab_t tabs[MAX_TABS];
@@ -60,6 +59,12 @@ static int my_strlen(const char* s) {
     int len = 0;
     while (s[len]) len++;
     return len;
+}
+
+static void my_strcat(char* dest, const char* src) {
+    char* d = dest;
+    while (*d) d++;
+    while ((*d++ = *src++));
 }
 
 static void kputc_at(int x, int y, char c, uint32_t color) {
@@ -155,28 +160,9 @@ static int get_file_type(const char* filename) {
     return 0;
 }
 
-static void to_fat83(const char* in, char* out83) {
-    for (int i = 0; i < 11; i++) out83[i] = ' ';
-    out83[11] = '\0';
-    int i = 0;
-    while (*in && *in != '.' && i < 8) {
-        char c = *in++;
-        if (c >= 'a' && c <= 'z') c -= 32;
-        out83[i++] = c;
-    }
-    while (*in && *in != '.') in++;
-    if (*in == '.') in++;
-    int j = 8;
-    while (*in && j < 11) {
-        char c = *in++;
-        if (c >= 'a' && c <= 'z') c -= 32;
-        out83[j++] = c;
-    }
-}
-
 static void navigate_to_dir(const char* path) {
-    if (!fat16_is_mounted()) return;
-    fat16_go_root();
+    if (!fs_is_mounted()) return;
+    fs_go_root();
 
     // Если корень — фиксируем "/" и выходим
     if (!path || path[0] == '\0' || (path[0] == '/' && path[1] == '\0')) {
@@ -188,20 +174,17 @@ static void navigate_to_dir(const char* path) {
     if (*p == '/') p++;
 
     while (*p) {
-        char part[16];
+        char part[64]; // Увеличили буфер для поддержки длинных имен папок (LFN)
         int i = 0;
-        while (*p && *p != '/' && i < 15) part[i++] = *p++;
+        while (*p && *p != '/' && i < 63) part[i++] = *p++;
         part[i] = '\0';
         if (*p == '/') p++;
 
         if (part[0] == '\0') continue;
 
-        char n83[12];
-        to_fat83(part, n83);
-
-        if (!fat16_change_dir(n83)) {
-            fat16_make_folder(n83);
-            fat16_change_dir(n83);
+        if (!fs_change_dir(part)) {
+            fs_make_folder(part);
+            fs_change_dir(part);
         }
     }
 
@@ -268,19 +251,13 @@ static void load_single_file(const char* path) {
     active_tab = 0;
     my_strcpy(tabs[0].dir_path, dir);
 
-    int flen = 0;
-    while (file[flen] && flen < 15) {
-        char c = file[flen];
-        if (c >= 'A' && c <= 'Z') c += 32;
-        tabs[0].name[flen] = c;
-        flen++;
-    }
-    tabs[0].name[flen] = '\0';
+    // Сохраняем оригинальное имя файла во вкладке
+    my_strcpy(tabs[0].name, file);
     tabs[0].file_type = get_file_type(tabs[0].name);
-    to_fat83(file, tabs[0].fat_name);
 
     static char load_buf[EDITOR_MAX_LINES * EDITOR_MAX_COLS];
-    int r = fat16_read_file(tabs[0].fat_name, load_buf, sizeof(load_buf) - 1);
+    // Читаем файл по его полноценному имени через фасад fs
+    int r = fs_read_file(tabs[0].name, load_buf, sizeof(load_buf) - 1);
     if (r > 0) {
         load_buf[r] = '\0';
         load_buffer_to_tab(0, load_buf, r);
@@ -291,7 +268,7 @@ static void load_single_file(const char* path) {
 }
 
 static void create_project(const char* proj_name) {
-    char proj_dir[64] = "/CODE/";
+    char proj_dir[64] = "/Code/";
     int pidx = 6;
     for (int i = 0; proj_name[i] && pidx < 60; i++) {
         char c = proj_name[i];
@@ -304,7 +281,7 @@ static void create_project(const char* proj_name) {
 
     const char* template_c =
         "void main() {\n"
-        "    print(\"devOS Project Started!\\n\");\n"
+        "    print(\"overOS Project Started!\\n\");\n"
         "    int a = 20;\n"
         "    int b = 30;\n"
         "    print(\"Sum: \");\n"
@@ -312,8 +289,8 @@ static void create_project(const char* proj_name) {
         "    print(\"\\n\");\n"
         "}\n";
 
-    to_fat83("MAIN.C", tabs[0].fat_name);
-    fat16_write_file(tabs[0].fat_name, template_c, my_strlen(template_c));
+    // Записываем шаблон под полноценным именем "main.c"
+    fs_write_file("main.c", template_c, my_strlen(template_c));
 
     tab_count = 1;
     active_tab = 0;
@@ -325,64 +302,35 @@ static void create_project(const char* proj_name) {
 }
 
 static void scan_and_load_dir(const char* dir_path) {
-    if (!fat16_is_mounted()) fat16_mount(0);
+    if (!fs_is_mounted()) fs_mount(0);
     navigate_to_dir(dir_path);
 
-    static fat16_file_info_api_t file_list[MAX_TABS];
-    int raw_count = fat16_get_dir_files(file_list, MAX_TABS);
+    static fs_file_info_api_t file_list[MAX_TABS];
+    int raw_count = fs_get_dir_files(file_list, MAX_TABS);
 
     tab_count = 0;
     static char load_buf[EDITOR_MAX_LINES * EDITOR_MAX_COLS];
 
     for (int t = 0; t < raw_count && tab_count < MAX_TABS; t++) {
-        // Пропускаем системные записи каталогов FAT16: "." и ".."
-        if (file_list[t].name83[0] == '.' || file_list[t].name83[0] == ' ' || file_list[t].name83[0] == '\0') {
+        // Пропускаем скрытые файлы и пустые записи
+        if (file_list[t].name[0] == '.' || file_list[t].name[0] == '\0') {
             continue;
         }
 
-        char base[9], ext[4];
-        int b_len = 0;
-        for (int i = 0; i < 8; i++) {
-            char c = file_list[t].name83[i];
-            if (c != ' ' && c != '\0') {
-                if (c >= 'A' && c <= 'Z') c += 32;
-                base[b_len++] = c;
-            }
-        }
-        base[b_len] = '\0';
-
-        int e_len = 0;
-        for (int i = 8; i < 11; i++) {
-            char c = file_list[t].name83[i];
-            if (c != ' ' && c != '\0') {
-                if (c >= 'A' && c <= 'Z') c += 32;
-                ext[e_len++] = c;
-            }
-        }
-        ext[e_len] = '\0';
-
-        // Если это папка (нет расширения и это не корень проекта), не открываем её как текстовый файл
-        if (e_len == 0 && my_strcmp(base, "main") != 0 && my_strcmp(base, "test") != 0) {
-            // Это вложенная директория — пропускаем
+        // Если это директория (атрибут 0x10), пропускаем её
+        if (file_list[t].attr & 0x10) {
             continue;
         }
 
         int cur_tab = tab_count++;
         my_strcpy(tabs[cur_tab].dir_path, dir_path);
-
-        int idx = 0;
-        for (int i = 0; base[i] && idx < 12; i++) tabs[cur_tab].name[idx++] = base[i];
-        if (e_len > 0) {
-            tabs[cur_tab].name[idx++] = '.';
-            for (int i = 0; ext[i] && idx < 15; i++) tabs[cur_tab].name[idx++] = ext[i];
-        }
-        tabs[cur_tab].name[idx] = '\0';
+        
+        // Копируем полноценное имя файла из структуры fs_file_info_api_t напрямую!
+        my_strcpy(tabs[cur_tab].name, file_list[t].name);
         tabs[cur_tab].file_type = get_file_type(tabs[cur_tab].name);
 
-        for (int f = 0; f < 11; f++) tabs[cur_tab].fat_name[f] = file_list[t].name83[f];
-        tabs[cur_tab].fat_name[11] = '\0';
-
-        int read_bytes = fat16_read_file(tabs[cur_tab].fat_name, load_buf, sizeof(load_buf) - 1);
+        // Читаем содержимое файла по его реальному имени
+        int read_bytes = fs_read_file(tabs[cur_tab].name, load_buf, sizeof(load_buf) - 1);
         if (read_bytes > 0) {
             load_buf[read_bytes] = '\0';
             load_buffer_to_tab(cur_tab, load_buf, read_bytes);
@@ -397,8 +345,7 @@ static void scan_and_load_dir(const char* dir_path) {
             "void main() {\n"
             "    print(\"Hello Project!\\n\");\n"
             "}\n";
-        to_fat83("MAIN.C", tabs[0].fat_name);
-        fat16_write_file(tabs[0].fat_name, template_c, my_strlen(template_c));
+        fs_write_file("main.c", template_c, my_strlen(template_c));
 
         tab_count = 1;
         my_strcpy(tabs[0].dir_path, dir_path);
@@ -411,7 +358,7 @@ static void scan_and_load_dir(const char* dir_path) {
 }
 
 static void fs_save_active_tab(void) {
-    if (tab_count == 0 || !fat16_is_mounted()) return;
+    if (tab_count == 0 || !fs_is_mounted()) return;
 
     navigate_to_dir(tabs[active_tab].dir_path);
 
@@ -426,7 +373,8 @@ static void fs_save_active_tab(void) {
         save_buf[total_bytes++] = '\n';
     }
 
-    if (fat16_write_file(tabs[active_tab].fat_name, save_buf, total_bytes)) {
+    // Сохраняем файл по его полноценному имени (LFN)
+    if (fs_write_file(tabs[active_tab].name, save_buf, total_bytes)) {
         tabs[active_tab].is_modified = 0;
         int i = 0; const char* msg = "Saved to ";
         while (msg[i]) { status_msg[i] = msg[i]; i++; }
@@ -436,6 +384,8 @@ static void fs_save_active_tab(void) {
         int m = 0;
         while (tabs[active_tab].name[m] && i < 62) status_msg[i++] = tabs[active_tab].name[m++];
         status_msg[i] = '\0';
+    } else {
+        my_strcpy(status_msg, "Error: Failed to save file!");
     }
 }
 
@@ -858,12 +808,11 @@ static void resolve_project_path(const char* arg, char* out_path) {
         return;
     }
 
-    // Если указали просто имя проекта (например "cube"), разворачиваем в "/CODE/CUBE"
     out_path[0] = '/';
     out_path[1] = 'C';
-    out_path[2] = 'O';
-    out_path[3] = 'D';
-    out_path[4] = 'E';
+    out_path[2] = 'o';
+    out_path[3] = 'd';
+    out_path[4] = 'e';
     out_path[5] = '/';
     int idx = 6;
     for (int i = 0; arg[i] && idx < 60; i++) {
@@ -881,20 +830,19 @@ static void build_sys_binary(void) {
         return;
     }
 
-    // 1. Формируем дефолтное имя на основе текущего таба (без .c)
-    char sys_name[9] = {0};
+    // 1. Формируем дефолтное имя на основе текущего таба (без .c) — теперь без жесткого ограничения в 8 символов
+    char sys_name[32] = {0};
     int pos = 0;
-    for (int i = 0; tabs[active_tab].name[i] && tabs[active_tab].name[i] != '.' && pos < 8; i++) {
+    for (int i = 0; tabs[active_tab].name[i] && tabs[active_tab].name[i] != '.' && pos < 30; i++) {
         char c = tabs[active_tab].name[i];
-        if (c >= 'a' && c <= 'z') c -= 32;
-        // Разрешаем только латиницу, цифры, тире и подчеркивание для FAT 8.3
-        if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
+        // Разрешаем латиницу, цифры, точки, тире и подчеркивание
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.') {
             sys_name[pos++] = c;
         }
     }
     if (pos == 0) {
-        sys_name[0] = 'M'; sys_name[1] = 'A'; sys_name[2] = 'I'; sys_name[3] = 'N';
-        pos = 4;
+        my_strcpy(sys_name, "driver");
+        pos = 6;
     }
     sys_name[pos] = '\0';
 
@@ -909,7 +857,6 @@ static void build_sys_binary(void) {
 
         kputs_at(8, bottom_y + 3, "Build as: [", 0x55FF55);
         kputs_at(104, bottom_y + 3, sys_name, 0xFFFF55);
-        // Зафиксированное расширение и курсор
         kputc_at(104 + (pos * 8), bottom_y + 3, '_', 0xFFFFFF);
         kputs_at(104 + (pos * 8) + 10, bottom_y + 3, "].SYS  (Enter: Build | ESC: Cancel)", 0xAAAAAA);
         flush_buffer();
@@ -918,7 +865,7 @@ static void build_sys_binary(void) {
         if (status & 1) {
             uint8_t sc = inb(0x60);
             
-            // ФИКС МЫШИ: защищаем ввод имени бинарника от тачпада
+            // Защита ввода от пакетов мыши
             if (status & 0x20) continue;
             if (sc & 0x80) continue;
 
@@ -928,7 +875,7 @@ static void build_sys_binary(void) {
                 return;
             }
 
-            // Enter — собираем с выбранным именем
+            // Enter — подтверждение
             if (sc == 0x1C) {
                 if (pos > 0) {
                     confirmed = 1;
@@ -946,11 +893,9 @@ static void build_sys_binary(void) {
             }
 
             char ch = get_char_for_scancode(sc);
-            if (ch >= 'a' && ch <= 'z') ch -= 32; // Всегда в верхний регистр для FAT 8.3
-
-            // Ограничение FAT 8.3: имя не более 8 символов
-            if (pos < 8) {
-                if ((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_') {
+            // Убран принудительный капслок, разрешаем полноценные символы в имени
+            if (ch >= 32 && ch <= 126 && pos < 30) {
+                if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.') {
                     sys_name[pos++] = ch;
                     sys_name[pos] = '\0';
                 }
@@ -974,7 +919,6 @@ static void build_sys_binary(void) {
     }
     full_src[p_idx] = '\0';
 
-    // Вместо set_compiler_target_sys(1):
     set_compiler_target(TARGET_SYS);
     int ok = compile_source_to_x86(full_src);
     set_compiler_target(TARGET_JIT);
@@ -1002,32 +946,24 @@ static void build_sys_binary(void) {
 
     int total_sys_size = sizeof(sys_header_t) + code_size;
 
-    // 5. Заполнение FAT 8.3 имени (ровно 11 байт: 8 байт имя + 3 байта расширение SYS)
-    char out_name83[12];
-    for (int i = 0; i < 11; i++) out_name83[i] = ' ';
-    out_name83[11] = '\0';
-
-    for (int i = 0; i < pos; i++) {
-        out_name83[i] = sys_name[i];
-    }
-    out_name83[8]  = 'S';
-    out_name83[9]  = 'Y';
-    out_name83[10] = 'S';
+    // 5. Формируем единое имя файла с расширением .sys без 8.3 ограничений
+    char out_filename[64];
+    my_strcpy(out_filename, sys_name);
+    my_strcat(out_filename, ".sys");
 
     // 6. Запись в корень диска
-    fat16_go_root();
-    if (fat16_write_file(out_name83, (const char*)sys_file_buffer, total_sys_size)) {
+    fs_go_root();
+    if (fs_write_file(out_filename, (const char*)sys_file_buffer, total_sys_size)) {
         navigate_to_dir(tabs[active_tab].dir_path);
 
         char msg[64] = "Built: /";
         int m = 8;
-        for (int i = 0; i < pos; i++) msg[m++] = sys_name[i];
-        msg[m++] = '.'; msg[m++] = 'S'; msg[m++] = 'Y'; msg[m++] = 'S';
+        for (int i = 0; out_filename[i] && m < 60; i++) msg[m++] = out_filename[i];
         msg[m] = '\0';
         my_strcpy(status_msg, msg);
     } else {
         navigate_to_dir(tabs[active_tab].dir_path);
-        my_strcpy(status_msg, "Write to FAT16 failed!");
+        my_strcpy(status_msg, "Write to fs failed!");
     }
 }
 
@@ -1038,19 +974,18 @@ static void build_prg_binary(void) {
         return;
     }
 
-    // 1. Формируем имя по умолчанию (до 8 символов FAT 8.3)
-    char prg_name[9] = {0};
+    // 1. Формируем имя по умолчанию без ограничения 8.3
+    char prg_name[32] = {0};
     int pos = 0;
-    for (int i = 0; tabs[active_tab].name[i] && tabs[active_tab].name[i] != '.' && pos < 8; i++) {
+    for (int i = 0; tabs[active_tab].name[i] && tabs[active_tab].name[i] != '.' && pos < 30; i++) {
         char c = tabs[active_tab].name[i];
-        if (c >= 'a' && c <= 'z') c -= 32;
-        if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.') {
             prg_name[pos++] = c;
         }
     }
     if (pos == 0) {
-        prg_name[0] = 'T'; prg_name[1] = 'E'; prg_name[2] = 'S'; prg_name[3] = 'T';
-        pos = 4;
+        my_strcpy(prg_name, "app");
+        pos = 3;
     }
     prg_name[pos] = '\0';
 
@@ -1096,10 +1031,8 @@ static void build_prg_binary(void) {
             }
 
             char ch = get_char_for_scancode(sc);
-            if (ch >= 'a' && ch <= 'z') ch -= 32;
-
-            if (pos < 8) {
-                if ((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_') {
+            if (ch >= 32 && ch <= 126 && pos < 30) {
+                if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.') {
                     prg_name[pos++] = ch;
                     prg_name[pos] = '\0';
                 }
@@ -1142,7 +1075,6 @@ static void build_prg_binary(void) {
         prg_file_buffer[i] = jit_buffer[i];
     }
 
-    // Дописываем строковые литералы по смещению 0x2000
     extern char string_pool[4096];
     extern int string_pool_idx;
     for (int i = 0; i < string_pool_idx; i++) {
@@ -1151,32 +1083,24 @@ static void build_prg_binary(void) {
 
     int total_prg_size = 0x2000 + string_pool_idx;
 
-    // 5. Имя файла FAT 8.3: 8 символов + PRG
-    char out_name83[12];
-    for (int i = 0; i < 11; i++) out_name83[i] = ' ';
-    out_name83[11] = '\0';
-
-    for (int i = 0; i < pos; i++) {
-        out_name83[i] = prg_name[i];
-    }
-    out_name83[8]  = 'P';
-    out_name83[9]  = 'R';
-    out_name83[10] = 'G';
+    // 5. Формируем единое имя файла с расширением .prg без 8.3 ограничений
+    char out_filename[64];
+    my_strcpy(out_filename, prg_name);
+    my_strcat(out_filename, ".prg");
 
     // 6. Запись файла в корень диска
-    fat16_go_root();
-    if (fat16_write_file(out_name83, (const char*)prg_file_buffer, total_prg_size)) {
+    fs_go_root();
+    if (fs_write_file(out_filename, (const char*)prg_file_buffer, total_prg_size)) {
         navigate_to_dir(tabs[active_tab].dir_path);
 
         char msg[64] = "Built: /";
         int m = 8;
-        for (int i = 0; i < pos; i++) msg[m++] = prg_name[i];
-        msg[m++] = '.'; msg[m++] = 'P'; msg[m++] = 'R'; msg[m++] = 'G';
+        for (int i = 0; out_filename[i] && m < 60; i++) msg[m++] = out_filename[i];
         msg[m] = '\0';
         my_strcpy(status_msg, msg);
     } else {
         navigate_to_dir(tabs[active_tab].dir_path);
-        my_strcpy(status_msg, "Write to FAT16 failed!");
+        my_strcpy(status_msg, "Write to fs failed!");
     }
 }
 
@@ -1203,7 +1127,7 @@ void run_editor(const char* args) {
             resolve_project_path(proj, pdir);
             scan_and_load_dir(pdir);
         } else {
-            scan_and_load_dir("/CODE");
+            scan_and_load_dir("/Code");
         }
     } else if (args && args[0] != '\0') {
         int has_extension = 0;
@@ -1219,7 +1143,7 @@ void run_editor(const char* args) {
             scan_and_load_dir(pdir);
         }
     } else {
-        scan_and_load_dir("/CODE");
+        scan_and_load_dir("/Code");
     }
 
     draw_editor_ui();
@@ -1322,7 +1246,7 @@ void run_editor(const char* args) {
 
             // F7: Пересканировать воркспейс
             if (scancode == 0x41) {
-                const char* cur_dir = (tab_count > 0 && tabs[active_tab].dir_path[0]) ? tabs[active_tab].dir_path : "/CODE";
+                const char* cur_dir = (tab_count > 0 && tabs[active_tab].dir_path[0]) ? tabs[active_tab].dir_path : "/Code";
                 scan_and_load_dir(cur_dir);
                 draw_editor_ui();
                 continue;
@@ -1392,7 +1316,7 @@ void run_editor(const char* args) {
         sleep_ms(5);
     }
 
-    // 3. Возвращаем FAT16 и указатель current_path точно на место старта
+    // 3. Возвращаем fs и указатель current_path точно на место старта
     navigate_to_dir(saved_path);
     console_restore_state();
 }

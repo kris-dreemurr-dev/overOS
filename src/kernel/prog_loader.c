@@ -11,31 +11,12 @@ extern void kputc(char c, uint32_t color);
 extern void clear_screen(uint32_t color);
 extern void flush_buffer(void);
 extern void itoa(int n, char* str);
-extern int fat16_read_file(const char* filename, uint8_t* buffer, uint32_t max_size);
+extern int fs_read_file(const char* filename, uint8_t* buffer, uint32_t max_size);
 
 uint8_t kernel_temp_buf[1024 * 1024 * 4] __attribute__((aligned(4096)));
 
 // Общий kernel_temp_buf: одновременно грузить программу может только одна задача
 static volatile int g_load_lock = 0;
-
-static void format_to_83(const char* src, char* dst) {
-    for (int i = 0; i < 11; i++) dst[i] = ' ';
-    int i = 0, d = 0;
-    while (src[i] && src[i] != '.' && d < 8) {
-        char c = src[i++];
-        if (c >= 'a' && c <= 'z') c -= 32;
-        dst[d++] = c;
-    }
-    if (src[i] == '.') {
-        i++;
-        d = 8;
-        while (src[i] && d < 11) {
-            char c = src[i++];
-            if (c >= 'a' && c <= 'z') c -= 32;
-            dst[d++] = c;
-        }
-    }
-}
 
 int prog_load_module(const char* filename, const char* args) {
     (void)args;
@@ -43,7 +24,6 @@ int prog_load_module(const char* filename, const char* args) {
     while (__sync_lock_test_and_set(&g_load_lock, 1)) sched_yield();
 
     char name83[11];
-    format_to_83(filename, name83);
 
     kputs("[devOS] Loading program ", 0x00AAAAAA); 
     kputs(filename, 0x00FFFFFF); 
@@ -54,7 +34,7 @@ int prog_load_module(const char* filename, const char* args) {
     // Диск трогаем с выключенными прерываниями: чтобы сисколл другой программы не вошёл в FAT посреди чтения
     uint64_t rd_flags;
     __asm__ volatile("pushfq; popq %0; cli" : "=r"(rd_flags) :: "memory");
-    int bytes = fat16_read_file(name83, kernel_temp_buf, sizeof(kernel_temp_buf));
+    int bytes = fs_read_file(filename, kernel_temp_buf, sizeof(kernel_temp_buf));
     __asm__ volatile("pushq %0; popfq" :: "r"(rd_flags) : "memory", "cc"); 
     if (bytes <= 0) {
         kputs("[!] Executable not found or read error.\n", 0x00FF5555); 

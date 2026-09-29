@@ -1,6 +1,6 @@
 #include "ehci.h"
 #include "ehci-msc.h"
-#include "../../fs/fat16.h"
+#include "../../fs/fs.h"
 
 extern void kdebug(const char* str, uint32_t color);
 extern void itoa(int n, char* str);
@@ -431,8 +431,8 @@ static void ehci_dump_flash_drive(uint8_t dev_addr, uint8_t max_packet0) {
 
                 if (boot_sig == 0xAA55) {
                     kdebug(" (VALID 0x55AA - Ready to mount FAT!)\n", 0x55FF55);
-                    if (fat16_mount(0)) {
-                    fat16_dir();
+                    if (fs_mount(0)) {
+                    fs_dir();
                 }
                 } else {
                     kdebug(" (No 0x55AA signature)\n", 0xFFAA00);

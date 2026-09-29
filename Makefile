@@ -1,6 +1,6 @@
 # ==============================================================================
 # overOS Master Makefile
-# Архитектура: x86_64 Bare-Metal (64-bit Long Mode, Two-Stage MBR + FAT16)
+# Архитектура: x86_64 Bare-Metal (64-bit Long Mode, Two-Stage MBR + FAT32)
 # ==============================================================================
 
 BUILD_DIR    := build
@@ -27,8 +27,8 @@ LDFLAGS      := -m elf_x86_64 -T linker.ld --oformat binary -no-pie
 PROG_LDFLAGS := -m elf_x86_64 -T user.ld --oformat binary -no-pie
 
 DISK_IMG     := $(BUILD_DIR)/os.img
-PART_IMG     := $(BUILD_DIR)/fat16_part.img
-PART_SIZE_MB := 256
+PART_IMG     := $(BUILD_DIR)/fat32_part.img
+PART_SIZE_MB := 512
 
 # ==============================================================================
 # СИСТЕМНЫЕ МОДУЛИ (.SYS, Ring 0)
@@ -42,6 +42,11 @@ MODULE_BINS := $(patsubst %, $(BUILD_DIR)/%.sys, $(MODULES))
 PROG_DIR    := $(SRC_DIR)/programs
 PROG_SRCS   := $(wildcard $(PROG_DIR)/*.c)
 PROG_BINS   := $(patsubst $(PROG_DIR)/%.c, $(BUILD_DIR)/%.prg, $(PROG_SRCS))
+
+# Пути к DOOM
+DOOM_DIR    := $(SRC_DIR)/files/progs/DOOM
+DOOM_PRG    := $(DOOM_DIR)/DOOM.PRG
+DOOM_WAD    := $(DOOM_DIR)/DOOM1.WAD
 
 # ==============================================================================
 # ИСХОДНЫЕ ФАЙЛЫ ЯДРА
@@ -64,7 +69,9 @@ C_SRC   := $(SRC_DIR)/kernel/kernel.c \
            $(SRC_DIR)/drivers/pci.c \
            $(SRC_DIR)/drivers/usb/ehci.c \
            $(SRC_DIR)/drivers/usb/ehci-msc.c \
-           $(SRC_DIR)/fs/fat16.c
+           $(SRC_DIR)/fs/fat16.c \
+           $(SRC_DIR)/fs/fat32.c \
+           $(SRC_DIR)/fs/fs.c
 
 OBJS    := $(BUILD_DIR)/entry_kernel.o \
            $(BUILD_DIR)/switch.o \
@@ -82,12 +89,25 @@ modules: $(MODULE_BINS)
 progs: $(PROG_BINS)
 
 # ------------------------------------------------------------------------------
-# Ассемблерные файлы ядра ELF64
+# Ассемблерные файлы загрузчика и точки входа (папка src/boot)
 # ------------------------------------------------------------------------------
-$(BUILD_DIR)/entry_kernel.o: $(SRC_DIR)/asm/entry_kernel.asm
+$(BUILD_DIR)/entry_kernel.o: $(SRC_DIR)/boot/entry_kernel.asm
 	@mkdir -p $(dir $@)
 	$(NASM) -f elf64 $< -o $@
 
+$(BUILD_DIR)/boot_stage1.bin: $(SRC_DIR)/boot/boot_stage1.asm
+	@mkdir -p $(BUILD_DIR)
+	$(NASM) -f bin $< -o $@
+
+$(BUILD_DIR)/boot_stage2.bin: $(SRC_DIR)/boot/boot_stage2.asm
+	@mkdir -p $(BUILD_DIR)
+	$(NASM) -f bin $< -o $@
+	@# Строго выравниваем Stage 2 до 32 секторов (16 384 байт, LBA 1..32)
+	@truncate -s 16384 $@
+
+# ------------------------------------------------------------------------------
+# Прочие ассемблерные файлы ядра (папка src/asm)
+# ------------------------------------------------------------------------------
 $(BUILD_DIR)/switch.o: $(SRC_DIR)/asm/switch.asm
 	@mkdir -p $(dir $@)
 	$(NASM) -f elf64 $< -o $@
@@ -110,19 +130,6 @@ $(BUILD_DIR)/crt0.o: $(SRC_DIR)/asm/crt0.asm
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
-
-# ------------------------------------------------------------------------------
-# Двухстадийный загрузчик (Two-Stage Boot)
-# ------------------------------------------------------------------------------
-$(BUILD_DIR)/boot_stage1.bin: $(SRC_DIR)/asm/boot_stage1.asm
-	@mkdir -p $(BUILD_DIR)
-	$(NASM) -f bin $< -o $@
-
-$(BUILD_DIR)/boot_stage2.bin: $(SRC_DIR)/asm/boot_stage2.asm
-	@mkdir -p $(BUILD_DIR)
-	$(NASM) -f bin $< -o $@
-	@# Строго выравниваем Stage 2 до 32 секторов (16 384 байт, LBA 1..32)
-	@truncate -s 16384 $@
 
 # ------------------------------------------------------------------------------
 # Двухпроходная сборка ядра с автоматической таблицей символов (ksyms)
@@ -174,7 +181,7 @@ $(BUILD_DIR)/redactor.sys: $(SRC_DIR)/modules/redactor_module.c \
 	@echo ">>> Модуль $@ успешно собран."
 
 # ------------------------------------------------------------------------------
-# Сборка пользовательских программ .PRG (Ring 3) с универсальным crt0.o
+# Сборка пользовательских программ .PRG (Ring 3)
 # ------------------------------------------------------------------------------
 $(BUILD_DIR)/%.prg: $(PROG_DIR)/%.c $(BUILD_DIR)/crt0.o user.ld
 	@mkdir -p $(BUILD_DIR)/programs
@@ -183,35 +190,48 @@ $(BUILD_DIR)/%.prg: $(PROG_DIR)/%.c $(BUILD_DIR)/crt0.o user.ld
 	python3 tools/elf2prg.py $(BUILD_DIR)/programs/$*.elf $@
 	@echo ">>> Программа $@ успешно собрана в формате DPRG."
 
-# ------------------------------------------------------------------------------
-# Создание раздела FAT16 и упаковка софта
-# ------------------------------------------------------------------------------
-$(PART_IMG): $(BUILD_DIR)/kernel.bin $(BUILD_DIR)/boot_stage1.bin $(MODULE_BINS) $(PROG_BINS)
+# Автосборка DOOM.PRG через clean + make
+$(DOOM_PRG):
+	@if [ -d "$(DOOM_DIR)" ]; then \
+		echo ">>> Полная пересборка DOOM (clean + make)..."; \
+		$(MAKE) -C $(DOOM_DIR) clean && $(MAKE) -C $(DOOM_DIR); \
+	fi
+
+# -----------------------------------------------------------------------------
+# Создание раздела FAT32 и упаковка софта
+# -----------------------------------------------------------------------------
+$(PART_IMG): $(BUILD_DIR)/kernel.bin $(BUILD_DIR)/boot_stage1.bin $(MODULE_BINS) $(PROG_BINS) $(DOOM_PRG)
 	@mkdir -p $(BUILD_DIR)
-	@echo ">>> Создаем раздел FAT16 на $(PART_SIZE_MB) МБ..."
+	@echo ">>> Создаем раздел FAT32 на $(PART_SIZE_MB) МБ..."
 	@rm -f $@
 	@truncate -s $(PART_SIZE_MB)M $@
-	@mkfs.vfat -F 16 -n "OVEROS" $@ >/dev/null
+	@mkfs.vfat -F 32 -s 8 -n "OVER_OS" $@ >/dev/null
 	@if command -v mcopy >/dev/null 2>&1; then \
-	    mcopy -i $@ $(BUILD_DIR)/kernel.bin ::KERNEL.BIN; \
+	    mmd -i $@ ::sys 2>/dev/null || true; \
+	    mmd -i $@ ::utils 2>/dev/null || true; \
+	    mmd -i $@ ::programs 2>/dev/null || true; \
+	    mmd -i $@ ::programs/DOOM 2>/dev/null || true; \
+	    mmd -i $@ ::Code 2>/dev/null || true; \
+	    mcopy -i $@ $(BUILD_DIR)/kernel.bin ::sys/KERNEL.BIN; \
+	    if [ -f "$(SRC_DIR)/files/image/logo.bmp" ]; then \
+	        mcopy -i $@ $(SRC_DIR)/files/image/logo.bmp ::sys/logo.bmp; \
+	    fi; \
 	    for mod in $(MODULE_BINS); do \
-	        fname=$$(basename $$mod | tr 'a-z' 'A-Z'); \
-	        mcopy -i $@ $$mod ::$$fname; \
+	        fname=$$(basename $$mod); \
+	        mcopy -i $@ $$mod ::utils/$$fname; \
 	    done; \
 	    for prg in $(PROG_BINS); do \
 	        [ -f "$$prg" ] || continue; \
-	        fname=$$(basename $$prg | tr 'a-z' 'A-Z'); \
-	        mcopy -i $@ $$prg ::$$fname; \
+	        fname=$$(basename $$prg); \
+	        mcopy -i $@ $$prg ::programs/$$fname; \
 	    done; \
-	    if [ -f "DOOM1.WAD" ]; then \
-	        mcopy -i $@ DOOM1.WAD ::DOOM1.WAD; \
-	        echo ">>> Скопирован DOOM1.WAD в корень FAT16"; \
+	    if [ -f "$(DOOM_PRG)" ]; then \
+	        mcopy -i $@ $(DOOM_PRG) ::programs/DOOM/DOOM.PRG; \
+	        echo ">>> Скопирован DOOM.PRG в ::programs/DOOM/"; \
 	    fi; \
-	    mmd -i $@ ::CODE 2>/dev/null || true; \
-	    mmd -i $@ ::SYS 2>/dev/null || true; \
-	    if [ -f "$(SRC_DIR)/files/image/logo.bmp" ]; then \
-	        mcopy -i $@ $(SRC_DIR)/files/image/logo.bmp ::SYS/LOGO.BMP; \
-	        echo ">>> Скопирован LOGO.BMP в папку SYS на FAT16"; \
+	    if [ -f "$(DOOM_WAD)" ]; then \
+	        mcopy -i $@ $(DOOM_WAD) ::programs/DOOM/DOOM1.WAD; \
+	        echo ">>> Скопирован DOOM1.WAD в ::programs/DOOM/"; \
 	    fi; \
 	fi
 
@@ -219,7 +239,7 @@ $(PART_IMG): $(BUILD_DIR)/kernel.bin $(BUILD_DIR)/boot_stage1.bin $(MODULE_BINS)
 # Сборка финального RAW-образа диска
 # ------------------------------------------------------------------------------
 $(DISK_IMG): $(BUILD_DIR)/boot_stage1.bin $(BUILD_DIR)/boot_stage2.bin $(BUILD_DIR)/kernel.bin $(PART_IMG)
-	@echo ">>> Собираем полный образ диска с Two-Stage Boot..."
+	@echo ">>> Собираем полный образ диска с Two-Stage Boot (FAT32)..."
 	@rm -f $@
 	@# 1. Записываем Stage 1 (LBA 0, 512 байт)
 	@cp $(BUILD_DIR)/boot_stage1.bin $@
@@ -229,15 +249,15 @@ $(DISK_IMG): $(BUILD_DIR)/boot_stage1.bin $(BUILD_DIR)/boot_stage2.bin $(BUILD_D
 	@dd if=$(BUILD_DIR)/boot_stage2.bin of=$@ bs=512 seek=1 conv=notrunc status=none
 	@# 4. Записываем ядро kernel.bin строго начиная с LBA 33 (до 2047 сектора)
 	@dd if=$(BUILD_DIR)/kernel.bin of=$@ bs=512 seek=33 conv=notrunc status=none
-	@# 5. Прописываем стандартную таблицу MBR (Partition 1: Boot RAW, Partition 2: FAT16 с LBA 2048)
+	@# 5. Прописываем стандартную таблицу MBR (Partition 1: Boot RAW, Partition 2: FAT32 с LBA 2048)
 	@python3 -c "import struct; f=open('$@','r+b'); \
 	    f.seek(446); \
 	    p1 = struct.pack('<BBBBBBBBII', 0x80, 0x00, 0x02, 0x00, 0x7F, 0x20, 0x20, 0x00, 1, 2047); \
-	    p2 = struct.pack('<BBBBBBBBII', 0x00, 0x20, 0x21, 0x00, 0x0E, 0xFE, 0xFF, 0xFF, 2048, $(PART_SIZE_MB)*2048); \
+	    p2 = struct.pack('<BBBBBBBBII', 0x00, 0x20, 0x21, 0x00, 0x0C, 0xFE, 0xFF, 0xFF, 2048, $(PART_SIZE_MB)*2048); \
 	    f.write(p1 + p2 + b'\x00'*32 + b'\x55\xAA')"
-	@# 6. Дописываем раздел FAT16 (начиная ровно с 1 МБ / LBA 2048)
+	@# 6. Дописываем раздел FAT32 (начиная ровно с 1 МБ / LBA 2048)
 	@cat $(PART_IMG) >> $@
-	@echo ">>> Готово: $(DISK_IMG) (overOS Two-Stage) успешно собран."
+	@echo ">>> Готово: $(DISK_IMG) (overOS Two-Stage FAT32) успешно собран."
 
 # ------------------------------------------------------------------------------
 # Запуск в QEMU x86_64
@@ -255,7 +275,6 @@ run: all
 	    -drive if=none,id=usb_drive,file=$(DISK_IMG),format=raw \
 	    -device usb-storage,bus=ehci.0,drive=usb_drive \
         -vga std -global VGA.vgamem_mb=2
-
 
 run-usb: all
 	qemu-system-x86_64 \
@@ -315,8 +334,8 @@ endif
 
 _write_disk:
 	@for part in $(TARGET_DEV)*; do \
-	    mp=$$(findmnt -n -o TARGET "$$part" 2>/dev/null); \
-	    if [ -n "$$mp" ]; then \
+	    pmp=$$(findmnt -n -o TARGET "$$part" 2>/dev/null); \
+	    if [ -n "$$pmp" ]; then \
 	        sudo umount "$$part" 2>/dev/null; \
 	    fi; \
 	done

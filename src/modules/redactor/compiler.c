@@ -29,22 +29,11 @@ static int my_strcmp(const char* s1, const char* s2) {
     return *(const unsigned char*)s1 - *(const unsigned char*)s2;
 }
 
-static void to_fat83(const char* in, char* out83) {
-    for (int i = 0; i < 11; i++) out83[i] = ' ';
-    out83[11] = '\0';
-    int i = 0;
-    while (*in && *in != '.' && i < 8) { char c = *in++; if (c >= 'a' && c <= 'z') c -= 32; out83[i++] = c; }
-    while (*in && *in != '.') in++; if (*in == '.') in++; int j = 8;
-    while (*in && j < 11) { char c = *in++; if (c >= 'a' && c <= 'z') c -= 32; out83[j++] = c; }
-}
-
 static int helper_jit_open(const char* filename) {
-    if (!fat16_is_mounted()) return -1;
-    fat16_go_root();
-    char name83[12];
-    to_fat83(filename, name83);
+    if (!fs_is_mounted()) return -1;
+    fs_go_root();
     uint8_t dummy[16];
-    int r = fat16_read_file(name83, dummy, 1);
+    int r = fs_read_file(filename, dummy, 1);
     return (r > 0) ? 1 : -1;
 }
 
@@ -891,9 +880,14 @@ static void preprocess_source(const char* src, char* out, int max_len) {
                     }
 
                     int loaded = get_tab_file_content(inc_name, inc_file_buf, sizeof(inc_file_buf));
-                    if (!loaded && fat16_is_mounted()) {
-                        char name83[12]; to_fat83(inc_name, name83); fat16_go_root(); fat16_change_dir("CODE       ");
-                        int r = fat16_read_file(name83, inc_file_buf, sizeof(inc_file_buf) - 1); if (r > 0) { inc_file_buf[r] = '\0'; loaded = 1; }
+                    if (!loaded && fs_is_mounted()) {
+                        fs_go_root();
+                        fs_change_dir("Code");
+                        int r = fs_read_file(inc_name, inc_file_buf, sizeof(inc_file_buf) - 1); 
+                        if (r > 0) { 
+                            inc_file_buf[r] = '\0'; 
+                            loaded = 1; 
+                        }
                     }
 
                     if (loaded) {

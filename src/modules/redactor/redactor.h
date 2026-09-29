@@ -52,14 +52,14 @@ static inline void console_restore_state(void) { if(g_redactor_api && g_redactor
 #define screen_width                (g_redactor_api ? g_redactor_api->screen_width : 1024)
 #define current_path                (g_redactor_api ? g_redactor_api->current_path : "/")
 
-#define fat16_is_mounted()          (g_redactor_api ? g_redactor_api->fat16_is_mounted() : 0)
-#define fat16_mount(lba)            (g_redactor_api ? g_redactor_api->fat16_mount(lba) : 0)
-#define fat16_go_root()             if(g_redactor_api) g_redactor_api->fat16_go_root()
-#define fat16_change_dir(n)         (g_redactor_api ? g_redactor_api->fat16_change_dir(n) : 0)
-#define fat16_make_folder(n)        (g_redactor_api ? g_redactor_api->fat16_make_folder(n) : 0)
-#define fat16_read_file(n, b, s)    (g_redactor_api ? g_redactor_api->fat16_read_file(n, b, s) : 0)
-#define fat16_write_file(n, b, s)   (g_redactor_api ? g_redactor_api->fat16_write_file(n, b, s) : 0)
-#define fat16_get_dir_files(o, m)   (g_redactor_api ? g_redactor_api->fat16_get_dir_files(o, m) : 0)
+#define fs_is_mounted()          (g_redactor_api ? g_redactor_api->fs_is_mounted() : 0)
+#define fs_mount(lba)            (g_redactor_api ? g_redactor_api->fs_mount(lba) : 0)
+#define fs_go_root()             if(g_redactor_api) g_redactor_api->fs_go_root()
+#define fs_change_dir(n)         (g_redactor_api ? g_redactor_api->fs_change_dir(n) : 0)
+#define fs_make_folder(n)        (g_redactor_api ? g_redactor_api->fs_make_folder(n) : 0)
+#define fs_read_file(n, b, s)    (g_redactor_api ? g_redactor_api->fs_read_file(n, b, s) : 0)
+#define fs_write_file(n, b, s)   (g_redactor_api ? g_redactor_api->fs_write_file(n, b, s) : 0)
+#define fs_get_dir_files(o, m)   (g_redactor_api ? g_redactor_api->fs_get_dir_files(o, m) : 0)
 
 typedef struct {
     uint32_t saved_esp;

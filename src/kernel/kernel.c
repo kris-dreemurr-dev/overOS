@@ -3,7 +3,7 @@
 #include "../font/font.h"
 #include "../drivers/display.h"
 #include "../drivers/pci.h"
-#include "../fs/fat16.h"
+#include "../fs/fs.h"
 #include "../memory/pmm.h"
 #include "../memory/vmm.h"
 #include "user_mode.h"
@@ -798,51 +798,17 @@ void init_crash_guard_idt(void) {
     __asm__ __volatile__("lidt (%0)" : : "r"(&idtp));
 }
 
-void print_tty_banner(int tty_id) {
-    kputs(OS_NAME " " OS_ARCH " " OS_VERSION " / tty", 0x55FF55);
-    char num_buf[16];
-    itoa(tty_id + 1, num_buf);
-    kputs(num_buf, 0x55FFFF);
-    kputs("\n\n", 0xFFFFFF);
-
-    kputs("Защита от ДОЛБАЁБОВ!!! не вытаскивайте флешку с ОС а если и вытащили не втыкайте, не поможет.\n\n", 0x00AA00);
-    fat16_dir();
-    kputs("\n", 0xFFFFFF);
-}
-
-// Вспомогательная функция форматирования под стандарт 8.3 для FAT16
-static void format_to_83(const char* src, char* dst) {
-    for (int i = 0; i < 11; i++) dst[i] = ' ';
-    int i = 0, d = 0;
-    while (src[i] && src[i] != '.' && d < 8) {
-        char c = src[i++];
-        if (c >= 'a' && c <= 'z') c -= 32;
-        dst[d++] = c;
-    }
-    if (src[i] == '.') {
-        i++;
-        d = 8;
-        while (src[i] && d < 11) {
-            char c = src[i++];
-            if (c >= 'a' && c <= 'z') c -= 32;
-            dst[d++] = c;
-        }
-    }
-}
-
 // Статический буфер для загрузки логотипа (512 КБ с запасом)
 static uint8_t bmp_load_buffer[512 * 1024];
 
 void render_boot_logo(void) {
-    char sys_dir[11];
-    format_to_83("SYS", sys_dir);
-    fat16_change_dir(sys_dir); // Переходим в системную папку SYS
+    // Переходим в системную папку обычной строкой
+    fs_change_dir("sys"); 
 
-    char name83[11];
-    format_to_83("LOGO.BMP", name83);
-    int bytes = fat16_read_file(name83, bmp_load_buffer, sizeof(bmp_load_buffer));
+    // Читаем файл в оригинальном регистре — наш FAT32 драйвер с LFN и strcasecmp легко его найдет
+    int bytes = fs_read_file("logo.bmp", bmp_load_buffer, sizeof(bmp_load_buffer));
 
-    fat16_go_root(); // Возвращаемся в корень файловой системы[cite: 26]
+    fs_go_root(); // Возвращаемся в корень файловой системы
 
     clear_screen(0x000000); // Чёрный экран по умолчанию 
 
@@ -923,8 +889,20 @@ void render_boot_logo(void) {
     flush_buffer(); 
 }
 
+void print_tty_banner(int tty_id) {
+    kputs(OS_NAME " " OS_ARCH " " OS_VERSION " / tty", 0x55FF55);
+    char num_buf[16];
+    itoa(tty_id + 1, num_buf);
+    kputs(num_buf, 0x55FFFF);
+    kputs("\n\n", 0xFFFFFF);
+
+    kputs("Защита от ДОЛБАЁБОВ!!! не вытаскивайте флешку с ОС а если и вытащили не втыкайте, не поможет.\n\n", 0x00AA00);
+    fs_dir();
+    kputs("\n", 0xFFFFFF);
+}
+
 void kernel_main(void) {
-    vbe_info_t* vbe = (vbe_info_t*)(uintptr_t)0x8000; 
+    vbe_info_t* vbe = (vbe_info_t*)(uintptr_t)0x8000;
 
     screen_width = vbe->width;
     screen_height = vbe->height;
@@ -981,7 +959,6 @@ void kernel_main(void) {
     flush_buffer();
     kputs("\n", 0xFFFFFF);
     flush_buffer();
-    sleep_ms(250);
     render_boot_logo();
     sleep_ms(250);
     kputs("[", 0xFFFFFF); kputs(" OK ", 0x00AA00); kputs("] Display driver init\n", 0xFFFFFF);

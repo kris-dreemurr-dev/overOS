@@ -16,13 +16,14 @@
 typedef struct devos_api devos_api_t;
 typedef int (*driver_entry_t)(const devos_api_t* api);
 
+// Унифицированная структура информации о файле с поддержкой длинных имен
 typedef struct {
-    char name83[11];
+    char name[64];
     uint8_t attr;
     uint32_t size;
-    uint16_t cluster;
-    char clean_name[16];
-} __attribute__((packed)) fat16_file_info_api_t;
+    uint32_t cluster;
+    char clean_name[64];
+} __attribute__((packed)) fs_file_info_api_t;
 
 typedef struct {
     const char* name;
@@ -70,22 +71,21 @@ struct devos_api {
     uint16_t screen_pitch;
     volatile uint32_t* lfb;
 
-    // Интерфейс файловой системы FAT16 для редактора
-    int (*fat16_is_mounted)(void);
-    int (*fat16_mount)(int partition_lba);
-    void (*fat16_go_root)(void);
-    int (*fat16_change_dir)(const char* name83);
-    int (*fat16_make_folder)(const char* name83);
-    int (*fat16_read_file)(const char* name83, void* buffer, uint32_t max_bytes);
-    int (*fat16_write_file)(const char* name83, const void* data, uint32_t size);
-    int (*fat16_get_dir_files)(void* out_files, int max_files);
+    // Интерфейс файловой системы fs (полноценная поддержка LFN)
+    int (*fs_is_mounted)(void);
+    int (*fs_mount)(int partition_lba);
+    void (*fs_go_root)(void);
+    int (*fs_change_dir)(const char* filename);
+    int (*fs_make_folder)(const char* filename);
+    int (*fs_read_file)(const char* filename, void* buffer, uint32_t max_bytes);
+    int (*fs_write_file)(const char* filename, const void* data, uint32_t size);
+    int (*fs_get_dir_files)(void* out_files, int max_files);
 
     // Таблица экспортируемых символов ядра для JIT
     const ksym_api_t* kernel_symbols;
     char* current_path;
 
-    // Единый вход клавиатуры для модулей: 1 = сканкод получен, 0 = нет
-    // (порт 0x60/0x64 модули напрямую больше не читают)
+    // Единый вход клавиатуры для модулей
     int (*kbd_poll)(uint8_t* scancode);
 };
 

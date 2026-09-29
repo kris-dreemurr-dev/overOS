@@ -3,7 +3,7 @@
 #include "../drivers/acpi.h"
 #include "../drivers/pci.h"
 #include "../drivers/usb/ehci-msc.h"
-#include "../fs/fat16.h"
+#include "../fs/fs.h"
 #include "sys_loader.h"
 #include "prog_loader.h"
 #include "sched.h"
@@ -67,33 +67,15 @@ static char* strcat(char* dest, const char* src) {
     return dest;
 }
 
-static void format_to_83(const char* src, char* dst) {
-    for (int i = 0; i < 11; i++) dst[i] = ' ';
-    int i = 0, d = 0;
-    while (src[i] && src[i] != '.' && d < 8) {
-        char c = src[i++];
-        if (c >= 'a' && c <= 'z') c -= 32;
-        dst[d++] = c;
-    }
-    if (src[i] == '.') {
-        i++;
-        d = 8;
-        while (src[i] && d < 11) {
-            char c = src[i++];
-            if (c >= 'a' && c <= 'z') c -= 32;
-            dst[d++] = c;
-        }
-    }
-}
-
 static void cmd_self_update(int raw_root_mode, int update_boot_sector) {
     kputs("\n[SELF-UPDATE] Starting kernel flash procedure...\n", 0x55FFFF);
 
-    char name83[11];
-    format_to_83("KERNEL.BIN", name83);
+    // Переходим в системный каталог /sys
+    fs_go_root();
+    fs_change_dir("sys");
 
-    kputs("  -> Loading KERNEL.BIN from FAT16 partition...\n", 0xAAAAAA);
-    int bytes = fat16_read_file(name83, file_buf, sizeof(file_buf));
+    kputs("  -> Loading KERNEL.BIN from /sys partition...\n", 0xAAAAAA);
+    int bytes = fs_read_file("KERNEL.BIN", file_buf, sizeof(file_buf));
     
     if (bytes <= 0) {
         if (raw_root_mode) {
@@ -101,7 +83,8 @@ static void cmd_self_update(int raw_root_mode, int update_boot_sector) {
             bytes = 0;
             for (int i = 0; i < 512; i++) file_buf[i] = 0;
         } else {
-            kputs("  [!] KERNEL.BIN not found in root directory! Aborted.\n", 0xFF5555);
+            kputs("  [!] KERNEL.BIN not found in /sys directory! Aborted.\n", 0xFF5555);
+            fs_go_root();
             return;
         }
     }
@@ -114,6 +97,7 @@ static void cmd_self_update(int raw_root_mode, int update_boot_sector) {
     uint16_t sectors_needed = (bytes > 0) ? (bytes + 511) / 512 : 600;
     if (sectors_needed > 2047) {
         kputs("  [!] File is too big for MBR Gap (> 2047 sectors)!\n", 0xFF5555);
+        fs_go_root();
         return;
     }
 
@@ -137,6 +121,7 @@ static void cmd_self_update(int raw_root_mode, int update_boot_sector) {
 
     if (flash_error) {
         kputs("  [!] SCSI WRITE ERROR during chunked flash!\n", 0xFF5555);
+        fs_go_root();
         return;
     }
     
@@ -148,19 +133,19 @@ static void cmd_self_update(int raw_root_mode, int update_boot_sector) {
 
     if (update_boot_sector) {
         kputs("  -> Updating Stage0 in LBA 0 (preserving partition table)...\n", 0xAAAAAA);
-        format_to_83("BOOT.BIN", name83);
-        int boot_bytes = fat16_read_file(name83, file_buf, 512);
+        int boot_bytes = fs_read_file("BOOT.BIN", file_buf, 512);
 
         if (boot_bytes >= 446) {
-            if (!ehci_msc_read_sectors(0, 1, mbr_tmp)) return;
+            if (!ehci_msc_read_sectors(0, 1, mbr_tmp)) { fs_go_root(); return; }
             for (int i = 0; i < 446; i++) mbr_tmp[i] = file_buf[i];
             ehci_msc_write_sectors(0, 1, mbr_tmp);
             kputs("  [+] Bootloader stage0 updated safely in LBA 0!\n", 0x55FF55);
         } else {
-            kputs("  [i] BOOT.BIN not found in root; LBA 0 left untouched.\n", 0xFFFF55);
+            kputs("  [i] BOOT.BIN not found in /sys; LBA 0 left untouched.\n", 0xFFFF55);
         }
     }
 
+    fs_go_root();
     kputs("\n[+] SUCCESS! Type 'reboot' to test.\n", 0x55FF55);
 }
 
@@ -223,14 +208,14 @@ static void copy_to_prog_name(const char* cmd, char* out_prog, int max_len) {
     int name_len = (dot_pos != -1) ? dot_pos : len;
     int out_len = 0;
 
-    // Копируем имя в верхнем регистре (до 8 символов формата 8.3 FAT16)
+    // Копируем имя в верхнем регистре (до 8 символов формата 8.3 fs)
     for (int i = 0; i < name_len && out_len < (max_len - 5) && out_len < 8; i++) {
         char c = cmd[i];
         if (c >= 'a' && c <= 'z') c -= 32;
         out_prog[out_len++] = c;
     }
 
-    // Всегда дописываем чистое 3-буквенное расширение FAT16: .PRG
+    // Всегда дописываем чистое 3-буквенное расширение fs: .PRG
     out_prog[out_len++] = '.';
     out_prog[out_len++] = 'P';
     out_prog[out_len++] = 'R';
@@ -334,13 +319,19 @@ void execute_command(void) {
         kputs(buf, 0xFFFF55);
         kputs("%\n", 0x55FF55);
     } else if (strcmp(cmd, "dir") == 0 || strcmp(cmd, "ls") == 0) {
-        fat16_dir();
-    } else if (strncmp(cmd, "cd ", 3) == 0) {
+        fs_dir();
+} else if (strncmp(cmd, "cd ", 3) == 0) {
         char* target = cmd + 3;
         while (*target == ' ') target++;
 
+        // Убираем хвостовые пробелы
+        int tlen = strlen(target);
+        while (tlen > 0 && target[tlen - 1] == ' ') {
+            target[--tlen] = '\0';
+        }
+
         if (strcmp(target, "..") == 0) {
-            if (fat16_change_dir("..")) {
+            if (fs_change_dir("..")) {
                 int len = strlen(current_path);
                 while (len > 1 && current_path[len - 1] != '/') {
                     current_path[len - 1] = '\0';
@@ -353,26 +344,24 @@ void execute_command(void) {
                 kputs("[-] Already at root!\n", 0xFF5555);
             }
         } else if (strcmp(target, "/") == 0) {
-            fat16_go_root();
+            fs_go_root();
             current_path[0] = '/';
             current_path[1] = '\0';
         } else {
-            char name83[11];
-            format_to_83(target, name83);
-
-            if (fat16_change_dir(name83)) {
+            if (fs_change_dir(target)) {
                 if (strcmp(current_path, "/") != 0) {
                     strcat(current_path, "/");
                 }
-                strcat(current_path, target);
+                const char* real_name = fs_get_last_dir_name();
+                strcat(current_path, (real_name && real_name[0]) ? real_name : target);
             } else {
                 kputs("[-] Directory not found!\n", 0xFF5555);
             }
         }
     } else if (strncmp(cmd, "cat ", 4) == 0) {
-        char name83[11];
-        format_to_83(&cmd[4], name83);
-        int bytes = fat16_read_file(name83, file_buf, sizeof(file_buf) - 1);
+        char* target = cmd + 4;
+        while (*target == ' ') target++;
+        int bytes = fs_read_file(target, file_buf, sizeof(file_buf) - 1);
         if (bytes > 0) {
             file_buf[bytes] = '\0';
             kputs((char*)file_buf, 0xFFFFFF);
@@ -381,25 +370,25 @@ void execute_command(void) {
             kputs("[-] File not found or read error.\n", 0xFF5555);
         }
     } else if (strncmp(cmd, "touch ", 6) == 0) {
-        char name83[11];
-        format_to_83(&cmd[6], name83);
-        if (fat16_touch(name83)) {
+        char* target = cmd + 6;
+        while (*target == ' ') target++;
+        if (fs_touch(target)) {
             kputs("[+] File created successfully.\n", 0x55FF55);
         } else {
-            kputs("[-] Failed to create file (disk full or root full).\n", 0xFF5555);
+            kputs("[-] Failed to create file (already exists or disk full).\n", 0xFF5555);
         }
     } else if (strncmp(cmd, "mkdir ", 6) == 0) {
-        char name83[11];
-        format_to_83(&cmd[6], name83);
-        if (fat16_make_folder(name83)) {
+        char* target = cmd + 6;
+        while (*target == ' ') target++;
+        if (fs_make_folder(target)) {
             kputs("[+] Directory created successfully.\n", 0x55FF55);
         } else {
-            kputs("[-] Failed to create directory.\n", 0xFF5555);
+            kputs("[-] Failed to create directory (already exists or disk full).\n", 0xFF5555);
         }
     } else if (strncmp(cmd, "rm ", 3) == 0) {
-        char name83[11];
-        format_to_83(&cmd[3], name83);
-        if (fat16_remove_file(name83)) {
+        char* target = cmd + 3;
+        while (*target == ' ') target++;
+        if (fs_remove_file(target)) {
             kputs("[+] File deleted successfully.\n", 0x55FF55);
         } else {
             kputs("[-] File not found or error deleting.\n", 0xFF5555);
@@ -441,7 +430,7 @@ void execute_command(void) {
         while (*args == ' ') args++;
 
         int res = prog_load_module(prog_filename, args);
-        if (res < 0) { // <--- Ругаемся ТОЛЬКО если файл не найден или не загрузился
+        if (res < 0) {
             kputs("Unknown command: ", 0xFF5555);
             kputs(cmd, 0xFFFFFF);
             kputc('\n', 0xFFFFFF);

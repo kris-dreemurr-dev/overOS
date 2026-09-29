@@ -1,5 +1,5 @@
 #include "user_mode.h"
-#include "../fs/fat16.h"
+#include "../fs/fs.h"
 #include "sched.h"
 #include "../memory/vmm.h"
 #include "../memory/pmm.h"
@@ -184,12 +184,15 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
 
         case 10: { // sys_open(filename)
             if (!arg1) return (uint64_t)-1;
-            fat16_go_root();
-            char name83[12];
-            str_to_fat83((const char*)arg1, name83);
-            extern int fat16_file_exists(const char* name83);
-            if (fat16_file_exists(name83)) {
-                for (int c = 0; c < 12; c++) caller->open83[c] = name83[c];
+            //fs_go_root();
+            const char* filename = (const char*)arg1;
+            if (fs_file_exists(filename)) {
+                int idx = 0;
+                while (filename[idx] && idx < 63) {
+                    caller->open83[idx] = filename[idx]; // Буфер для открытого файла в task_t
+                    idx++;
+                }
+                caller->open83[idx] = '\0';
                 return 1;
             }
             return (uint64_t)-1;
@@ -197,8 +200,8 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
 
         case 11: // sys_read
             if ((int)arg1 <= 0 || arg2 == 0 || arg3 == 0 || caller->open83[0] == '\0') return 0;
-            fat16_go_root();
-            return (uint64_t)fat16_read_file(caller->open83, (void*)arg2, (uint32_t)arg3);
+            //fs_go_root();
+            return (uint64_t)fs_read_file(caller->open83, (void*)arg2, (uint32_t)arg3);
 
         case 12: // sys_close
             caller->open83[0] = '\0';
@@ -206,11 +209,9 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
 
         case 13: { // sys_write(filename, buffer, size)
             if (arg1 && arg2) {
-                char name83[12];
-                fat16_go_root();
-                str_to_fat83((const char*)arg1, name83);
-                extern int fat16_write_file(const char* name83, const void* in_buffer, uint32_t bytes_to_write);
-                return (uint64_t)fat16_write_file(name83, (const void*)arg2, (uint32_t)arg3);
+                //fs_go_root();
+                const char* filename = (const char*)arg1;
+                return (uint64_t)fs_write_file(filename, (const void*)arg2, (uint32_t)arg3);
             }
             return 0;
         }
@@ -311,7 +312,7 @@ case 21: { // sys_blit_frame(fb) -> сколько мс задача прост�
     flush_buffer();   // TTY программы сейчас активен
     return paused;
 }
-case 22: return g_tsc_per_ms;
+        case 22: return g_tsc_per_ms;
         case 30: { // sys_fork()
             task_t* parent = sched_get_current_task();
             if (!parent) return (uint64_t)-1;
@@ -362,41 +363,33 @@ case 22: return g_tsc_per_ms;
             const char* filename = (const char*)arg1;
             if (!filename) return (uint64_t)-1;
 
-            char name83[12];
-            fat16_go_root();
-            str_to_fat83(filename, name83);
-
-            // Читаем новый исполняемый файл в статический временный буфер ядра
-            extern uint8_t kernel_temp_buf[]; // Объявлен в prog_loader.c
-            int bytes = fat16_read_file(name83, kernel_temp_buf, 1024 * 1024 * 4);
+            fs_go_root();
+            extern uint8_t kernel_temp_buf[];
+            int bytes = fs_read_file(filename, kernel_temp_buf, 1024 * 1024 * 4);
             if (bytes <= 0) return (uint64_t)-1;
 
             task_t* current = sched_get_current_task();
             if (!current) return (uint64_t)-1;
 
-            // Уничтожаем старое пользовательское адресное пространство
             vmm_destroy_address_space((uint64_t*)current->cr3);
 
-            // Создаем новое чистое пространство
             uint64_t* new_pml4 = vmm_create_address_space();
             current->cr3 = (uint64_t)new_pml4;
             vmm_switch_directory(new_pml4);
 
-            // Мапим память под новый код (8 МБ)
             uint32_t num_pages = (8 * 1024 * 1024) / 4096;
             for (uint32_t p = 0; p < num_pages; p++) {
-                uint64_t v_addr = PROG_LOAD_BASE + (p * 4096); // PROG_LOAD_BASE = 0x01000000
+                uint64_t v_addr = PROG_LOAD_BASE + (p * 4096);
                 void* p_addr = pmm_alloc_page();
                 vmm_map_page(new_pml4, v_addr, (uint64_t)p_addr, VMM_FLAG_USER | VMM_FLAG_WRITABLE);
             }
 
-            // Копируем байты нового приложения в память процесса
             uint8_t* target = (uint8_t*)PROG_LOAD_BASE;
             for (int b = 0; b < bytes; b++) {
                 target[b] = kernel_temp_buf[b];
             }
 
-            return 0; // Успешный запуск нового образа
+            return 0;
         }
         default:
             return 0;

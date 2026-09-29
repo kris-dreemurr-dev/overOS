@@ -1,6 +1,6 @@
 #include "sys_loader.h"
 #include "../drivers/api.h"
-#include "../fs/fat16.h"
+#include "../fs/fs.h"
 #include "sched.h"
 #include "tty.h" // Подключаем заголовки TTY
 #include "../memory/pmm.h"
@@ -115,25 +115,6 @@ static int sys_readline(char* buf, int max_len) {
     return idx;
 }
 
-static void sys_format_83(const char* src, char* dst) {
-    for (int i = 0; i < 11; i++) dst[i] = ' ';
-    int i = 0, d = 0;
-    while (src[i] && src[i] != '.' && d < 8) {
-        char c = src[i++];
-        if (c >= 'a' && c <= 'z') c -= 32;
-        dst[d++] = c;
-    }
-    if (src[i] == '.') {
-        i++;
-        d = 8;
-        while (src[i] && d < 11) {
-            char c = src[i++];
-            if (c >= 'a' && c <= 'z') c -= 32;
-            dst[d++] = c;
-        }
-    }
-}
-
 // ============================================================================
 // Загрузка перемещаемых модулей (.SYS формата SREL, см. tools/elf2sys.py)
 // ============================================================================
@@ -206,20 +187,20 @@ static void sys_api_fill(void) {
     a->exec_cmd = sys_exec_cmd;
     a->screen_width = screen_width; a->screen_height = screen_height;
     a->screen_pitch = screen_pitch; a->lfb = lfb;
-    a->fat16_is_mounted = fat16_is_mounted;
-    a->fat16_mount = fat16_mount;
-    a->fat16_go_root = fat16_go_root;
-    a->fat16_change_dir = fat16_change_dir;
-    a->fat16_make_folder = fat16_make_folder;
-    a->fat16_read_file = fat16_read_file;
-    a->fat16_write_file = fat16_write_file;
-    a->fat16_get_dir_files = (int (*)(void*, int))fat16_get_dir_files;
+    a->fs_is_mounted = fs_is_mounted;
+    a->fs_mount = fs_mount;
+    a->fs_go_root = fs_go_root;
+    a->fs_change_dir = fs_change_dir;
+    a->fs_make_folder = fs_make_folder;
+    a->fs_read_file = fs_read_file;
+    a->fs_write_file = fs_write_file;
+    a->fs_get_dir_files = (int (*)(void*, int))fs_get_dir_files;
     a->kernel_symbols = auto_ksyms;
     a->current_path = current_path;
     a->kbd_poll = sys_kbd_poll;
 }
 
-// FAT16 и current_path общие: читаем файл под коротким замком
+// fs и current_path общие: читаем файл под коротким замком
 static volatile int g_sys_load_lock = 0;
 static void sys_load_lock(void)   { while (__sync_lock_test_and_set(&g_sys_load_lock, 1)) sched_yield(); }
 static void sys_load_unlock(void) { __sync_lock_release(&g_sys_load_lock); }
@@ -236,8 +217,6 @@ static int sys_load_fail(uint64_t phys, const char* msg) {
 }
 
 int sys_load_module(const char* filename, const char* args) {
-    char name83[11];
-    sys_format_83(filename, name83);
 
     // 1. Временно берём максимум непрерывной физической памяти и читаем файл прямо в неё
     const uint32_t max_pages = SYS_MAX_MEM / PAGE_SIZE;
@@ -255,13 +234,12 @@ int sys_load_module(const char* filename, const char* args) {
     }
 
     uint8_t* base = (uint8_t*)PHYS_TO_VIRT(phys);
-    fat16_go_root();
-    int bytes = fat16_read_file(name83, base, SYS_MAX_MEM);
+    int bytes = fs_read_file(filename, base, SYS_MAX_MEM);
     sys_load_unlock();
 
     if (bytes <= 0) {
-        kputs("[-] FAT16 read error: file not found [", 0xFF5555);
-        for (int i = 0; i < 11; i++) kputc(name83[i], 0xFFFF55);
+        kputs("[-] fs read error: file not found [", 0xFF5555);
+        kputs(filename, 0xFFFF55);
         kputs("]\n", 0xFF5555);
         sys_free_pages(phys, 0, max_pages);
         return 0;

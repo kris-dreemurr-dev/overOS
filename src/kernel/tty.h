@@ -17,8 +17,9 @@ typedef struct {
     int scroll_offset_px;
     char input_buf[256];
     int input_len;
-    uint32_t bg_color;   // фон консоли этого TTY (current_bg_color у каждого TTY свой)
-    int gfx_mode;        // 1 = экраном владеет модуль (.sys): курсор консоли не рисуем
+    char current_path[128];
+    uint32_t bg_color;   
+    int gfx_mode;        
 } tty_t;
 
 void   tty_init_core(void);
