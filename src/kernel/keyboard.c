@@ -10,6 +10,7 @@ extern void put_pixel(int x, int y, uint32_t color);
 extern void kputs_at(int x, int y, const char* str, uint32_t color);
 extern void draw_cursor(uint32_t color);
 extern void print_prompt(void);
+extern void mouse_feed_byte(uint8_t byte);
 
 extern int cursor_x;
 extern int cursor_y;
@@ -71,7 +72,7 @@ void keyboard_poll_handler(void) {
         uint8_t status = inb(0x64);
         uint8_t scancode = inb(0x60);
 
-        if (status & 0x20) continue; // Мышь
+        if (status & 0x20) { mouse_feed_byte(scancode); continue; } // Байт мыши — отдаём общему декодеру, не теряем
 
         // Глобальный перехват виртуальных терминалов
         if (tty_check_hotkey(scancode)) {

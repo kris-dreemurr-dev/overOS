@@ -13,15 +13,15 @@ typedef enum {
 } task_state_t;
 
 typedef struct task {
-    uint64_t        rsp;           // Смещение 0: текущий стек (для switch.asm)
-    uint64_t        cr3;           // Смещение 8: физ. адрес PML4 (для switch.asm)
-    uint64_t        kstack_top;    // Смещение 16: вершина стека
-    uint64_t        kstack_bottom; // Физическое начало стека в RAM
-    uint64_t        mem_size;      // Выделенная память (в байтах)
-    uint64_t        pid;           // Идентификатор процесса
-    char            name[16];      // Имя задачи
-    task_state_t    state;         // Состояние
-    struct task*    next;          // Следующий в Round-Robin
+    uint64_t        rsp;           // Смещение 0: текущий стек (для switch.asm)[cite: 16]
+    uint64_t        cr3;           // Смещение 8: физ. адрес PML4 (для switch.asm)[cite: 16]
+    uint64_t        kstack_top;    // Смещение 16: вершина стека[cite: 16]
+    uint64_t        kstack_bottom; // Физическое начало стека в RAM[cite: 16]
+    uint64_t        mem_size;      // Выделенная память (в байтах)[cite: 16]
+    uint64_t        pid;           // Идентификатор процесса[cite: 16]
+    char            name[16];      // Имя задачи[cite: 16]
+    task_state_t    state;         // Состояние[cite: 16]
+    struct task*    next;          // Следующий в Round-Robin[cite: 16]
     
     // Границы динамической памяти (Heap / brk)
     uint64_t        heap_start;    // Начало кучи (сразу за кодом)
@@ -31,7 +31,7 @@ typedef struct task {
     // Состояние Ring 3 (у каждой задачи своё, переносится в sched_yield)
     uint64_t        saved_krsp;    // saved_kernel_rsp: низ ring0-стека для входа из Ring 3
     int             in_user;       // 1 = задача в Ring 3 или внутри своего сисколла
-    char            open83[12];    // файл, открытый sys_open (свой у каждой программы)
+    char            open83[64];    // полное имя файла, открытого sys_open (FAT32 LFN, своё у каждой программы)
 
     // Самостоятельный процесс Ring 3 (свой ядерный стек), см. sched_spawn_process
     struct task*    parent;        // кто ждёт завершения (оболочка, запустившая программу)
@@ -40,6 +40,9 @@ typedef struct task {
     uint64_t        user_entry;    // стартовый RIP в Ring 3
     uint64_t        user_stack_top;// стартовый RSP в Ring 3
 } task_t;
+
+// Ядерный стек самостоятельного процесса (sched_spawn_process, sys_fork)
+#define PROC_KSTACK_SIZE (64 * 1024)
 
 int  sched_tty_is_active(void);
 
@@ -66,6 +69,9 @@ task_t* sched_spawn_process(const char* name, uint64_t cr3, uint64_t mem_size,
                             uint64_t user_entry, uint64_t user_stack_top, uint64_t heap_start);
 int     sched_wait_child(task_t* child);   // родитель спит до завершения; освобождает всё, возвращает код выхода
 void    sched_exit_current(int code);      // завершает текущий процесс (не возвращается)
+
+// Добавить уже заполненную задачу в кольцо планировщика (под cli)
+void sched_enqueue_task(task_t* t);
 
 void sched_set_current_task(task_t* t);
 

@@ -1,5 +1,17 @@
 #include "fs.h"
 
+extern void sched_yield(void);
+
+static volatile int g_fs_lock = 0;
+
+void fs_lock(void) {
+    while (__sync_lock_test_and_set(&g_fs_lock, 1)) sched_yield();
+}
+
+void fs_unlock(void) {
+    __sync_lock_release(&g_fs_lock);
+}
+
 #if USE_FAT32
 #include "fat32.h"
 #else

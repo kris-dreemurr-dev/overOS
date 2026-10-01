@@ -1,4 +1,6 @@
 #include <stdint.h>
+#include "tty.h"
+#include "sched.h"
 
 extern uint8_t inb(uint16_t port);
 extern void outb(uint16_t port, uint8_t val);
@@ -150,7 +152,18 @@ void mouse_feed_byte(uint8_t byte) {
     }
 }
 
+// Единственный безусловный читатель порта (цикл kernel_main). Пока активным TTY
+// владеет .sys-модуль (gfx_mode) или работает процесс (foreground_task), порт
+// читает ТОЛЬКО он сам (sys_kbd_poll / ps2_pump) — иначе оба читателя рвут друг
+// у друга байты пакетов мыши/клавиатуры.
+static int mouse_should_defer(void) {
+    if (sched_get_foreground_task()) return 1;
+    tty_t* at = tty_get(tty_get_active_id());
+    return at && at->gfx_mode;
+}
+
 void update_mouse_state(void) {
+    if (mouse_should_defer()) return;
     while (1) {
         // Статус и данные читаем атомарно: таймер может вытеснить задачу между ними,
         // и другой читатель заберёт байт, который мы только что увидели в статусе

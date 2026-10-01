@@ -115,7 +115,14 @@ static void str_to_fat83(const char* in, char* out83) {
     }
 }
 
-uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t arg3) {
+static void fork_child_resume(void);   // определена ниже, нужна форвард-декларация для case 30
+
+// frame указывает на 20 слотов (160 байт), которые syscall_isr_stub сохранил на стеке:
+// frame[0..13]  = r15,r14,r13,r12,r11,r10,r9,r8,rdi,rsi,rdx,rcx,rbx,rax
+// frame[14]     = rbp вызывающего
+// frame[15..19] = RIP,CS,RFLAGS,RSP,SS — аппаратно сохранённые CPU при входе через int 0x80
+// Нужен только sys_fork: остальные сисколлы его не трогают.
+uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t* frame) {
     task_t* caller = sched_get_current_task();
     int visible = (!caller || caller->tty_id < 0 || caller->tty_id == tty_get_active_id());
     // Фоновая программа (её TTY не на экране) не рисует в чужой экран
@@ -321,13 +328,22 @@ case 21: { // sys_blit_frame(fb) -> сколько мс задача прост�
             task_t* child = (task_t*)pmm_alloc_page();
             if (!child) return (uint64_t)-1;
 
-            // 2. Копируем базовые поля из родителя
+            // 2. Копируем базовые поля из родителя и зануляем остальное
+            //    (как task_init_um в sched.c — та функция static, не экспортирована)
             child->pid = sched_alloc_pid();
             child->state = TASK_READY;
-            
-            // Копируем имя родителя с припиской _fork
+            child->parent = parent;
+            child->exit_code = 0;
+            child->is_process = 1;        // ребёнок — такой же процесс Ring 3, как и родитель
+            child->tty_id = parent->tty_id;
+            child->open83[0] = '\0';     // дескриптор не наследуется (fd-таблицы пока нет)
+            child->heap_start = parent->heap_start;
+            child->heap_end   = parent->heap_end;
+            child->user_entry = 0;
+            child->user_stack_top = 0;
+
             int i = 0;
-            while (parent->name[i] && i < 11) { child->name[i] = parent->name[i]; i++; }
+            while (parent->name[i] && i < 15) { child->name[i] = parent->name[i]; i++; }
             child->name[i] = '\0';
 
             // 3. Клонируем виртуальное адресное пространство (память)
@@ -338,24 +354,45 @@ case 21: { // sys_blit_frame(fb) -> сколько мс задача прост�
             }
             child->cr3 = (uint64_t)child_cr3;
 
-            // 4. Выделяем новый стек ядра для контекста задачи
-            void* kstack = pmm_alloc_page();
-            if (!kstack) {
+            // 4. Свой ядерный стек (как у sched_spawn_process — 64 КБ, не одна страница:
+            //    в него ляжет полный кадр прерывания + будущие входы в ядро этого процесса)
+            void* kst_phys = pmm_alloc_pages(PROC_KSTACK_SIZE / 4096);
+            if (!kst_phys) {
                 vmm_destroy_address_space(child_cr3);
                 pmm_free_page(child);
                 return (uint64_t)-1;
             }
+            uint8_t* kstack = (uint8_t*)PHYS_TO_VIRT(kst_phys);
             child->kstack_bottom = (uint64_t)kstack;
-            child->mem_size = 8192;
-            
-            uint64_t* stk = (uint64_t*)((uintptr_t)kstack + 4096);
-            child->kstack_top = (uint64_t)stk;
+            child->kstack_top    = (uint64_t)(kstack + PROC_KSTACK_SIZE);
+            child->mem_size = 4096 + PROC_KSTACK_SIZE;
+
+            // 5. Копируем на вершину стека ребёнка кадр прерывания родителя (160 байт:
+            //    r15..rax, rbp, RIP, CS, RFLAGS, RSP, SS), поэтому ребёнок возобновится
+            //    РОВНО в той же точке Ring 3, что и родитель — но с RAX = 0.
+            uint64_t* tf = (uint64_t*)(kstack + PROC_KSTACK_SIZE - 160);
+            for (int k = 0; k < 20; k++) tf[k] = frame[k];
+            tf[13] = 0;   // слот rax ребёнка — fork() возвращает 0 только у ребёнка
+
+            // 6. Трамплин для switch_to (как в task_create_kernel/sched_spawn_process):
+            //    6 нулевых callee-saved + адрес fork_child_resume, который "вернувшись"
+            //    сразу попадёт на tf и раскрутит его через pop+iretq.
+            uint64_t* stk = tf;
+            *(--stk) = (uint64_t)fork_child_resume;
+            *(--stk) = 0; // rbp
+            *(--stk) = 0; // rbx
+            *(--stk) = 0; // r12
+            *(--stk) = 0; // r13
+            *(--stk) = 0; // r14
+            *(--stk) = 0; // r15
             child->rsp = (uint64_t)stk;
 
-            // Добавляем ребенка в кольцевой список планировщика Round-Robin
-            // (здесь интеграция зависит от структуры task_list_head в sched.c)
+            child->in_user = 1;                 // следующие сисколлы ребёнка войдут через rsp0 = его стек
+            child->saved_krsp = child->kstack_top;
 
-            // Возвращаем PID ребенка для родителя (а ребенок получит 0)
+            sched_enqueue_task(child);
+
+            // Родителю — PID ребёнка (у ребёнка в его копии кадра уже стоит RAX = 0)
             return child->pid;
         }
 
@@ -396,6 +433,32 @@ case 21: { // sys_blit_frame(fb) -> сколько мс задача прост�
     }
 }
 
+// Первая "точка возврата" для ребёнка sys_fork: на стеке под ней уже лежит
+// копия кадра прерывания родителя (см. case 30). Эти 15 pop + iretq —
+// побайтово то же самое, что .L_normal_iretq ниже: ребёнок продолжит
+// исполнение Ring 3 с той же RIP/RSP, что и родитель в момент fork(),
+// но с RAX = 0 (это значение подставлено в кадр заранее).
+__attribute__((naked)) static void fork_child_resume(void) {
+    __asm__ volatile (
+        "pop %r15\n\t"
+        "pop %r14\n\t"
+        "pop %r13\n\t"
+        "pop %r12\n\t"
+        "pop %r11\n\t"
+        "pop %r10\n\t"
+        "pop %r9\n\t"
+        "pop %r8\n\t"
+        "pop %rdi\n\t"
+        "pop %rsi\n\t"
+        "pop %rdx\n\t"
+        "pop %rcx\n\t"
+        "pop %rbx\n\t"
+        "pop %rax\n\t"
+        "pop %rbp\n\t"
+        "iretq\n\t"
+    );
+}
+
 __attribute__((naked)) static void syscall_isr_stub(void) {
     __asm__ volatile (
         "push %rbp\n\t"
@@ -417,6 +480,12 @@ __attribute__((naked)) static void syscall_isr_stub(void) {
         "push %r15\n\t"
 
         "mov %rax, %r12\n\t"
+
+        // 5-й аргумент (SysV: r8) — указатель на начало только что сохранённого
+        // блока регистров (r15 был запушен последним, значит лежит по текущему rsp).
+        // Берём ДО перестановки остальных регистров под аргументы 1-4: этот mov
+        // не трогает rsp, так что адрес кадра остаётся верным.
+        "mov %rsp, %r8\n\t"
 
         "mov %rdx, %r9\n\t"
         "mov %rax, %rdi\n\t"

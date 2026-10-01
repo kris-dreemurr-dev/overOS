@@ -32,4 +32,11 @@ int      fs_is_mounted(void);
 int      fs_get_dir_files(fs_file_info_t* out_list, int max_files);
 const char* fs_get_last_dir_name(void);
 
+// Все fs_*/fat32_* вызовы делят одно состояние драйвера (позиция в каталоге,
+// буфер сектора): конкурентный доступ из разных задач/прерываний его портит.
+// Берётся на время одной fs_* операции или короткой последовательности
+// (например fs_go_root + цепочка fs_change_dir при переключении TTY).
+void fs_lock(void);
+void fs_unlock(void);
+
 #endif

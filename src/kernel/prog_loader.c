@@ -12,16 +12,17 @@ extern void clear_screen(uint32_t color);
 extern void flush_buffer(void);
 extern void itoa(int n, char* str);
 extern int fs_read_file(const char* filename, uint8_t* buffer, uint32_t max_size);
+extern void fs_lock(void);
+extern void fs_unlock(void);
 
 uint8_t kernel_temp_buf[1024 * 1024 * 4] __attribute__((aligned(4096)));
-
-// Общий kernel_temp_buf: одновременно грузить программу может только одна задача
-static volatile int g_load_lock = 0;
 
 int prog_load_module(const char* filename, const char* args) {
     (void)args;
 
-    while (__sync_lock_test_and_set(&g_load_lock, 1)) sched_yield();
+    // kernel_temp_buf общий с sys_execve/sys_loader; fs_lock также защищает
+    // от конкурентного доступа к общему состоянию драйвера fs_* (fat32.c)
+    fs_lock();
 
     char name83[11];
 
@@ -39,7 +40,7 @@ int prog_load_module(const char* filename, const char* args) {
     if (bytes <= 0) {
         kputs("[!] Executable not found or read error.\n", 0x00FF5555); 
         flush_buffer(); 
-        __sync_lock_release(&g_load_lock);
+        fs_unlock();
         return -1; 
     }
 
@@ -81,7 +82,7 @@ int prog_load_module(const char* filename, const char* args) {
     if (!proc_pml4) {
         kputs("[!] Failed to allocate PML4\n", 0x00FF5555); 
         flush_buffer(); 
-        __sync_lock_release(&g_load_lock);
+        fs_unlock();
         return 0; 
     }
 
@@ -103,7 +104,7 @@ int prog_load_module(const char* filename, const char* args) {
             flush_buffer(); 
             __asm__ volatile("mov %0, %%cr3" :: "r"(original_cr3) : "memory"); 
             vmm_destroy_address_space(proc_pml4); 
-            __sync_lock_release(&g_load_lock);
+            fs_unlock();
         return 0; 
         }
         vmm_map_page(proc_pml4, v_addr, (uint64_t)p_addr, VMM_FLAG_USER | VMM_FLAG_WRITABLE); 
@@ -138,7 +139,7 @@ int prog_load_module(const char* filename, const char* args) {
     }
 
     __asm__ volatile("mov %0, %%cr3" :: "r"(original_cr3) : "memory"); 
-    __sync_lock_release(&g_load_lock);   // kernel_temp_buf больше не нужен
+    fs_unlock();   // kernel_temp_buf и состояние fs_* больше не нужны
     __asm__ volatile("pushq %0; popfq" :: "r"(cp_flags) : "memory", "cc");
 
     // 8. Запускаем ОТДЕЛЬНЫЙ процесс: свой ядерный стек, своё адресное пространство.

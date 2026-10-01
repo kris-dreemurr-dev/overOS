@@ -1,6 +1,6 @@
 # ==============================================================================
 # overOS Master Makefile
-# Архитектура: x86_64 Bare-Metal (64-bit Long Mode, Two-Stage MBR + FAT32)
+# Архитектура: x86_64 Bare-Metal (64-bit Long Mode, Two-Stage MBR + FAT32, ядро грузится ФАЙЛОМ /sys/KERNEL.BIN)
 # ==============================================================================
 
 BUILD_DIR    := build
@@ -99,11 +99,35 @@ $(BUILD_DIR)/boot_stage1.bin: $(SRC_DIR)/boot/boot_stage1.asm
 	@mkdir -p $(BUILD_DIR)
 	$(NASM) -f bin $< -o $@
 
-$(BUILD_DIR)/boot_stage2.bin: $(SRC_DIR)/boot/boot_stage2.asm
+# --- Stage 2 = asm-часть (вход, FAT32-загрузчик ядра) + C-часть (меню VBE) в одном образе на 32 сектора ---
+# C-часть компилируется в 16-битный код (gcc -m16: 32-битные инструкции с префиксами 0x66/0x67),
+# линкуется на 0x2000 и вшивается в boot_stage2.bin через incbin (см. boot_stage2.asm).
+CFLAGS_BOOT16 := -m16 -march=i386 -std=gnu11 -ffreestanding -fno-builtin -fno-pic -fno-pie \
+                 -fno-stack-protector -fno-asynchronous-unwind-tables -fcf-protection=none \
+                 -fomit-frame-pointer -mno-sse -mno-mmx -fno-tree-loop-distribute-patterns \
+                 -Os -Wall -Wextra
+
+$(BUILD_DIR)/boot_menu.o: $(SRC_DIR)/boot/vbe_menu.c $(SRC_DIR)/boot/bios.h
 	@mkdir -p $(BUILD_DIR)
-	$(NASM) -f bin $< -o $@
-	@# Строго выравниваем Stage 2 до 32 секторов (16 384 байт, LBA 1..32)
+	$(CC) $(CFLAGS_BOOT16) -c $< -o $@
+
+$(BUILD_DIR)/boot_menu.bin: $(BUILD_DIR)/boot_menu.o $(SRC_DIR)/boot/stage2_menu.ld
+	$(LD) -m elf_i386 -T $(SRC_DIR)/boot/stage2_menu.ld -o $@ $<
+
+$(BUILD_DIR)/boot_stage2.bin: $(SRC_DIR)/boot/boot_stage2.asm $(SRC_DIR)/boot/boot_fat32.asm $(BUILD_DIR)/boot_menu.bin
+	@mkdir -p $(BUILD_DIR)
+	$(NASM) -f bin -I $(SRC_DIR)/boot/ -I $(BUILD_DIR)/ $< -o $@
+	@# Stage 2 = ровно 32 сектора (16 384 байт, LBA 1..32). boot_stage2.asm сам добивает файл до 16 КиБ
+	@# директивой times, и NASM падает с ошибкой, если код не влезает; truncate оставлен как страховка.
 	@truncate -s 16384 $@
+
+# --- проверка логики меню на хосте (обычный gcc, без QEMU и BIOS): make test-menu ---
+test-menu: tools/test_menu.c $(SRC_DIR)/boot/vbe_menu.c $(SRC_DIR)/boot/bios.h
+	@mkdir -p $(BUILD_DIR)
+	gcc -DHOST_TEST -std=gnu11 -Wall -Wextra -o $(BUILD_DIR)/test_menu tools/test_menu.c
+	@for i in 0 1 2 3; do $(BUILD_DIR)/test_menu $$i || exit 1; done
+	@$(BUILD_DIR)/test_menu 4 >/dev/null; test $$? -eq 42 && echo "no VBE: stops with a message - ok"
+	@$(BUILD_DIR)/test_menu 5 >/dev/null; test $$? -eq 42 && echo "no 32-bit modes: stops with a message - ok"
 
 # ------------------------------------------------------------------------------
 # Прочие ассемблерные файлы ядра (папка src/asm)
@@ -247,8 +271,8 @@ $(DISK_IMG): $(BUILD_DIR)/boot_stage1.bin $(BUILD_DIR)/boot_stage2.bin $(BUILD_D
 	@truncate -s 1M $@
 	@# 3. Записываем Stage 2 на LBA 1 (занимает ровно 32 сектора: 1..32)
 	@dd if=$(BUILD_DIR)/boot_stage2.bin of=$@ bs=512 seek=1 conv=notrunc status=none
-	@# 4. Записываем ядро kernel.bin строго начиная с LBA 33 (до 2047 сектора)
-	@dd if=$(BUILD_DIR)/kernel.bin of=$@ bs=512 seek=33 conv=notrunc status=none
+	@# 4. Ядро в загрузочную область БОЛЬШЕ НЕ пишется: Stage 2 читает его как ФАЙЛ /sys/KERNEL.BIN
+	@#    из раздела FAT32 (копируется в $(PART_IMG) ниже, "boot from file"). Размер ядра до 14 МиБ.
 	@# 5. Прописываем стандартную таблицу MBR (Partition 1: Boot RAW, Partition 2: FAT32 с LBA 2048)
 	@python3 -c "import struct; f=open('$@','r+b'); \
 	    f.seek(446); \
@@ -315,7 +339,7 @@ install-modules: $(MODULE_BINS) $(PROG_BINS)
 # ------------------------------------------------------------------------------
 install: all
 ifdef DEV
-	@lsblk $(DEV) >/dev/null 2>&1 || { echo "!! $(DEV) не существует"; exit 1; }
+	@lsblk $(DEV) >/dev/null 2>&1 || { echo "!! $(DEV) ne существует"; exit 1; }
 	@$(MAKE) --no-print-directory _write_disk TARGET_DEV=$(DEV)
 else
 	@CANDIDATES=$$(lsblk -dn -o NAME,TRAN,RM,TYPE | awk '$$2=="usb" && $$3=="1" && $$4=="disk"{print $$1}'); \
@@ -349,4 +373,4 @@ _write_disk:
 clean:
 	rm -rf $(BUILD_DIR)
 
-.PHONY: all modules progs run install install-modules _write_disk clean run-usb
+.PHONY: all modules progs run install install-modules _write_disk clean run-usb test-menu

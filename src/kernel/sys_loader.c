@@ -200,10 +200,11 @@ static void sys_api_fill(void) {
     a->kbd_poll = sys_kbd_poll;
 }
 
-// fs и current_path общие: читаем файл под коротким замком
-static volatile int g_sys_load_lock = 0;
-static void sys_load_lock(void)   { while (__sync_lock_test_and_set(&g_sys_load_lock, 1)) sched_yield(); }
-static void sys_load_unlock(void) { __sync_lock_release(&g_sys_load_lock); }
+// fs_* общие с sys_open/sys_read/sys_write/prog_loader/tty_switch: один замок на всех
+extern void fs_lock(void);
+extern void fs_unlock(void);
+static void sys_load_lock(void)   { fs_lock(); }
+static void sys_load_unlock(void) { fs_unlock(); }
 
 static void sys_free_pages(uint64_t phys, uint32_t first_page, uint32_t end_page) {
     for (uint32_t i = first_page; i < end_page; i++)

@@ -318,8 +318,6 @@ task_t* sched_get_foreground_task(void) {
 // пространство. Родитель запускает его (spawn), засыпает в wait, процесс при
 // завершении становится ZOMBIE, а родитель освобождает его ресурсы.
 // ============================================================================
-#define PROC_KSTACK_SIZE (64 * 1024)
-
 // Первый код нового процесса: уже на СВОЁМ ядерном стеке и в СВОЁМ адресном пространстве.
 // Входит в Ring 3 через iretq; дальше все входы в ядро идут на rsp0 = вершина этого стека.
 static void user_task_entry(void) {
@@ -376,12 +374,16 @@ task_t* sched_spawn_process(const char* name, uint64_t cr3, uint64_t mem_size,
     for (int r = 0; r < 6; r++) *(--stk) = 0;
     t->rsp = (uint64_t)stk;
 
+    sched_enqueue_task(t);
+    return t;
+}
+
+void sched_enqueue_task(task_t* t) {
     uint64_t fl;
     __asm__ volatile("pushfq; popq %0; cli" : "=r"(fl) :: "memory");
     t->next = task_list_head->next;
     task_list_head->next = t;
     __asm__ volatile("pushq %0; popfq" :: "r"(fl) : "memory", "cc");
-    return t;
 }
 
 void sched_exit_current(int code) {

@@ -35,7 +35,7 @@ static void tty2_task_entry(void) {
 }
 
 void tty_init_core(void) {
-    // TTY 1 привязан к статическому back_buffer ядра[cite: 53]
+    // TTY 1 привязан к статическому back_buffer ядрa
     g_ttys[0].id = 0;
     g_ttys[0].active = 1;
     g_ttys[0].buffer = back_buffer;
@@ -50,7 +50,7 @@ void tty_init_core(void) {
     g_ttys[0].bg_color = 0x000000;
     g_ttys[0].gfx_mode = 0;
 
-    // TTY 2 не выделен до нажатия Alt+F2[cite: 53]
+    // TTY 2 не выделен до нажатия Alt+F2
     g_ttys[1].id = 1;
     g_ttys[1].active = 0;
     g_ttys[1].buffer = NULL;
@@ -70,18 +70,18 @@ tty_t* tty_get(int id) {
 
 static void tty_shell_loop(void);
 
-// Создаёт TTY 2: видеобуфер, состояние терминала и задачу с оболочкой[cite: 53].
+// Создаёт TTY 2: видеобуфер, состояние терминала и задачу с оболочкой.
 static int tty_spawn_second(void) {
     size_t px_count = (size_t)screen_width * screen_height;
     size_t fb_size  = px_count * sizeof(uint32_t);
     size_t pages    = (fb_size + 4095) / 4096;
 
-    // Выделяем непрерывный видеобуфер под TTY 2[cite: 53]
+    // Выделяем непрерывный видеобуфер под TTY 2
     void* phys = pmm_alloc_pages(pages);
     if (!phys) return -1;
     g_ttys[1].buffer = (uint32_t*)PHYS_TO_VIRT(phys);
 
-    // Зачищаем буфер терминала[cite: 53]
+    // Зачищаем буфер терминала
     for (size_t i = 0; i < px_count; i++) {
         g_ttys[1].buffer[i] = 0x000000;
     }
@@ -98,7 +98,7 @@ static int tty_spawn_second(void) {
     g_ttys[1].gfx_mode = 0;
     g_ttys[1].active = 1;
 
-    // Оболочка TTY 2: общий цикл, привязка к TTY через tty_id[cite: 53]
+    // Оболочка TTY 2: общий цикл, привязка к TTY через tty_id
     task_t* t = task_create_kernel(tty_shell_loop, "tty2_shell");
     t->tty_id = 1;
 
@@ -108,7 +108,7 @@ static int tty_spawn_second(void) {
 void tty_switch(int target_id) {
     if (target_id == g_active_tty || target_id < 0 || target_id >= MAX_TTYS) return;
 
-    // 1. Создаём TTY 2 при первом обращении (Alt+F2)[cite: 53].
+    // 1. Создаём TTY 2 при первом обращении (Alt+F2).
     int is_first_open = 0;
     if (target_id == 1 && !g_ttys[1].active) {
         if (tty_spawn_second() != 0) return;   
@@ -121,7 +121,7 @@ void tty_switch(int target_id) {
     tty_t* cur = &g_ttys[g_active_tty];
     tty_t* dst = &g_ttys[target_id];
 
-    // 2. Сохраняем состояние текущей консоли[cite: 53]
+    // 2. Сохраняем состояние текущей консоли
     cur->cursor_x = cursor_x;
     cur->cursor_y = cursor_y;
     cur->prompt_min_x = prompt_min_x;
@@ -137,16 +137,16 @@ void tty_switch(int target_id) {
         cur->input_buf[i] = input_buffer[i];
     }
     
-    // Сохраняем текущий путь TTY[cite: 53]
+    // Сохраняем текущий путь TTY
     for (int i = 0; i < 128; i++) {
         cur->current_path[i] = current_path[i];
     }
 
-    // 3. Переключаем рабочий буфер отрисовки[cite: 53]
+    // 3. Переключаем рабочий буфер отрисовки
     g_active_tty = target_id;
     current_draw_buffer = dst->buffer;
 
-    // 4. Восстанавливаем состояние целевой консоли[cite: 53]
+    // 4. Восстанавливаем состояние целевой консоли
     cursor_x = dst->cursor_x;
     cursor_y = dst->cursor_y;
     prompt_min_x = dst->prompt_min_x;
@@ -168,6 +168,12 @@ void tty_switch(int target_id) {
         current_path[i] = dst->current_path[i];
     }
     
+    // fs_* делят одно состояние драйвера с sys_open/read/write и prog_loader/sys_loader —
+    // без замка процесс в другом TTY может вклиниться посреди этой пересинхронизации
+    extern void fs_lock(void);
+    extern void fs_unlock(void);
+    fs_lock();
+
     // Восстанавливаем реальное положение файловой системы по сохраненному пути
     fs_go_root();
     if (strcmp(dst->current_path, "/") != 0) {
@@ -193,14 +199,15 @@ void tty_switch(int target_id) {
             fs_change_dir(token);
         }
     }
+    fs_unlock();
 
-    // 5. TTY открыт впервые — баннер и приглашение[cite: 53]
+    // 5. TTY открыт впервые — баннер и приглашение
     if (is_first_open) {
         print_tty_banner(1);   
         print_prompt();
     }
 
-    // 6. Показываем экран целевого TTY[cite: 53]
+    // 6. Показываем экран целевого TTY
     flush_buffer();
 
     __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory", "cc");
@@ -224,23 +231,23 @@ void tty1_task_entry(void) {
 static int g_alt_state = 0;
 
 int tty_check_hotkey(uint8_t scancode) {
-    if (scancode == 0x38) { // Нажат Alt[cite: 53]
+    if (scancode == 0x38) { // Нажат Alt
         g_alt_state = 1;
         return 0; 
     }
-    if (scancode == 0xB8) { // Отпущен Alt[cite: 53]
+    if (scancode == 0xB8) { // Отпущен Alt
         int was_combo = (g_alt_state == 2);
         g_alt_state = 0;
         return was_combo ? 1 : 0;
     }
 
     if (g_alt_state) {
-        if (scancode == 0x3B) { // F1 -> TTY 1[cite: 53]
+        if (scancode == 0x3B) { // F1 -> TTY 1
             g_alt_state = 2;
             tty_switch(0);
             return 1; 
         }
-        if (scancode == 0x3C) { // F2 -> TTY 2[cite: 53]
+        if (scancode == 0x3C) { // F2 -> TTY 2[
             g_alt_state = 2;
             tty_switch(1);
             return 1; 
