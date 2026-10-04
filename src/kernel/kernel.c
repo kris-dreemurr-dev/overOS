@@ -10,6 +10,7 @@
 #include "sched.h"
 #include "tty.h"
 #include "config.h"
+#include "loader_kernel.h"
 
 #include "../files/image/sprite.h"
 #include "../files/image/image.h"
@@ -1281,29 +1282,15 @@ void kernel_main(void) {
     __asm__ volatile ("sti");
     tsc_calibrate();
 
-    init_crash_guard_idt();
+    //init_crash_guard_idt();
 
     init_mc_monitor();
     init_ps2_mouse();
     clear_screen(0x000000);
 
-    ehci_init();
-    clear_screen(0x000000);
-    flush_buffer();
-    kputs("[", 0xFFFFFF); kputs(" OK ", 0x00AA00); kputs("] EHCI init\n", 0xFFFFFF);
-    flush_buffer();
-    sleep_ms(250);
-    kputs("[", 0xFFFFFF); kputs(" OK ", 0x00AA00); kputs("] File System mounted\n", 0xFFFFFF);
-    flush_buffer();
-    kputs("\n", 0xFFFFFF);
-    flush_buffer();
-    render_boot_logo();
-    sleep_ms(250);
-    kputs("[", 0xFFFFFF); kputs(" OK ", 0x00AA00); kputs("] Display driver init\n", 0xFFFFFF);
-    flush_buffer();
-    intel_set_backlight(100, 1);
-    sleep_ms(250);
+    kernel_system_bootstrap();
 
+    render_boot_logo();
 
     input_len = 0;
     for (int i = 0; i < MAX_INPUT; i++) {

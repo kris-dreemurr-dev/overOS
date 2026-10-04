@@ -56,6 +56,7 @@ QUAKE_PAK   := $(QUAKE_DIR)/pak0.pak
 # ИСХОДНЫЕ ФАЙЛЫ ЯДРА
 # ==============================================================================
 C_SRC   := $(SRC_DIR)/kernel/kernel.c \
+		   $(SRC_DIR)/kernel/loader_kernel.c \
            $(SRC_DIR)/kernel/main.c \
            $(SRC_DIR)/kernel/tty.c \
            $(SRC_DIR)/kernel/sched.c \

@@ -10,7 +10,7 @@
 #define  OS_VERSION         "0.0.1"
 
 #define  FUN_EDITION        0
-#define  DEBUG_MODE         1
+#define  DEBUG_MODE         0
 #define  BSOD_ENABLED       1
 // ==============================================================
 

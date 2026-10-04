@@ -2,9 +2,11 @@
 #include "fat16.h"
 #include "../drivers/usb/ehci-msc.h"
 
+extern void kputs(const char* str, uint32_t color);
 extern void kdebug(const char* str, uint32_t color);
 extern void itoa(int n, char* str);
 extern int strcmp(const char* s1, const char* s2);
+extern void flush_buffer(void);
 
 static fat32_bpb_t g_bpb32;
 static uint32_t g_partition_lba = 2048;
@@ -248,9 +250,9 @@ void fat32_dir(void) {
     uint32_t cluster = g_current_cluster32;
     uint32_t spc = g_bpb32.sectors_per_cluster;
 
-    kdebug("\nDirectory contents (FAT32):\n", 0x55FFFF);
-    kdebug("NAME                 SIZE\n", 0xAAAAAA);
-    kdebug("--------------------------------\n", 0xAAAAAA);
+    kputs("\nDirectory contents (FAT32):\n", 0x55FFFF);
+    kputs("NAME                 SIZE\n", 0xAAAAAA);
+    kputs("--------------------------------\n", 0xAAAAAA);
 
     while (cluster >= 2 && cluster < 0x0FFFFFF8) {
         uint32_t cluster_lba = g_data_lba + (cluster - 2) * spc;
@@ -285,7 +287,6 @@ void fat32_dir(void) {
                     }
                     display_name[p] = '\0';
                 } else {
-                    // НАСТОЯЩИЙ регистр 8.3 с учётом NTRes
                     uint8_t ntres = entry->reserved;
                     int lower_name = (ntres & 0x08);
                     int lower_ext  = (ntres & 0x10);
@@ -311,18 +312,18 @@ void fat32_dir(void) {
                     display_name[p] = '\0';
                 }
 
-                kdebug(display_name, 0xFFFF55);
+                kputs(display_name, 0xFFFF55);
                 int pad = 21;
                 for (int l = 0; display_name[l]; l++) pad--;
-                while (pad-- > 0) kdebug(" ", 0);
+                while (pad-- > 0) kputs(" ", 0);
 
                 if (entry->attributes & 0x10) {
-                    kdebug("<DIR>\n", 0x55FF55);
+                    kputs("<DIR>\n", 0x55FF55);
                 } else {
                     char sz_str[16];
                     format_size(entry->file_size, sz_str);
-                    kdebug(sz_str, 0x55FF55);
-                    kdebug("\n", 0);
+                    kputs(sz_str, 0x55FF55);
+                    kputs("\n", 0);
                 }
 
                 global_lfn_buf[0] = '\0';
@@ -330,6 +331,7 @@ void fat32_dir(void) {
         }
         cluster = fat32_get_next_cluster(cluster);
     }
+    flush_buffer();
 }
 
 int fat32_change_dir(const char* name) {
