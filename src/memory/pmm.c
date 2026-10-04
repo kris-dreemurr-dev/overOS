@@ -104,3 +104,11 @@ void* pmm_alloc_pages(size_t count) {
 }
 
 uint64_t pmm_free_pages(void) { return pmm_max_blocks - pmm_used_blocks; }
+
+uint64_t pmm_get_used_blocks(void) {
+    return pmm_used_blocks;
+}
+
+uint64_t pmm_get_total_blocks(void) {
+    return pmm_max_blocks;
+}

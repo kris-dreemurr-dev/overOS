@@ -20,6 +20,7 @@ typedef struct {
     char current_path[128];
     uint32_t bg_color;   
     int gfx_mode;        
+    int fg_pid;   // PID процесса-владельца этого TTY (-1 = нет), для Ctrl+C
 } tty_t;
 
 void   tty_init_core(void);

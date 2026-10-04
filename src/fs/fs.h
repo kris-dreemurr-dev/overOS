@@ -31,6 +31,7 @@ int      fs_file_exists(const char* name);
 int      fs_is_mounted(void);
 int      fs_get_dir_files(fs_file_info_t* out_list, int max_files);
 const char* fs_get_last_dir_name(void);
+void fs_get_stats(uint32_t* out_used_mb, uint32_t* out_total_mb);
 
 // Все fs_*/fat32_* вызовы делят одно состояние драйвера (позиция в каталоге,
 // буфер сектора): конкурентный доступ из разных задач/прерываний его портит.

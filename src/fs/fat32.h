@@ -51,5 +51,6 @@ int      fat32_is_mounted(void);
 int      fat32_get_dir_files(fs_file_info_t* out_list, int max_files);
 const char* fat32_get_last_dir_name(void);
 static int fat32_entry_exists(const char* name);
+void fat32_get_stats(uint32_t* out_used_mb, uint32_t* out_total_mb);
 
 #endif

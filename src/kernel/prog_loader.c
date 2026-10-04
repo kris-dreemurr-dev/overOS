@@ -165,7 +165,7 @@ int prog_load_module(const char* filename, const char* args) {
     kputs("\n", 0x00FFFFFF);
     flush_buffer();
 
-    if (my_tty) my_tty->gfx_mode = 1;      // курсор консоли не рисуем поверх программы
+    if (my_tty) { my_tty->gfx_mode = 1; my_tty->fg_pid = (int)proc->pid; }   // курсор не рисуем, Ctrl+C метит в этот PID
     sched_set_foreground_task(proc);
 
     // 9. Ждём завершения. Внутри: адресное пространство, ядерный стек и task_t
@@ -173,7 +173,7 @@ int prog_load_module(const char* filename, const char* args) {
     int exit_code = sched_wait_child(proc);
 
     sched_set_foreground_task(NULL);
-    if (my_tty) my_tty->gfx_mode = 0;
+    if (my_tty) { my_tty->gfx_mode = 0; my_tty->fg_pid = -1; }
 
     kputs("\n[devOS] Process finished with exit code: ", 0x00AAAAAA);
     itoa(exit_code, bbuf);

@@ -1257,3 +1257,58 @@ int fat32_get_dir_files(fs_file_info_t* out_list, int max_files) {
     }
     return count;
 }
+
+// расчет реального объема и занятого места на диске
+void fat32_get_stats(uint32_t* out_used_mb, uint32_t* out_total_mb) {
+    if (!g_mounted32 || g_bpb32.bytes_per_sector == 0) {
+        if (out_used_mb) *out_used_mb = 0;
+        if (out_total_mb) *out_total_mb = 0;
+        return;
+    }
+
+    uint32_t bytes_per_sec = g_bpb32.bytes_per_sector;
+    uint32_t sec_per_cluster = g_bpb32.sectors_per_cluster;
+    uint32_t cluster_size_bytes = bytes_per_sec * sec_per_cluster;
+
+    // Общее количество секторов тома
+    uint32_t total_sectors = g_bpb32.total_sectors_long;
+    if (total_sectors == 0) {
+        total_sectors = g_bpb32.total_sectors_short;
+    }
+
+    // Сектора области данных = Всего секторов - Зарезервированные - FAT-таблицы
+    uint32_t fat_sectors_total = g_bpb32.fat_count * g_bpb32.sectors_per_fat_32;
+    uint32_t non_data_sectors = g_bpb32.reserved_sectors + fat_sectors_total;
+    uint32_t data_sectors = (total_sectors > non_data_sectors) ? (total_sectors - non_data_sectors) : 0;
+
+    // Общее количество доступных кластеров данных (начиная с кластера 2)
+    uint32_t total_clusters = data_sectors / sec_per_cluster;
+
+    // Считаем занятые кластеры по таблице FAT (1 сектор FAT = 128 записей)
+    uint32_t total_fat_sectors = g_bpb32.sectors_per_fat_32;
+    uint32_t occupied_clusters = 0;
+
+    for (uint32_t s = 0; s < total_fat_sectors; s++) {
+        if (!ehci_msc_read_sectors(g_fat_lba + s, 1, sector_buf32)) break;
+        uint32_t* entries = (uint32_t*)sector_buf32;
+
+        int start_idx = (s == 0) ? 2 : 0;
+        for (int i = start_idx; i < 128; i++) {
+            uint32_t cluster_idx = s * 128 + i;
+            if (cluster_idx >= total_clusters + 2) break;
+
+            // Если элемент FAT != 0x00000000, кластер распределен (занят)
+            if ((entries[i] & 0x0FFFFFFF) != 0x00000000) {
+                occupied_clusters++;
+            }
+        }
+        if (s * 128 >= total_clusters + 2) break;
+    }
+
+    // Переводим в мегабайты (MiB)
+    uint64_t total_bytes = (uint64_t)total_clusters * cluster_size_bytes;
+    uint64_t used_bytes  = (uint64_t)occupied_clusters * cluster_size_bytes;
+
+    if (out_total_mb) *out_total_mb = (uint32_t)(total_bytes / (1024 * 1024));
+    if (out_used_mb)  *out_used_mb  = (uint32_t)(used_bytes / (1024 * 1024));
+}

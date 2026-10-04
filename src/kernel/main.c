@@ -223,6 +223,24 @@ static void copy_to_prog_name(const char* cmd, char* out_prog, int max_len) {
     out_prog[out_len] = '\0';
 }
 
+void cmd_timer_test(void) {
+    kputs("Запуск теста таймера на 10 секунд...\n", 0x55FFFF);
+    flush_buffer();
+
+    for (int i = 1; i <= 10; i++) {
+        sleep_ms(1000); // Ждем ровно 1000 тиков PIT
+        
+        char buf[16];
+        itoa(i, buf);
+        kputs(buf, 0xFFFFFF);
+        kputs("... ", 0xAAAAAA);
+        flush_buffer();
+    }
+    
+    kputs("\n[ OK ] Тест завершен!\n", 0x00AA00);
+    flush_buffer();
+}
+
 void execute_command(void) {
     kputc('\n', 0xFFFFFF);
 
@@ -276,7 +294,8 @@ void execute_command(void) {
         kputs("fastfetch -a        ", 0xFFFF55); kputs("- System info with audio controllers\n", 0xFFFFFF);
         kputs("brightness <0-100>  ", 0xFFFF55); kputs("- Set screen backlight brightness\n", 0xFFFFFF);
         kputs("ehci-log            ", 0xFFFF55); kputs("- Display EHCI host controller debug log\n", 0xFFFFFF);
-        kputs("taskmgr             ", 0xFFFF55); kputs("- Task Manager\n", 0xFFFFFF);
+        kputs("taskmgr / ps        ", 0xFFFF55); kputs("- Task Manager\n", 0xFFFFFF);
+        kputs("pkill <pid> [sig]   ", 0xFFFF55); kputs("- Send a signal to PID (default SIGKILL=9)\n", 0xFFFFFF);
 
         kputs("\n--- System Control ---\n", 0x55FF55);
         kputs("update [-r] [-b]    ", 0xFFFF55); kputs("- Self-update kernel (-r raw, -b bootloader)\n", 0xFFFFFF);
@@ -286,14 +305,51 @@ void execute_command(void) {
     // --- Встроенные приложения и диагностика ---
     } else if (strcmp(cmd, "render") == 0) {
         enter_render_mode();
+    } else if (strcmp(cmd, "time") == 0) {
+        cmd_timer_test();
     } else if (strcmp(cmd, "fastfetch -a") == 0 || strcmp(cmd, "fastfetch-audio") == 0) {
         cmd_fastfetch_audio();
     } else if (strcmp(cmd, "fastfetch") == 0) {
         cmd_fastfetch();
     } else if (strcmp(cmd, "ehci-log") == 0) {
         cmd_ehci_log();
-    } else if (strcmp(cmd, "taskmgr") == 0) {
+    } else if (strcmp(cmd, "taskmgr") == 0 || strcmp(cmd, "ps") == 0) {
         sched_dump_tasks();
+
+    } else if (strncmp(cmd, "pkill ", 6) == 0) {
+        char* arg = cmd + 6;
+        while (*arg == ' ') arg++;
+
+        // PID (обязательный)
+        long pid = 0;
+        int has_pid = 0;
+        while (*arg >= '0' && *arg <= '9') { pid = pid * 10 + (*arg - '0'); arg++; has_pid = 1; }
+
+        while (*arg == ' ') arg++;
+
+        // Сигнал (необязательный, по умолчанию SIGKILL — как у настоящего pkill)
+        int sig = SIGKILL;
+        if (*arg >= '0' && *arg <= '9') {
+            sig = 0;
+            while (*arg >= '0' && *arg <= '9') { sig = sig * 10 + (*arg - '0'); arg++; }
+        }
+
+        if (!has_pid || pid <= 0) {
+            kputs("Usage: pkill <pid> [signal]   (signal defaults to 9 = SIGKILL)\n", 0xFF5555);
+        } else if (pid == 0) {
+            kputs("pkill: refusing to signal PID 0 (kernel_main)\n", 0xFF5555);
+        } else {
+            int r = sched_send_signal((uint64_t)pid, sig);
+            char nb[16];
+            if (r == 0) {
+                kputs("Signal ", 0x55FF55); itoa(sig, nb); kputs(nb, 0xFFFFFF);
+                kputs(" sent to PID ", 0x55FF55); itoa((int)pid, nb); kputs(nb, 0xFFFFFF);
+                kputc('\n', 0xFFFFFF);
+            } else {
+                kputs("pkill: no such PID ", 0xFF5555); itoa((int)pid, nb); kputs(nb, 0xFFFFFF);
+                kputs(" (not running, already dead, or that's you)\n", 0xFF5555);
+            }
+        }
 
     // --- Файловая система и драйверы ---
 } else if (strncmp(cmd, "brightness ", 11) == 0 || strncmp(cmd, "bright ", 7) == 0) {

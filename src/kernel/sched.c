@@ -386,6 +386,61 @@ void sched_enqueue_task(task_t* t) {
     __asm__ volatile("pushq %0; popfq" :: "r"(fl) : "memory", "cc");
 }
 
+int sched_wait_pid(uint64_t pid, int* out_code) {
+    task_t* me = current_task;
+
+    // Ищем задачу с этим PID среди СВОИХ детей. Сканируем под cli: список может
+    // поменяться (exit другого ребёнка), а pid не должен успеть переиспользоваться
+    // посреди поиска (next_pid только растёт, переиспользования PID нет).
+    uint64_t fl;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(fl) :: "memory");
+    task_t* found = NULL;
+    if (task_list_head) {
+        task_t* c = task_list_head;
+        do {
+            if (c->pid == pid && c->parent == me) { found = c; break; }
+            c = c->next;
+        } while (c != task_list_head);
+    }
+    __asm__ volatile("pushq %0; popfq" :: "r"(fl) : "memory", "cc");
+
+    if (!found) return 0;   // не наш ребёнок, уже собран кем-то другим, или не существует
+
+    int code = sched_wait_child(found);
+    if (out_code) *out_code = code;
+    return 1;
+}
+
+int sched_send_signal(uint64_t pid, int sig) {
+    uint64_t fl;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(fl) :: "memory");
+
+    task_t* target = NULL;
+    if (task_list_head) {
+        task_t* c = task_list_head;
+        do {
+            if (c->pid == pid) { target = c; break; }
+            c = c->next;
+        } while (c != task_list_head);
+    }
+
+    if (!target || target == current_task ||
+        target->state == TASK_ZOMBIE || target->state == TASK_DEAD) {
+        __asm__ volatile("pushq %0; popfq" :: "r"(fl) : "memory", "cc");
+        return -1;   // нет такого PID, это мы сами (себя так не убить), или уже не жив
+    }
+
+    // Ни SIGKILL, ни SIGINT не перехватываются — цель просто становится ZOMBIE,
+    // будим её родителя, если он спит в wait() (как и при обычном exit()).
+    // Отрицательный exit_code — по аналогии с Unix WIFSIGNALED: "убит сигналом sig".
+    target->exit_code = -sig;
+    target->state = TASK_ZOMBIE;
+    if (target->parent && target->parent->state == TASK_SLEEPING) target->parent->state = TASK_READY;
+
+    __asm__ volatile("pushq %0; popfq" :: "r"(fl) : "memory", "cc");
+    return 0;
+}
+
 void sched_exit_current(int code) {
     __asm__ volatile("cli");
     task_t* me = current_task;

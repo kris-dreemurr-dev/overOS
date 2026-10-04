@@ -6,12 +6,15 @@
 #include "prog_loader.h"
 #include "tty.h"
 
+
 extern void     kputs(const char* str, uint32_t color);
 extern int      strcmp(const char* s1, const char* s2);
 extern void     put_pixel(int x, int y, uint32_t color);
 extern void     clear_screen(uint32_t color);
 extern void     flush_buffer(void);
+extern void     update_mouse_state(void);
 extern void     sleep_ms(uint32_t ms);
+extern void     get_mouse_delta(int* out_dx, int* out_dy, uint8_t* out_buttons);
 extern uint8_t  inb(uint16_t port);
 extern void     itoa(int n, char* str);
 extern uint16_t screen_width;
@@ -191,11 +194,13 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
 
         case 10: { // sys_open(filename)
             if (!arg1) return (uint64_t)-1;
-            //fs_go_root();
             const char* filename = (const char*)arg1;
-            if (fs_file_exists(filename)) {
+            fs_lock();
+            int exists = fs_file_exists(filename);
+            fs_unlock();
+            if (exists) {
                 int idx = 0;
-                while (filename[idx] && idx < 63) {
+                while (filename[idx] && idx < (int)sizeof(caller->open83) - 1) {
                     caller->open83[idx] = filename[idx]; // Буфер для открытого файла в task_t
                     idx++;
                 }
@@ -207,8 +212,10 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
 
         case 11: // sys_read
             if ((int)arg1 <= 0 || arg2 == 0 || arg3 == 0 || caller->open83[0] == '\0') return 0;
-            //fs_go_root();
-            return (uint64_t)fs_read_file(caller->open83, (void*)arg2, (uint32_t)arg3);
+            fs_lock();
+            uint64_t rd_ret = (uint64_t)fs_read_file(caller->open83, (void*)arg2, (uint32_t)arg3);
+            fs_unlock();
+            return rd_ret;
 
         case 12: // sys_close
             caller->open83[0] = '\0';
@@ -216,9 +223,11 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
 
         case 13: { // sys_write(filename, buffer, size)
             if (arg1 && arg2) {
-                //fs_go_root();
                 const char* filename = (const char*)arg1;
-                return (uint64_t)fs_write_file(filename, (const void*)arg2, (uint32_t)arg3);
+                fs_lock();
+                uint64_t wr_ret = (uint64_t)fs_write_file(filename, (const void*)arg2, (uint32_t)arg3);
+                fs_unlock();
+                return wr_ret;
             }
             return 0;
         }
@@ -267,59 +276,77 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
             }
             return 0;
 
-case 21: { // sys_blit_frame(fb) -> сколько мс задача простояла на паузе (пауза часов)
-    if (!arg1 || arg1 >= 0x0000800000000000ULL) return 0;
-    if (!caller || caller->tty_id < 0 || screen_width == 0 || screen_height == 0) return 0;
-    tty_t* my_tty = tty_get(caller->tty_id);
-    if (!my_tty || !my_tty->buffer) return 0;
-    const uint32_t* user_fb = (const uint32_t*)arg1;
+        case 21: { // sys_blit_frame(fb) -> сколько мс задача простояла на паузе (пауза часов)
+            if (!arg1 || arg1 >= 0x0000800000000000ULL) return 0;
+            if (!caller || caller->tty_id < 0 || screen_width == 0 || screen_height == 0) return 0;
+            tty_t* my_tty = tty_get(caller->tty_id);
+            if (!my_tty || !my_tty->buffer) return 0;
+            const uint32_t* user_fb = (const uint32_t*)arg1;
 
-    uint32_t paused = 0;
-    if (tty_get_active_id() != caller->tty_id) {
-        // TTY программы не на экране: стоим и отдаём процессор другим задачам
-        uint32_t t0 = now_ms();
-        while (tty_get_active_id() != caller->tty_id) sched_yield();
-        paused = now_ms() - t0;
+            uint32_t paused = 0;
+            if (tty_get_active_id() != caller->tty_id) {
+                // TTY программы не на экране: стоим и отдаём процессор другим задачам
+                uint32_t t0 = now_ms();
+                while (tty_get_active_id() != caller->tty_id) sched_yield();
+                paused = now_ms() - t0;
 
-        // Alt-up прочитала оболочка другого TTY: шлём релизы, чтобы клавиши не залипли
-        static const uint8_t rel[3] = {0xB8, 0x9D, 0xAA};   // Alt, Ctrl, Shift up
-        for (int i = 0; i < 3; i++) {
-            int nx = (g_kbd_head + 1) % KBD_BUF_SIZE;
-            if (nx != g_kbd_tail) { g_kbd_buf[g_kbd_head] = rel[i]; g_kbd_head = nx; }
-        }
-    }
-
-    uint32_t* dst_buf = my_tty->buffer;   // буфер TTY, в котором запущена программа
-    uint32_t step_x = ((uint32_t)320 << 16) / screen_width;
-    uint32_t step_y = ((uint32_t)200 << 16) / screen_height;
-    uint32_t src_y_fp = 0, prev_sy = 0xFFFFFFFFu;
-    uint32_t* prev_row = 0;
-
-    for (uint32_t dst_y = 0; dst_y < screen_height; dst_y++) {
-        uint32_t src_y = src_y_fp >> 16;
-        if (src_y >= 200) src_y = 199;
-        uint32_t* dst_row = &dst_buf[dst_y * screen_width];
-
-        if (src_y == prev_sy) {   // та же исходная строка: копируем уже готовую
-            uint32_t* d = dst_row; const uint32_t* sp = prev_row; uint64_t n = screen_width;
-            __asm__ volatile ("rep movsl" : "+D"(d), "+S"(sp), "+c"(n) :: "memory");
-        } else {
-            const uint32_t* src_row = user_fb + (src_y * 320);
-            uint32_t src_x_fp = 0;
-            for (uint32_t dst_x = 0; dst_x < screen_width; dst_x++) {
-                dst_row[dst_x] = src_row[src_x_fp >> 16];
-                src_x_fp += step_x;
+                // Alt-up прочитала оболочка другого TTY: шлём релизы, чтобы клавиши не залипли
+                static const uint8_t rel[3] = {0xB8, 0x9D, 0xAA};   // Alt, Ctrl, Shift up
+                for (int i = 0; i < 3; i++) {
+                    int nx = (g_kbd_head + 1) % KBD_BUF_SIZE;
+                    if (nx != g_kbd_tail) { g_kbd_buf[g_kbd_head] = rel[i]; g_kbd_head = nx; }
+                }
             }
-        }
-        prev_sy = src_y;
-        prev_row = dst_row;
-        src_y_fp += step_y;
-    }
 
-    flush_buffer();   // TTY программы сейчас активен
-    return paused;
-}
+            uint32_t* dst_buf = my_tty->buffer;   // буфер TTY, в котором запущена программа
+            uint32_t step_x = ((uint32_t)320 << 16) / screen_width;
+            uint32_t step_y = ((uint32_t)200 << 16) / screen_height;
+            uint32_t src_y_fp = 0, prev_sy = 0xFFFFFFFFu;
+            uint32_t* prev_row = 0;
+
+            for (uint32_t dst_y = 0; dst_y < screen_height; dst_y++) {
+                uint32_t src_y = src_y_fp >> 16;
+                if (src_y >= 200) src_y = 199;
+                uint32_t* dst_row = &dst_buf[dst_y * screen_width];
+
+                if (src_y == prev_sy) {   // та же исходная строка: копируем уже готовую
+                    uint32_t* d = dst_row; const uint32_t* sp = prev_row; uint64_t n = screen_width;
+                    __asm__ volatile ("rep movsl" : "+D"(d), "+S"(sp), "+c"(n) :: "memory");
+                } else {
+                    const uint32_t* src_row = user_fb + (src_y * 320);
+                    uint32_t src_x_fp = 0;
+                    for (uint32_t dst_x = 0; dst_x < screen_width; dst_x++) {
+                       dst_row[dst_x] = src_row[src_x_fp >> 16];
+                       src_x_fp += step_x;
+                    }
+                }
+                prev_sy = src_y;
+                prev_row = dst_row;
+                src_y_fp += step_y;
+            }
+
+            flush_buffer();   // TTY программы сейчас активен
+            return paused;
+        }
         case 22: return g_tsc_per_ms;
+        // В диспетчере syscall ядра devOS:
+        case 23: {
+            // Вход: EBX = указатель на int dx, ECX = int dy, EDX = uint8_t buttons
+            int* u_dx = (int*)arg1;       // вместо regs->rbx
+            int* u_dy = (int*)arg2;       // вместо regs->rcx
+            uint8_t* u_btn = (uint8_t*)arg3; // вместо regs->rdx
+    
+            update_mouse_state();
+
+            int k_dx, k_dy;
+            uint8_t k_btn;
+            get_mouse_delta(&k_dx, &k_dy, &k_btn);
+    
+            if (u_dx) *u_dx = k_dx;
+            if (u_dy) *u_dy = k_dy;
+            if (u_btn) *u_btn = k_btn;
+            break;
+        }
         case 30: { // sys_fork()
             task_t* parent = sched_get_current_task();
             if (!parent) return (uint64_t)-1;
@@ -392,41 +419,141 @@ case 21: { // sys_blit_frame(fb) -> сколько мс задача прост�
 
             sched_enqueue_task(child);
 
+            kputs("[fork] new child PID=", 0x55FFFF);
+            char fbuf[16]; itoa((int)child->pid, fbuf);
+            kputs(fbuf, 0xFFFFFF); kputs(", parent PID=", 0x55FFFF);
+            itoa((int)parent->pid, fbuf); kputs(fbuf, 0xFFFFFF); kputs("\n", 0x55FFFF);
+            sched_dump_tasks();
+
             // Родителю — PID ребёнка (у ребёнка в его копии кадра уже стоит RAX = 0)
             return child->pid;
         }
 
-        case 31: { // sys_execve(const char* filename)
+        case 32: { // sys_waitpid(pid, int* out_status) -> 1 если дождались и собрали, 0 иначе
+            // out_status — указатель В АДРЕСНОМ ПРОСТРАНСТВЕ ВЫЗЫВАЮЩЕГО. CR3 на время
+            // сисколла не меняется (higher-half и так общий), поэтому писать в него отсюда
+            // безопасно — ровно как в случаях 2/11 (put_pixel/sys_read).
+            int* out_status = (int*)arg2;
+            int code = 0;
+            int ok = sched_wait_pid((uint64_t)arg1, &code);
+
+            char wbuf[16];
+            kputs("[waitpid] pid=", 0x55FFFF);
+            itoa((int)arg1, wbuf); kputs(wbuf, 0xFFFFFF);
+            if (ok) {
+                if (out_status) *out_status = code;
+                kputs(": reaped, exit_code=", 0x55FFFF);
+                itoa(code, wbuf); kputs(wbuf, 0xFFFFFF); kputs("\n", 0x55FFFF);
+            } else {
+                kputs(": FAILED (not our child or already reaped)\n", 0x55FFFF);
+            }
+            sched_dump_tasks();
+            return (uint64_t)ok;
+        }
+
+        case 33: { // sys_kill(pid, sig)
+            uint64_t target_pid = arg1;
+            int sig = (int)arg2;
+            if (caller && target_pid == caller->pid) {
+                // Самоубийство: обычный путь выхода, с отрицательным кодом (как Unix WIFSIGNALED)
+                flush_buffer();
+                sched_exit_current(-sig);   // не возвращается
+            }
+            int kr = sched_send_signal(target_pid, sig);
+            kputs("[kill] pid=", 0x55FFFF);
+            char kbuf[16]; itoa((int)target_pid, kbuf); kputs(kbuf, 0xFFFFFF);
+            kputs(" sig=", 0x55FFFF); itoa(sig, kbuf); kputs(kbuf, 0xFFFFFF);
+            kputs(kr == 0 ? ": delivered\n" : ": FAILED (no such pid, or it's you)\n", 0x55FFFF);
+            sched_dump_tasks();
+            return (uint64_t)(int64_t)kr;
+        }
+
+        case 31: { // sys_execve(const char* filename, const char* args) — args пока не используется
             const char* filename = (const char*)arg1;
             if (!filename) return (uint64_t)-1;
 
-            fs_go_root();
-            extern uint8_t kernel_temp_buf[];
+            extern uint8_t kernel_temp_buf[];      // общий с prog_loader.c/sys_loader.c — под fs_lock
+            fs_lock();
             int bytes = fs_read_file(filename, kernel_temp_buf, 1024 * 1024 * 4);
+            fs_unlock();
             if (bytes <= 0) return (uint64_t)-1;
 
             task_t* current = sched_get_current_task();
             if (!current) return (uint64_t)-1;
 
-            vmm_destroy_address_space((uint64_t*)current->cr3);
+            // 1. Разбор формата — как в prog_loader.c: нативный DPRG или плоский бинарник.
+            //    Старая версия этого не делала вовсе и грузила файл как плоский блоб,
+            //    игнорируя entry_point/bss_size из заголовка.
+            devos_prg_header_t* hdr = (devos_prg_header_t*)kernel_temp_buf;
+            uint64_t load_base = PROG_LOAD_BASE;
+            uint64_t entry_vaddr = PROG_LOAD_BASE;
+            uint64_t payload_offset = 0;
+            uint64_t payload_bytes = (uint64_t)bytes;
+            uint64_t total_image_bytes = payload_bytes;
+            uint32_t stack_size = 512 * 1024;
 
+            if (hdr->magic[0] == 'D' && hdr->magic[1] == 'P' && hdr->magic[2] == 'R' && hdr->magic[3] == 'G') {
+                load_base = hdr->load_vaddr ? hdr->load_vaddr : PROG_LOAD_BASE;
+                entry_vaddr = hdr->entry_point ? hdr->entry_point : load_base;
+                payload_offset = sizeof(devos_prg_header_t);
+                payload_bytes = hdr->code_size;
+                total_image_bytes = hdr->code_size + hdr->bss_size;
+                if (hdr->stack_size) stack_size = (uint32_t)hdr->stack_size;
+            }
+
+            // 2. Новое адресное пространство создаём РАНЬШЕ, чем уничтожаем старое:
+            //    если здесь не хватит памяти, старое остаётся целым и можно спокойно
+            //    вернуть ошибку, не убивая вызывающий процесс (как и положено execve).
             uint64_t* new_pml4 = vmm_create_address_space();
-            current->cr3 = (uint64_t)new_pml4;
-            vmm_switch_directory(new_pml4);
+            if (!new_pml4) return (uint64_t)-1;
 
-            uint32_t num_pages = (8 * 1024 * 1024) / 4096;
-            for (uint32_t p = 0; p < num_pages; p++) {
-                uint64_t v_addr = PROG_LOAD_BASE + (p * 4096);
+            uint32_t num_image_pages = (total_image_bytes + 4095) / 4096;
+            if (num_image_pages == 0) num_image_pages = 1;
+            for (uint32_t pg = 0; pg < num_image_pages; pg++) {
+                uint64_t v_addr = load_base + (uint64_t)pg * 4096;
                 void* p_addr = pmm_alloc_page();
+                if (!p_addr) { vmm_destroy_address_space(new_pml4); return (uint64_t)-1; }
                 vmm_map_page(new_pml4, v_addr, (uint64_t)p_addr, VMM_FLAG_USER | VMM_FLAG_WRITABLE);
             }
 
-            uint8_t* target = (uint8_t*)PROG_LOAD_BASE;
-            for (int b = 0; b < bytes; b++) {
-                target[b] = kernel_temp_buf[b];
+            // 3. Свой стек — старой версии этого вообще не хватало (RSP указывал бы
+            //    в никуда после переключения CR3, первый же push дал бы page fault).
+            uint32_t num_stack_pages = (stack_size + 4095) / 4096;
+            uint64_t stack_top = 0x00007FFFFFFF0000ULL;
+            uint64_t stack_base = stack_top - (uint64_t)num_stack_pages * 4096;
+            for (uint32_t pg = 0; pg < num_stack_pages; pg++) {
+                void* p_addr = pmm_alloc_page();
+                if (p_addr) vmm_map_page(new_pml4, stack_base + (uint64_t)pg * 4096,
+                                         (uint64_t)p_addr, VMM_FLAG_USER | VMM_FLAG_WRITABLE);
             }
 
-            return 0;
+            // 4. Копируем тело и зануляем .bss — ровно как prog_loader.c
+            vmm_switch_directory(new_pml4);
+
+            uint8_t* target = (uint8_t*)load_base;
+            uint8_t* src = kernel_temp_buf + payload_offset;
+            for (uint64_t i = 0; i < payload_bytes; i++) target[i] = src[i];
+            for (uint64_t i = payload_bytes; i < (uint64_t)num_image_pages * 4096; i++) target[i] = 0;
+
+            // 5. Старое пространство заменяем новым и только теперь освобождаем старое
+            uint64_t old_cr3 = current->cr3;
+            current->cr3 = (uint64_t)new_pml4;
+            vmm_destroy_address_space((uint64_t*)old_cr3);
+
+            current->heap_start = load_base + (uint64_t)num_image_pages * 4096;
+            current->heap_end   = current->heap_start;
+            current->open83[0] = '\0';   // открытый файл из прошлого образа больше не существует
+
+            // 6. ГЛАВНОЕ: меняем RIP/RSP прямо в сохранённом кадре прерывания (тот же
+            //    frame[], что и в sys_fork). Старая версия этого не делала — обычный
+            //    возврат из сисколла иретнул бы на старый RIP/RSP, которых в новом
+            //    адресном пространстве больше нет как исполняемого кода и стека.
+            frame[15] = entry_vaddr;   // RIP
+            frame[18] = stack_top;     // RSP
+
+            return 0;   // RAX тоже будет 0 на входе в новую программу — это ОК,
+                        // execve() в Unix в случае успеха вообще не возвращается в
+                        // вызвавший код, так что значение RAX здесь никто не прочитает
         }
         default:
             return 0;

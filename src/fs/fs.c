@@ -121,3 +121,12 @@ const char* fs_get_last_dir_name(void) {
     return "";
 #endif
 }
+
+void fs_get_stats(uint32_t* out_used_mb, uint32_t* out_total_mb) {
+#if USE_FAT32
+    fat32_get_stats(out_used_mb, out_total_mb);
+#else
+    if (out_used_mb) *out_used_mb = 0;
+    if (out_total_mb) *out_total_mb = 0;
+#endif
+}

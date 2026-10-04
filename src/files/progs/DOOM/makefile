@@ -49,7 +49,7 @@ doom.elf: $(ALL_OBJS)
 DOOM.PRG: doom.elf
 	python3 ../../../../tools/elf2prg.py doom.elf DOOM.PRG
 	@echo "========================================="
-	@echo "  SUCCESS: devOS 64-bit DOOM.PRG ready!  "
+	@echo "  SUCCESS: overOS 64-bit DOOM.PRG ready!  "
 	@echo "========================================="
 
 clean:

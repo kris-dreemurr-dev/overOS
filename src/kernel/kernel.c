@@ -233,6 +233,17 @@ uint16_t inw(uint16_t port) {
     return ret;
 }
 
+// Если outl / inl еще не объявлены в заголовочных файлах ядра:
+static inline void outl(uint16_t port, uint32_t val) {
+    __asm__ volatile ("outl %0, %1" : : "a"(val), "Nd"(port));
+}
+
+static inline uint32_t inl(uint16_t port) {
+    uint32_t ret;
+    __asm__ volatile ("inl %1, %0" : "=a"(ret) : "Nd"(port));
+    return ret;
+}
+
 void sleep_ms(uint32_t ms) {
     if (ms == 0) return;
 
@@ -580,11 +591,113 @@ void enter_render_mode(void) {
     console_restore_state();
 }
 
-void cmd_fastfetch(void) {
-    char buf[32];
-    uint32_t uptime_sec = timer_ticks / 1000;
+// Чтение модели процессора через CPUID
+static void get_cpu_brand(char* out_brand) {
+    uint32_t brand[12];
+    for (int i = 0; i < 3; i++) {
+        __asm__ volatile ("cpuid"
+            : "=a"(brand[i * 4 + 0]), "=b"(brand[i * 4 + 1]), 
+              "=c"(brand[i * 4 + 2]), "=d"(brand[i * 4 + 3])
+            : "a"(0x80000002 + i), "c"(0));
+    }
+    char* src = (char*)brand;
+    while (*src == ' ') src++; // Пропуск начальных пробелов
+    int idx = 0;
+    while (*src && idx < 47) out_brand[idx++] = *src++;
+    out_brand[idx] = '\0';
+}
 
-    int total_h = FASTFETCH_HEIGHT > 140 ? FASTFETCH_HEIGHT : 140;
+// Получение модели ПК/Платы через SMBIOS Type 1
+static void get_smbios_host(char* out_host, int max_len) {
+    const uint8_t* bios_mem = (const uint8_t*)0xF0000;
+    out_host[0] = '\0';
+
+    for (uint32_t off = 0; off < 0x10000; off += 16) {
+        if (bios_mem[off] == '_' && bios_mem[off+1] == 'S' && 
+            bios_mem[off+2] == 'M' && bios_mem[off+3] == '_') {
+            
+            uint32_t table_addr = *(const uint32_t*)&bios_mem[off + 0x18];
+            uint16_t num_structs = *(const uint16_t*)&bios_mem[off + 0x1C];
+            const uint8_t* ptr = (const uint8_t*)(uintptr_t)table_addr;
+
+            for (uint16_t i = 0; i < num_structs; i++) {
+                uint8_t type = ptr[0];
+                uint8_t len = ptr[1];
+                if (type == 1) { // System Information
+                    uint8_t prod_idx = ptr[5];
+                    const char* str = (const char*)ptr + len;
+                    while (prod_idx > 1 && *str) {
+                        while (*str) str++;
+                        str++;
+                        prod_idx--;
+                    }
+                    int k = 0;
+                    while (*str && k < max_len - 1) out_host[k++] = *str++;
+                    out_host[k] = '\0';
+                    return;
+                }
+                if (type == 127) break;
+                ptr += len;
+                while (*(const uint16_t*)ptr != 0) ptr++;
+                ptr += 2;
+            }
+            break;
+        }
+    }
+    if (out_host[0] == '\0') {
+        const char* def = "Generic x86_64 PC";
+        for (int i = 0; def[i]; i++) out_host[i] = def[i];
+        out_host[17] = '\0';
+    }
+}
+
+// Поиск GPU на шине PCI
+static void get_pci_gpu(char* out_gpu) {
+    for (uint8_t bus = 0; bus < 8; bus++) {
+        for (uint8_t slot = 0; slot < 32; slot++) {
+            uint32_t addr = (1U << 31) | (bus << 16) | (slot << 11);
+            outl(0xCF8, addr);
+            uint32_t ven_dev = inl(0xCFC);
+            uint16_t ven = ven_dev & 0xFFFF;
+            uint16_t dev = ven_dev >> 16;
+
+            if (ven == 0x10DE) { // NVIDIA
+                const char* n = "NVIDIA GeForce (PCIe)";
+                int i = 0; while (n[i]) { out_gpu[i] = n[i]; i++; }
+                out_gpu[i] = '\0';
+                return;
+            } else if (ven == 0x8086 && (slot == 2)) { // Intel Integrated
+                const char* n = "Intel HD Graphics";
+                int i = 0; while (n[i]) { out_gpu[i] = n[i]; i++; }
+                out_gpu[i] = '\0';
+                return;
+            } else if (ven == 0x1234 && dev == 0x1111) { // QEMU Standard VGA
+                const char* n = "QEMU Standard VBE Display";
+                int i = 0; while (n[i]) { out_gpu[i] = n[i]; i++; }
+                out_gpu[i] = '\0';
+                return;
+            }
+        }
+    }
+    const char* n = "VGA Compatible Controller";
+    int i = 0; while (n[i]) { out_gpu[i] = n[i]; i++; }
+    out_gpu[i] = '\0';
+}
+
+void cmd_fastfetch(void) {
+    char buf[64];
+    uint32_t total_sec = timer_ticks / 1000;
+    uint32_t days = total_sec / 86400;
+    uint32_t hours = (total_sec % 86400) / 3600;
+    uint32_t mins = (total_sec % 3600) / 60;
+    uint32_t secs = total_sec % 60;
+
+// Масштабирование спрайта в 2 раза
+    const int scale = 2;
+    int scaled_w = FASTFETCH_WIDTH * scale;
+    int scaled_h = FASTFETCH_HEIGHT * scale;
+
+    int total_h = scaled_h > 230 ? scaled_h : 230;
 
     while (cursor_y + total_h > screen_height) {
         scroll_screen();
@@ -594,68 +707,225 @@ void cmd_fastfetch(void) {
     int start_y = cursor_y;
 
     int sprite_x = start_x + 10;
-    int sprite_y = start_y + (total_h - FASTFETCH_HEIGHT) / 2;
+    int sprite_y = start_y + (total_h - scaled_h) / 2;
 
+    // Отрисовка с увеличением каждого пикселя в квадрат scale x scale
     for (int y = 0; y < FASTFETCH_HEIGHT; y++) {
         for (int x = 0; x < FASTFETCH_WIDTH; x++) {
             uint32_t color = fastfetch_sprite_data[y * FASTFETCH_WIDTH + x];
             if (color != 0x000000) {
-                put_pixel(sprite_x + x, sprite_y + y, color);
+                for (int dy = 0; dy < scale; dy++) {
+                    for (int dx = 0; dx < scale; dx++) {
+                        put_pixel(sprite_x + x * scale + dx, sprite_y + y * scale + dy, color);
+                    }
+                }
             }
         }
     }
 
-    int text_x = sprite_x + FASTFETCH_WIDTH + 20;
+    // Сдвигаем текстовый блок с учетом увеличенной ширины спрайта
+    int text_x = sprite_x + scaled_w + 24;
     int text_y = start_y;
 
-    kputs_at(text_x, text_y, "root@" OS_LOWER_NAME, 0xFFFFFF); text_y += 18;
-    kputs_at(text_x, text_y, "----------", 0xAAAAAA); text_y += 18;
+    // Имя хоста
+    kputs_at(text_x, text_y, "root@" OS_LOWER_NAME, 0x55FF55); text_y += 16;
+    kputs_at(text_x, text_y, "----------------------------", 0x666666); text_y += 16;
 
-    kputs_at(text_x, text_y, "OS:         ", 0x55FFFF);
-    kputs_at(text_x + 12 * 8, text_y, OS_NAME, 0xFFFFFF); text_y += 18;
+    // OS & Kernel
+    kputs_at(text_x, text_y, "OS:          ", 0x55FFFF);
+    kputs_at(text_x + 13 * 8, text_y, OS_NAME " x86_64", 0xFFFFFF); text_y += 16;
 
-    kputs_at(text_x, text_y, "Kernel:     ", 0x55FFFF);
-    kputs_at(text_x + 12 * 8, text_y, OS_NAME " (" OS_ARCH ")", 0xFFFFFF); text_y += 18;
+    char host_str[64];
+    get_smbios_host(host_str, sizeof(host_str));
+    kputs_at(text_x, text_y, "Host:        ", 0x55FFFF);
+    kputs_at(text_x + 13 * 8, text_y, host_str, 0xFFFFFF); text_y += 16;
 
-    kputs_at(text_x, text_y, "Uptime:     ", 0x55FFFF);
-    char uptime_msg[64] = "";
-    int u_idx = 0;
-    itoa(uptime_sec, buf);
-    for (int i = 0; buf[i] != '\0'; i++) uptime_msg[u_idx++] = buf[i];
-    const char* sec_str = " seconds";
-    for (int i = 0; sec_str[i] != '\0'; i++) uptime_msg[u_idx++] = sec_str[i];
-    uptime_msg[u_idx] = '\0';
-    kputs_at(text_x + 12 * 8, text_y, uptime_msg, 0xFFFFFF); text_y += 18;
+    kputs_at(text_x, text_y, "Kernel:      ", 0x55FFFF);
+    kputs_at(text_x + 13 * 8, text_y, OS_NAME " " OS_VERSION " (" OS_ARCH ")", 0xFFFFFF);
+    text_y += 16;
 
-    kputs_at(text_x, text_y, "Resolution: ", 0x55FFFF);
-    char res_msg[64] = "";
-    int r_idx = 0;
-    char w_buf[16], h_buf[16];
-    itoa(screen_width, w_buf);
-    itoa(screen_height, h_buf);
-    for (int i = 0; w_buf[i] != '\0'; i++) res_msg[r_idx++] = w_buf[i];
-    res_msg[r_idx++] = 'x';
-    for (int i = 0; h_buf[i] != '\0'; i++) res_msg[r_idx++] = h_buf[i];
-    res_msg[r_idx] = '\0';
-    kputs_at(text_x + 12 * 8, text_y, res_msg, 0xFFFFFF); text_y += 18;
+    // Uptime
+    kputs_at(text_x, text_y, "Uptime:      ", 0x55FFFF);
+    char up_msg[64];
+    int up_p = 0;
+    if (days > 0) {
+        itoa(days, buf); for (int i = 0; buf[i]; i++) up_msg[up_p++] = buf[i];
+        up_msg[up_p++] = 'd'; up_msg[up_p++] = ' ';
+    }
+    itoa(hours, buf); for (int i = 0; buf[i]; i++) up_msg[up_p++] = buf[i];
+    up_msg[up_p++] = 'h'; up_msg[up_p++] = ' ';
+    itoa(mins, buf); for (int i = 0; buf[i]; i++) up_msg[up_p++] = buf[i];
+    up_msg[up_p++] = 'm'; up_msg[up_p++] = ' ';
+    itoa(secs, buf); for (int i = 0; buf[i]; i++) up_msg[up_p++] = buf[i];
+    up_msg[up_p++] = 's'; up_msg[up_p] = '\0';
+    kputs_at(text_x + 13 * 8, text_y, up_msg, 0xFFFFFF); text_y += 16;
 
-    kputs_at(text_x, text_y, "Audio:      ", 0x55FFFF);
-    char audio_msg[128] = "";
-    int a_idx = 0;
-    const char* audio_name = pci_get_audio_controller_name();
-    for (int i = 0; audio_name[i] != '\0' && a_idx < 120; i++) audio_msg[a_idx++] = audio_name[i];
-    audio_msg[a_idx] = '\0';
-    kputs_at(text_x + 12 * 8, text_y, audio_msg, 0xFFFF55); text_y += 24;
+    // Display
+    kputs_at(text_x, text_y, "Display:     ", 0x55FFFF);
+    char res_buf[48];
+    char w_s[8], h_s[8];
+    itoa(screen_width, w_s); 
+    itoa(screen_height, h_s);
+    int rp = 0;
+    for (int i = 0; w_s[i]; i++) res_buf[rp++] = w_s[i];
+    res_buf[rp++] = 'x';
+    for (int i = 0; h_s[i]; i++) res_buf[rp++] = h_s[i];
+    const char* bpp_str = " @ 60 Hz [VBE LFB]";
+    for (int i = 0; bpp_str[i]; i++) res_buf[rp++] = bpp_str[i];
+    res_buf[rp] = '\0';
+    kputs_at(text_x + 13 * 8, text_y, res_buf, 0xFFFFFF); 
+    text_y += 16;
 
+    // Shell
+    kputs_at(text_x, text_y, "Shell:       ", 0x55FFFF);
+    kputs_at(text_x + 13 * 8, text_y, "bash-lite (overOS)", 0xFFFFFF); 
+    text_y += 16;
+
+    // Terminal
+    kputs_at(text_x, text_y, "Terminal:    ", 0x55FFFF);
+    kputs_at(text_x + 13 * 8, text_y, "kernel-console", 0xFFFFFF); 
+    text_y += 16;
+
+    // Font
+    kputs_at(text_x, text_y, "Font:        ", 0x55FFFF);
+    kputs_at(text_x + 13 * 8, text_y, "8x16-tty (CP866)", 0xFFFFFF); 
+    text_y += 16;
+
+    // кремний
+    char cpu_str[48];
+    get_cpu_brand(cpu_str);
+    kputs_at(text_x, text_y, "CPU:         ", 0x55FFFF);
+    kputs_at(text_x + 13 * 8, text_y, cpu_str, 0xFFFFFF); text_y += 16;
+
+    // зачем оно тут вообще
+    char gpu_str[36];
+    get_pci_gpu(gpu_str);
+    kputs_at(text_x, text_y, "GPU:         ", 0x55FFFF);
+    kputs_at(text_x + 13 * 8, text_y, gpu_str, 0xFFFFFF); text_y += 16;
+
+    // протечка месячные оперативной памяти
+    kputs_at(text_x, text_y, "Memory:      ", 0x55FFFF);
+
+    uint64_t used_bytes = pmm_get_used_blocks() * PAGE_SIZE;
+    uint64_t total_bytes = pmm_get_total_blocks() * PAGE_SIZE;
+
+    uint32_t total_mb = (uint32_t)(total_bytes / (1024 * 1024));
+    uint32_t mem_percent = (total_bytes > 0) ? (uint32_t)((used_bytes * 100) / total_bytes) : 0;
+
+    char mem_buf[64];
+    char tot_s[12], pct_s[8];
+    itoa(total_mb, tot_s);
+    itoa(mem_percent, pct_s);
+
+    int mp = 0;
+
+    // килобит парсер
+    if (used_bytes < 1024 * 1024) {
+        uint32_t used_kb = (uint32_t)(used_bytes / 1024);
+        char kb_s[12];
+        itoa(used_kb, kb_s);
+
+        for (int i = 0; kb_s[i]; i++) mem_buf[mp++] = kb_s[i];
+        const char* k_div = " KiB / ";
+        for (int i = 0; k_div[i]; i++) mem_buf[mp++] = k_div[i];
+    } else {
+        // да пошло оно нахуя я вам не завидую
+        uint32_t used_mb_int = (uint32_t)(used_bytes / (1024 * 1024));
+        uint32_t used_mb_frac = (uint32_t)(((used_bytes % (1024 * 1024)) * 10) / (1024 * 1024));
+        char int_s[12], frac_s[8];
+        itoa(used_mb_int, int_s);
+        itoa(used_mb_frac, frac_s);
+
+        for (int i = 0; int_s[i]; i++) mem_buf[mp++] = int_s[i];
+        mem_buf[mp++] = '.';
+        mem_buf[mp++] = frac_s[0] ? frac_s[0] : '0';
+        const char* m_div = " MiB / ";
+        for (int i = 0; m_div[i]; i++) mem_buf[mp++] = m_div[i];
+    }
+
+    // Дописываем общий объем и процент: "512 MiB (X%)"
+    for (int i = 0; tot_s[i]; i++) mem_buf[mp++] = tot_s[i];
+    const char* m_p1 = " MiB (";
+    for (int i = 0; m_p1[i]; i++) mem_buf[mp++] = m_p1[i];
+    for (int i = 0; pct_s[i]; i++) mem_buf[mp++] = pct_s[i];
+    const char* m_p2 = "%)";
+    for (int i = 0; m_p2[i]; i++) mem_buf[mp++] = m_p2[i];
+    mem_buf[mp] = '\0';
+
+    uint32_t mem_col = (mem_percent > 80) ? 0xFF5555 : (mem_percent > 50) ? 0xFFFF55 : 0x55FF55;
+    kputs_at(text_x + 13 * 8, text_y, mem_buf, mem_col);
+    text_y += 16;
+
+
+    // самое лагучее блять место
+    kputs_at(text_x, text_y, "Disk (/):    ", 0x55FFFF);
+
+    uint32_t disk_used_mb = 0, disk_total_mb = 0;
+    fs_get_stats(&disk_used_mb, &disk_total_mb);
+
+    uint32_t disk_percent = 0;
+    if (disk_total_mb > 0) {
+        disk_percent = (disk_used_mb * 100) / disk_total_mb;
+    }
+
+    char disk_buf[64];
+    char du_s[12], dt_s[12], dp_s[8];
+    itoa(disk_used_mb, du_s);
+    itoa(disk_total_mb, dt_s);
+    itoa(disk_percent, dp_s);
+
+    int dp = 0;
+    for (int i = 0; du_s[i]; i++) disk_buf[dp++] = du_s[i];
+    const char* d_div = " MiB / ";
+    for (int i = 0; d_div[i]; i++) disk_buf[dp++] = d_div[i];
+    for (int i = 0; dt_s[i]; i++) disk_buf[dp++] = dt_s[i];
+    const char* d_p1 = " MiB (";
+    for (int i = 0; d_p1[i]; i++) disk_buf[dp++] = d_p1[i];
+    for (int i = 0; dp_s[i]; i++) disk_buf[dp++] = dp_s[i];
+    const char* d_p2 = "%) - fat32";
+    for (int i = 0; d_p2[i]; i++) disk_buf[dp++] = d_p2[i];
+    disk_buf[dp] = '\0';
+
+    uint32_t disk_col = (disk_percent > 80) ? 0xFF5555 : (disk_percent > 50) ? 0xFFFF55 : 0x55FF55;
+    kputs_at(text_x + 13 * 8, text_y, disk_buf, disk_col);
+    text_y += 16;
+
+    // звук
+    kputs_at(text_x, text_y, "Audio:       ", 0x55FFFF);
+    kputs_at(text_x + 13 * 8, text_y, pci_get_audio_controller_name(), 0xFFFF55); text_y += 24;
+
+    // блоки
+    static const uint32_t palette_colors[8] = {
+        0x000000, 0xAA0000, 0x00AA00, 0xAA5500,
+        0x0000AA, 0xAA00AA, 0x00AAAA, 0xAAAAAA
+    };
+    static const uint32_t bright_colors[8] = {
+        0x555555, 0xFF5555, 0x55FF55, 0xFFFF55,
+        0x5555FF, 0xFF55FF, 0x55FFFF, 0xFFFFFF
+    };
+
+    int box_w = 12;
+    int box_h = 10;
+    for (int i = 0; i < 8; i++) {
+        for (int dy = 0; dy < box_h; dy++) {
+            for (int dx = 0; dx < box_w; dx++) {
+                put_pixel(text_x + i * box_w + dx, text_y + dy, palette_colors[i]);
+                put_pixel(text_x + i * box_w + dx, text_y + dy + box_h, bright_colors[i]);
+            }
+        }
+    }
+    text_y += (box_h * 2 + 12);
+
+    // КАК ЖЕ ЭТА ХУЙНЯ МЕНЯ ЗАЕБАЛА
     cursor_x = 0;
-    cursor_y = start_y + total_h + 16;
-
-    while (cursor_y + 16 > screen_height) {
+    cursor_y = start_y + total_h + 48;
+    while (cursor_y + 48 > screen_height) {
         scroll_screen();
     }
 
     flush_buffer();
 }
+
 
 void force_bios_setup(void) {
     outb(0x70, 0x2E);
@@ -690,7 +960,7 @@ struct idt_entry {
     uint8_t  flags;
     uint16_t base_high;
     uint32_t base_upper;
-    uint32_t reserved;   // <--- Обязательные 4 байта для x86_64 (размер структуры станет 16 байт)
+    uint32_t reserved;   // 4 байта жесткого гей порна
 } __attribute__((packed));
 
 struct idt_ptr {
@@ -899,6 +1169,17 @@ void print_tty_banner(int tty_id) {
     kputs("Защита от ДОЛБАЁБОВ!!! не вытаскивайте флешку с ОС а если и вытащили не втыкайте, не поможет.\n\n", 0x00AA00);
     fs_dir();
     kputs("\n", 0xFFFFFF);
+}
+
+// Наш первый настоящий float-таймер высокого разрешения!
+float get_uptime_seconds(void) {
+    if (g_tsc_per_ms > 0) {
+        // rdtsc64() возвращает количество тактов со старта процессора.
+        // Делим на (такты_в_мс * 1000), чтобы получить секунды с микросекундной точностью.
+        return (float)rdtsc64() / ((float)g_tsc_per_ms * 1000.0f);
+    }
+    // Запасной вариант через прерывания PIT, если калибровка еще не прошла
+    return (float)timer_ticks / 1000.0f;
 }
 
 void kernel_main(void) {

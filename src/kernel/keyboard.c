@@ -11,6 +11,7 @@ extern void kputs_at(int x, int y, const char* str, uint32_t color);
 extern void draw_cursor(uint32_t color);
 extern void print_prompt(void);
 extern void mouse_feed_byte(uint8_t byte);
+extern int sched_send_signal(uint64_t pid, int sig);
 
 extern int cursor_x;
 extern int cursor_y;
@@ -67,6 +68,7 @@ void keyboard_poll_handler(void) {
     int my_tty = me->tty_id;
     int extended_key = 0;
     uint8_t alt_pressed = 0;
+    static uint8_t ctrl_pressed = 0;   // состояние Ctrl общее на систему (как alt_pressed в tty.c)
 
     while (inb(0x64) & 0x01) {
         uint8_t status = inb(0x64);
@@ -83,6 +85,27 @@ void keyboard_poll_handler(void) {
         if (scancode == 0xE0) { 
             extended_key = 1; 
             continue; 
+        }
+
+        // Фиксация Ctrl (0x1D) — нужен для Ctrl+C
+        if (scancode == 0x1D) {
+            ctrl_pressed = 1;
+            continue;
+        }
+        if (scancode == 0x9D) {
+            ctrl_pressed = 0;
+            continue;
+        }
+
+        // Ctrl+C -> SIGINT процессу, который сейчас владеет этим TTY (tty->fg_pid).
+        // SIGINT не перехватывается (обработчиков сигналов пока нет), поэтому
+        // это пока всегда немедленное завершение — ровно как "минимум: kill, Ctrl+C" из плана.
+        if (ctrl_pressed && scancode == 0x2E && !(scancode & 0x80)) {   // 'C' (make-код)
+            tty_t* at = tty_get(my_tty);
+            if (at && at->fg_pid > 0) {
+                sched_send_signal((uint64_t)at->fg_pid, SIGINT);
+            }
+            continue;
         }
 
         // Фиксация нажатия Alt (0x38)

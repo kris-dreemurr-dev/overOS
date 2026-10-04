@@ -23,4 +23,7 @@ void pmm_mark_region_free(uint64_t base, size_t size);
 
 void* pmm_alloc_pages(size_t count);
 
+uint64_t pmm_get_used_blocks(void);
+uint64_t pmm_get_total_blocks(void);
+
 #endif

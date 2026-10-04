@@ -12,8 +12,7 @@ NASM  := nasm
 
 # Флаги компиляции 64-битного ядра и программ overOS
 CFLAGS       := -m64 -std=c99 -ffreestanding -fno-pic -fno-pie -fno-stack-protector \
-                -mno-red-zone -mcmodel=kernel -U_FORTIFY_SOURCE -O2 -Wall -Wextra \
-                -mno-sse -mno-sse2 -mno-mmx
+                -mno-red-zone -mcmodel=kernel -U_FORTIFY_SOURCE -O2 -Wall -Wextra
 # Модули перемещаемые (PIE): грузятся по любому адресу, без -mcmodel=kernel
 CFLAGS_MOD   := -m64 -std=c99 -ffreestanding -fPIE -fvisibility=hidden -fno-plt \
                 -fno-stack-protector -mno-red-zone -U_FORTIFY_SOURCE -O2 -Wall -Wextra \
@@ -33,7 +32,7 @@ PART_SIZE_MB := 512
 # ==============================================================================
 # СИСТЕМНЫЕ МОДУЛИ (.SYS, Ring 0)
 # ==============================================================================
-MODULES     := mc redactor memedit stress gpu cpu hwinfo
+MODULES     := mc redactor memedit stress gpu cpu hwinfo cloak
 MODULE_BINS := $(patsubst %, $(BUILD_DIR)/%.sys, $(MODULES))
 
 # ==============================================================================
@@ -47,6 +46,11 @@ PROG_BINS   := $(patsubst $(PROG_DIR)/%.c, $(BUILD_DIR)/%.prg, $(PROG_SRCS))
 DOOM_DIR    := $(SRC_DIR)/files/progs/DOOM
 DOOM_PRG    := $(DOOM_DIR)/DOOM.PRG
 DOOM_WAD    := $(DOOM_DIR)/DOOM1.WAD
+
+# Пути к QUAKE
+QUAKE_DIR   := $(SRC_DIR)/files/progs/Quake
+QUAKE_PRG   := $(QUAKE_DIR)/QUAKE.PRG
+QUAKE_PAK   := $(QUAKE_DIR)/pak0.pak
 
 # ==============================================================================
 # ИСХОДНЫЕ ФАЙЛЫ ЯДРА
@@ -221,10 +225,17 @@ $(DOOM_PRG):
 		$(MAKE) -C $(DOOM_DIR) clean && $(MAKE) -C $(DOOM_DIR); \
 	fi
 
+# Автосборка QUAKE.PRG через clean + make
+$(QUAKE_PRG):
+	@if [ -d "$(QUAKE_DIR)" ]; then \
+		echo ">>> Полная пересборка QUAKE (clean + make)..."; \
+		$(MAKE) -C $(QUAKE_DIR) clean && $(MAKE) -C $(QUAKE_DIR); \
+	fi
+
 # -----------------------------------------------------------------------------
 # Создание раздела FAT32 и упаковка софта
 # -----------------------------------------------------------------------------
-$(PART_IMG): $(BUILD_DIR)/kernel.bin $(BUILD_DIR)/boot_stage1.bin $(MODULE_BINS) $(PROG_BINS) $(DOOM_PRG)
+$(PART_IMG): $(BUILD_DIR)/kernel.bin $(BUILD_DIR)/boot_stage1.bin $(MODULE_BINS) $(PROG_BINS) $(DOOM_PRG) $(QUAKE_PRG)
 	@mkdir -p $(BUILD_DIR)
 	@echo ">>> Создаем раздел FAT32 на $(PART_SIZE_MB) МБ..."
 	@rm -f $@
@@ -235,6 +246,7 @@ $(PART_IMG): $(BUILD_DIR)/kernel.bin $(BUILD_DIR)/boot_stage1.bin $(MODULE_BINS)
 	    mmd -i $@ ::utils 2>/dev/null || true; \
 	    mmd -i $@ ::programs 2>/dev/null || true; \
 	    mmd -i $@ ::programs/DOOM 2>/dev/null || true; \
+	    mmd -i $@ ::programs/Quake 2>/dev/null || true; \
 	    mmd -i $@ ::Code 2>/dev/null || true; \
 	    mcopy -i $@ $(BUILD_DIR)/kernel.bin ::sys/KERNEL.BIN; \
 	    if [ -f "$(SRC_DIR)/files/image/logo.bmp" ]; then \
@@ -249,13 +261,21 @@ $(PART_IMG): $(BUILD_DIR)/kernel.bin $(BUILD_DIR)/boot_stage1.bin $(MODULE_BINS)
 	        fname=$$(basename $$prg); \
 	        mcopy -i $@ $$prg ::programs/$$fname; \
 	    done; \
-	    if [ -f "$(DOOM_PRG)" ]; then \
+		if [ -f "$(DOOM_PRG)" ]; then \
 	        mcopy -i $@ $(DOOM_PRG) ::programs/DOOM/DOOM.PRG; \
 	        echo ">>> Скопирован DOOM.PRG в ::programs/DOOM/"; \
 	    fi; \
 	    if [ -f "$(DOOM_WAD)" ]; then \
 	        mcopy -i $@ $(DOOM_WAD) ::programs/DOOM/DOOM1.WAD; \
 	        echo ">>> Скопирован DOOM1.WAD в ::programs/DOOM/"; \
+	    fi; \
+	    if [ -f "$(QUAKE_PRG)" ]; then \
+	        mcopy -i $@ $(QUAKE_PRG) ::programs/Quake/QUAKE.PRG; \
+	        echo ">>> Скопирован QUAKE.PRG в ::programs/Quake/"; \
+	    fi; \
+	    if [ -f "$(QUAKE_PAK)" ]; then \
+	        mcopy -i $@ $(QUAKE_PAK) ::programs/Quake/pak0.pak; \
+	        echo ">>> Скопирован pak0.pak в ::programs/Quake/"; \
 	    fi; \
 	fi
 
@@ -298,7 +318,7 @@ run: all
 	    -device usb-ehci,id=ehci \
 	    -drive if=none,id=usb_drive,file=$(DISK_IMG),format=raw \
 	    -device usb-storage,bus=ehci.0,drive=usb_drive \
-        -vga std -global VGA.vgamem_mb=2
+        -vga std -global VGA.vgamem_mb=4
 
 run-usb: all
 	qemu-system-x86_64 \
@@ -312,7 +332,7 @@ run-usb: all
 	    -device usb-ehci,id=ehci \
 	    -drive if=none,id=usb_drive,file=/dev/sdc,format=raw \
 	    -device usb-storage,bus=ehci.0,drive=usb_drive \
-        -vga std -global VGA.vgamem_mb=2
+        -vga std -global VGA.vgamem_mb=4
 
 # ------------------------------------------------------------------------------
 # Быстрое обновление модулей и программ на уже размеченной флешке

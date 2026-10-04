@@ -8,6 +8,9 @@ extern void put_pixel(int x, int y, uint32_t color);
 extern uint16_t screen_width;
 extern uint16_t screen_height;
 
+
+static int mouse_accum_dx = 0;
+static int mouse_accum_dy = 0;
 static int mouse_x = 200;
 static int mouse_y = 200;
 static uint8_t mouse_buttons = 0;
@@ -131,18 +134,20 @@ void mouse_feed_byte(uint8_t byte) {
         mouse_bytes[2] = byte;
         mouse_cycle = 0;
 
-        // Бит 0: Левая кнопка (ЛКМ), Бит 1: Правая (ПКМ), Бит 2: Средняя (СКМ)
         mouse_buttons = mouse_bytes[0] & 0x07;
 
         int dx = (int)mouse_bytes[1];
         int dy = (int)mouse_bytes[2];
 
-        // Знаковое расширение 9-битных дельт смещения
         if (mouse_bytes[0] & 0x10) dx |= ~0xFF;
         if (mouse_bytes[0] & 0x20) dy |= ~0xFF;
 
+        // Накапливаем дельту для игр (Quake / Doom)
+        mouse_accum_dx += dx;
+        mouse_accum_dy += dy;
+
         mouse_x += dx;
-        mouse_y -= dy; // В PS/2 вертикальная ось инвертирована относительно экрана
+        mouse_y -= dy;
 
         // Ограничение по видимой области экрана
         if (mouse_x < 0) mouse_x = 0;
@@ -152,14 +157,21 @@ void mouse_feed_byte(uint8_t byte) {
     }
 }
 
-// Единственный безусловный читатель порта (цикл kernel_main). Пока активным TTY
-// владеет .sys-модуль (gfx_mode) или работает процесс (foreground_task), порт
-// читает ТОЛЬКО он сам (sys_kbd_poll / ps2_pump) — иначе оба читателя рвут друг
-// у друга байты пакетов мыши/клавиатуры.
+// РАЗРЕШАЕМ ядру обновлять мышь, даже когда запущен Ring 3 процесс:
 static int mouse_should_defer(void) {
-    if (sched_get_foreground_task()) return 1;
-    tty_t* at = tty_get(tty_get_active_id());
-    return at && at->gfx_mode;
+    // Удаляем или комментируем: if (sched_get_foreground_task()) return 1;
+    return 0; 
+}
+
+// Функция для системного вызова: возвращает дельты и сбрасывает их
+void get_mouse_delta(int* out_dx, int* out_dy, uint8_t* out_buttons) {
+    if (out_dx) *out_dx = mouse_accum_dx;
+    if (out_dy) *out_dy = mouse_accum_dy;
+    if (out_buttons) *out_buttons = mouse_buttons;
+
+    // Сбрасываем накопленные смещения после чтения
+    mouse_accum_dx = 0;
+    mouse_accum_dy = 0;
 }
 
 void update_mouse_state(void) {
