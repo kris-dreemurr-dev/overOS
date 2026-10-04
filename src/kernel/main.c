@@ -67,88 +67,6 @@ static char* strcat(char* dest, const char* src) {
     return dest;
 }
 
-static void cmd_self_update(int raw_root_mode, int update_boot_sector) {
-    kputs("\n[SELF-UPDATE] Starting kernel flash procedure...\n", 0x55FFFF);
-
-    // Переходим в системный каталог /sys
-    fs_go_root();
-    fs_change_dir("sys");
-
-    kputs("  -> Loading KERNEL.BIN from /sys partition...\n", 0xAAAAAA);
-    int bytes = fs_read_file("KERNEL.BIN", file_buf, sizeof(file_buf));
-    
-    if (bytes <= 0) {
-        if (raw_root_mode) {
-            kputs("  [!] KERNEL.BIN missing! [RAW MODE (-r)] Forcing raw override with zero data...\n", 0xFFFF55);
-            bytes = 0;
-            for (int i = 0; i < 512; i++) file_buf[i] = 0;
-        } else {
-            kputs("  [!] KERNEL.BIN not found in /sys directory! Aborted.\n", 0xFF5555);
-            fs_go_root();
-            return;
-        }
-    }
-
-    char buf[16];
-    if (bytes > 0) {
-        kputs("  [+] Image size: ", 0x55FF55); itoa(bytes, buf); kputs(buf, 0xFFFF55); kputs(" bytes.\n", 0);
-    }
-
-    uint16_t sectors_needed = (bytes > 0) ? (bytes + 511) / 512 : 600;
-    if (sectors_needed > 2047) {
-        kputs("  [!] File is too big for MBR Gap (> 2047 sectors)!\n", 0xFF5555);
-        fs_go_root();
-        return;
-    }
-
-    kputs("  -> Flashing kernel to LBA 1 in chunks...\n", 0xAAAAAA);
-    
-    uint32_t sectors_written = 0;
-    int flash_error = 0;
-
-    while (sectors_written < sectors_needed) {
-        uint16_t chunk = sectors_needed - sectors_written;
-        if (chunk > 32) chunk = 32;
-
-        uint8_t* write_ptr = (bytes > 0) ? (file_buf + (sectors_written * 512)) : file_buf;
-
-        if (!ehci_msc_write_sectors(1 + sectors_written, chunk, write_ptr)) {
-            flash_error = 1;
-            break;
-        }
-        sectors_written += chunk;
-    }
-
-    if (flash_error) {
-        kputs("  [!] SCSI WRITE ERROR during chunked flash!\n", 0xFF5555);
-        fs_go_root();
-        return;
-    }
-    
-    if (bytes > 0) {
-        kputs("  [+] Kernel flashed successfully to LBA 1.\n", 0x55FF55);
-    } else {
-        kputs("  [!] RAW OVERWRITE: Kernel destroyed (-r active). System is bricked!\n", 0xFF5555);
-    }
-
-    if (update_boot_sector) {
-        kputs("  -> Updating Stage0 in LBA 0 (preserving partition table)...\n", 0xAAAAAA);
-        int boot_bytes = fs_read_file("BOOT.BIN", file_buf, 512);
-
-        if (boot_bytes >= 446) {
-            if (!ehci_msc_read_sectors(0, 1, mbr_tmp)) { fs_go_root(); return; }
-            for (int i = 0; i < 446; i++) mbr_tmp[i] = file_buf[i];
-            ehci_msc_write_sectors(0, 1, mbr_tmp);
-            kputs("  [+] Bootloader stage0 updated safely in LBA 0!\n", 0x55FF55);
-        } else {
-            kputs("  [i] BOOT.BIN not found in /sys; LBA 0 left untouched.\n", 0xFFFF55);
-        }
-    }
-
-    fs_go_root();
-    kputs("\n[+] SUCCESS! Type 'reboot' to test.\n", 0x55FF55);
-}
-
 static int is_sys_command(const char* cmd) {
     int len = 0;
     while (cmd[len] && cmd[len] != ' ') len++;
@@ -298,7 +216,6 @@ void execute_command(void) {
         kputs("pkill <pid> [sig]   ", 0xFFFF55); kputs("- Send a signal to PID (default SIGKILL=9)\n", 0xFFFFFF);
 
         kputs("\n--- System Control ---\n", 0x55FF55);
-        kputs("update [-r] [-b]    ", 0xFFFF55); kputs("- Self-update kernel (-r raw, -b bootloader)\n", 0xFFFFFF);
         kputs("reboot / r          ", 0xFFFF55); kputs("- Restart system\n", 0xFFFFFF);
         kputs("shutdown / s        ", 0xFFFF55); kputs("- Shutdown system via ACPI\n", 0xFFFFFF);
 
@@ -451,14 +368,6 @@ void execute_command(void) {
         }
 
     // --- Управление системой и питанием ---
-    } else if (strncmp(cmd, "update", 6) == 0) {
-        int force_raw = 0;
-        int update_boot = 0;
-        for (int i = 6; cmd[i] != '\0'; i++) {
-            if (cmd[i] == '-' && cmd[i + 1] == 'r') force_raw = 1;
-            if (cmd[i] == '-' && cmd[i + 1] == 'b') update_boot = 1;
-        }
-        cmd_self_update(force_raw, update_boot);
     } else if (strcmp(cmd, "ver") == 0) {
         kputs(OS_NAME " " OS_ARCH " (process patch) 1.0\n", 0xFFFF55);
     } else if (strcmp(cmd, "rus") == 0) {

@@ -27,7 +27,12 @@ PROG_LDFLAGS := -m elf_x86_64 -T user.ld --oformat binary -no-pie
 
 DISK_IMG     := $(BUILD_DIR)/os.img
 PART_IMG     := $(BUILD_DIR)/fat32_part.img
-PART_SIZE_MB := 512
+# Параметры раздела и комплектации (переопределяются установщиком)
+PART_SIZE_MB    ?= 512
+INSTALL_MODULES ?= $(MODULES)
+INSTALL_PROGS   ?= $(patsubst $(PROG_DIR)/%.c,%,$(PROG_SRCS))
+WITH_DOOM       ?= 1
+WITH_QUAKE      ?= 1
 
 # ==============================================================================
 # СИСТЕМНЫЕ МОДУЛИ (.SYS, Ring 0)
@@ -253,30 +258,27 @@ $(PART_IMG): $(BUILD_DIR)/kernel.bin $(BUILD_DIR)/boot_stage1.bin $(MODULE_BINS)
 	    if [ -f "$(SRC_DIR)/files/image/logo.bmp" ]; then \
 	        mcopy -i $@ $(SRC_DIR)/files/image/logo.bmp ::sys/logo.bmp; \
 	    fi; \
-	    for mod in $(MODULE_BINS); do \
-	        fname=$$(basename $$mod); \
-	        mcopy -i $@ $$mod ::utils/$$fname; \
+	    for mod in $(INSTALL_MODULES); do \
+	        if [ -f "$(BUILD_DIR)/$$mod.sys" ]; then \
+	            mcopy -i $@ $(BUILD_DIR)/$$mod.sys ::utils/$$mod.sys; \
+	        fi; \
 	    done; \
-	    for prg in $(PROG_BINS); do \
-	        [ -f "$$prg" ] || continue; \
-	        fname=$$(basename $$prg); \
-	        mcopy -i $@ $$prg ::programs/$$fname; \
+	    for prg in $(INSTALL_PROGS); do \
+	        if [ -f "$(BUILD_DIR)/$$prg.prg" ]; then \
+	            mcopy -i $@ $(BUILD_DIR)/$$prg.prg ::programs/$$prg.prg; \
+	        fi; \
 	    done; \
-		if [ -f "$(DOOM_PRG)" ]; then \
+	    if [ "$(WITH_DOOM)" = "1" ] && [ -f "$(DOOM_PRG)" ]; then \
 	        mcopy -i $@ $(DOOM_PRG) ::programs/DOOM/DOOM.PRG; \
-	        echo ">>> Скопирован DOOM.PRG в ::programs/DOOM/"; \
+	        if [ -f "$(DOOM_WAD)" ]; then \
+	            mcopy -i $@ $(DOOM_WAD) ::programs/DOOM/DOOM1.WAD; \
+	        fi; \
 	    fi; \
-	    if [ -f "$(DOOM_WAD)" ]; then \
-	        mcopy -i $@ $(DOOM_WAD) ::programs/DOOM/DOOM1.WAD; \
-	        echo ">>> Скопирован DOOM1.WAD в ::programs/DOOM/"; \
-	    fi; \
-	    if [ -f "$(QUAKE_PRG)" ]; then \
+	    if [ "$(WITH_QUAKE)" = "1" ] && [ -f "$(QUAKE_PRG)" ]; then \
 	        mcopy -i $@ $(QUAKE_PRG) ::programs/Quake/QUAKE.PRG; \
-	        echo ">>> Скопирован QUAKE.PRG в ::programs/Quake/"; \
-	    fi; \
-	    if [ -f "$(QUAKE_PAK)" ]; then \
-	        mcopy -i $@ $(QUAKE_PAK) ::programs/Quake/pak0.pak; \
-	        echo ">>> Скопирован pak0.pak в ::programs/Quake/"; \
+	        if [ -f "$(QUAKE_PAK)" ]; then \
+	            mcopy -i $@ $(QUAKE_PAK) ::programs/Quake/pak0.pak; \
+	        fi; \
 	    fi; \
 	fi
 
@@ -356,26 +358,10 @@ install-modules: $(MODULE_BINS) $(PROG_BINS)
 	@echo ">>> Все модули и программы успешно обновлены на $(DEV)2"
 
 # ------------------------------------------------------------------------------
-# Полная прошивка USB-флешки с автоматическим поиском накопителя
+# Центр управления сборкой и установкой overOS
 # ------------------------------------------------------------------------------
-install: all
-ifdef DEV
-	@lsblk $(DEV) >/dev/null 2>&1 || { echo "!! $(DEV) ne существует"; exit 1; }
-	@$(MAKE) --no-print-directory _write_disk TARGET_DEV=$(DEV)
-else
-	@CANDIDATES=$$(lsblk -dn -o NAME,TRAN,RM,TYPE | awk '$$2=="usb" && $$3=="1" && $$4=="disk"{print $$1}'); \
-	COUNT=$$(echo "$$CANDIDATES" | grep -c .); \
-	if [ "$$COUNT" -eq 0 ]; then \
-	    echo "!! Съёмных USB-дисков не найдено."; \
-	    exit 1; \
-	elif [ "$$COUNT" -gt 1 ]; then \
-	    echo "!! Найдено несколько USB-дисков — укажи явно: make install DEV=/dev/sdX"; \
-	    exit 1; \
-	fi; \
-	DEV=/dev/$$CANDIDATES; \
-	echo ">>> Найден съемный накопитель: $$DEV"; \
-	$(MAKE) --no-print-directory _write_disk TARGET_DEV=$$DEV
-endif
+install:
+	@sudo python3 tools/installer_gui.py
 
 _write_disk:
 	@for part in $(TARGET_DEV)*; do \
@@ -394,4 +380,4 @@ _write_disk:
 clean:
 	rm -rf $(BUILD_DIR)
 
-.PHONY: all modules progs run install install-modules _write_disk clean run-usb test-menu
+.PHONY: all modules progs run install install-modules clean run-usb test-menu _write_disk
