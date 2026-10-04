@@ -432,7 +432,7 @@ static void ehci_dump_flash_drive(uint8_t dev_addr, uint8_t max_packet0) {
                 if (boot_sig == 0xAA55) {
                     kdebug(" (VALID 0x55AA - Ready to mount FAT!)\n", 0x55FF55);
                     if (fs_mount(0)) {
-                    fs_dir();
+                    //fs_dir();
                 }
                 } else {
                     kdebug(" (No 0x55AA signature)\n", 0xFFAA00);
