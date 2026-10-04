@@ -1,6 +1,7 @@
 #include "bsod.h"
 #include "user_mode.h"
 #include <stdint.h>
+#include "config.h"
 
 volatile jit_crash_guard_t g_jit_guard = { 0, 0, 0 };
 
@@ -227,7 +228,7 @@ void handle_cpu_exception(int exc_no, uint64_t fault_eip, uint64_t fault_esp) {
         kputs(" [", 0xAAAAAA);
         kputs(get_exception_name(exc_no), 0xFFFFFF);
         kputs("]\n", 0xAAAAAA);
-
+        
         kputs("  * Fault RIP: ", 0x55FFFF);
         bsod_print_hex64(fault_eip);
         kputs("   Fault RSP: ", 0x55FFFF);
@@ -241,7 +242,23 @@ void handle_cpu_exception(int exc_no, uint64_t fault_eip, uint64_t fault_esp) {
         return;
     }
 
+#if BSOD_ENABLED
     show_bsod("KERNEL_CRASH", 0x88880001, exc_no, fault_eip, fault_esp);
+#else
+    // Если BSOD отключен в конфиге, просто выводим короткое сообщение и зависаем на месте
+    kputs("\n[KERNEL PANIC] System halted (BSOD disabled in config).\n", 0xFF5555);
+    flush_buffer();
+#endif
+
     __asm__ volatile ("cli; hlt");
     while (1);
+}
+
+void default_exception_handler(uint64_t* frame) {
+    // Извлекаем данные из кадра прерывания, сформированного в interrupts.asm
+    int      exc_no    = (int)frame[15];
+    uint64_t fault_eip = frame[17];
+    uint64_t fault_esp = frame[20];
+
+    handle_cpu_exception(exc_no, fault_eip, fault_esp);
 }

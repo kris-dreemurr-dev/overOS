@@ -14,7 +14,6 @@
 #include "../files/image/sprite.h"
 #include "../files/image/image.h"
 
-int kernel_debug = 1;
 uint32_t current_bg_color = 0x000000;
 int mc_mode = 0;
 void init_mc_monitor(void) {}
@@ -515,7 +514,7 @@ void kputs(const char* str, uint32_t color) {
 }
 
 void kdebug(const char* str, uint32_t color) {
-    if (kernel_debug) {
+    if (DEBUG_MODE) {
         kputs(str, color);
     }
 }
@@ -692,10 +691,14 @@ void cmd_fastfetch(void) {
     uint32_t mins = (total_sec % 3600) / 60;
     uint32_t secs = total_sec % 60;
 
-// Масштабирование спрайта в 2 раза
+#if FUN_EDITION
     const int scale = 2;
     int scaled_w = FASTFETCH_WIDTH * scale;
     int scaled_h = FASTFETCH_HEIGHT * scale;
+#else
+    int scaled_w = LOGO_ASCII_COLS * 8;   // Ширина в пикселях (символ шрифта = 8px)
+    int scaled_h = LOGO_ASCII_ROWS * 16;  // Высота в пикселях (строка шрифта = 16px)
+#endif
 
     int total_h = scaled_h > 230 ? scaled_h : 230;
 
@@ -709,7 +712,8 @@ void cmd_fastfetch(void) {
     int sprite_x = start_x + 10;
     int sprite_y = start_y + (total_h - scaled_h) / 2;
 
-    // Отрисовка с увеличением каждого пикселя в квадрат scale x scale
+#if FUN_EDITION
+    // Отрисовка попиксельного спрайта Криса
     for (int y = 0; y < FASTFETCH_HEIGHT; y++) {
         for (int x = 0; x < FASTFETCH_WIDTH; x++) {
             uint32_t color = fastfetch_sprite_data[y * FASTFETCH_WIDTH + x];
@@ -722,8 +726,14 @@ void cmd_fastfetch(void) {
             }
         }
     }
+#else
+    // Отрисовка нового ASCII-секундомера фирменным бирюзовым цветом
+    for (int r = 0; r < LOGO_ASCII_ROWS; r++) {
+        kputs_at(sprite_x, sprite_y + (r * 16), logo_ascii[r], 0x55FFFF);
+    }
+#endif
 
-    // Сдвигаем текстовый блок с учетом увеличенной ширины спрайта
+    // Сдвигаем текстовый блок с учетом ширины логотипа
     int text_x = sprite_x + scaled_w + 24;
     int text_y = start_y;
 
@@ -791,19 +801,19 @@ void cmd_fastfetch(void) {
     kputs_at(text_x + 13 * 8, text_y, "8x16-tty (CP866)", 0xFFFFFF); 
     text_y += 16;
 
-    // кремний
+    // CPU
     char cpu_str[48];
     get_cpu_brand(cpu_str);
     kputs_at(text_x, text_y, "CPU:         ", 0x55FFFF);
     kputs_at(text_x + 13 * 8, text_y, cpu_str, 0xFFFFFF); text_y += 16;
 
-    // зачем оно тут вообще
+    // GPU
     char gpu_str[36];
     get_pci_gpu(gpu_str);
     kputs_at(text_x, text_y, "GPU:         ", 0x55FFFF);
     kputs_at(text_x + 13 * 8, text_y, gpu_str, 0xFFFFFF); text_y += 16;
 
-    // протечка месячные оперативной памяти
+    // Memory
     kputs_at(text_x, text_y, "Memory:      ", 0x55FFFF);
 
     uint64_t used_bytes = pmm_get_used_blocks() * PAGE_SIZE;
@@ -819,7 +829,6 @@ void cmd_fastfetch(void) {
 
     int mp = 0;
 
-    // килобит парсер
     if (used_bytes < 1024 * 1024) {
         uint32_t used_kb = (uint32_t)(used_bytes / 1024);
         char kb_s[12];
@@ -829,7 +838,6 @@ void cmd_fastfetch(void) {
         const char* k_div = " KiB / ";
         for (int i = 0; k_div[i]; i++) mem_buf[mp++] = k_div[i];
     } else {
-        // да пошло оно нахуя я вам не завидую
         uint32_t used_mb_int = (uint32_t)(used_bytes / (1024 * 1024));
         uint32_t used_mb_frac = (uint32_t)(((used_bytes % (1024 * 1024)) * 10) / (1024 * 1024));
         char int_s[12], frac_s[8];
@@ -843,7 +851,6 @@ void cmd_fastfetch(void) {
         for (int i = 0; m_div[i]; i++) mem_buf[mp++] = m_div[i];
     }
 
-    // Дописываем общий объем и процент: "512 MiB (X%)"
     for (int i = 0; tot_s[i]; i++) mem_buf[mp++] = tot_s[i];
     const char* m_p1 = " MiB (";
     for (int i = 0; m_p1[i]; i++) mem_buf[mp++] = m_p1[i];
@@ -856,8 +863,7 @@ void cmd_fastfetch(void) {
     kputs_at(text_x + 13 * 8, text_y, mem_buf, mem_col);
     text_y += 16;
 
-
-    // самое лагучее блять место
+    // Disk
     kputs_at(text_x, text_y, "Disk (/):    ", 0x55FFFF);
 
     uint32_t disk_used_mb = 0, disk_total_mb = 0;
@@ -890,11 +896,11 @@ void cmd_fastfetch(void) {
     kputs_at(text_x + 13 * 8, text_y, disk_buf, disk_col);
     text_y += 16;
 
-    // звук
+    // Audio
     kputs_at(text_x, text_y, "Audio:       ", 0x55FFFF);
     kputs_at(text_x + 13 * 8, text_y, pci_get_audio_controller_name(), 0xFFFF55); text_y += 24;
 
-    // блоки
+    // Цветовая палитра
     static const uint32_t palette_colors[8] = {
         0x000000, 0xAA0000, 0x00AA00, 0xAA5500,
         0x0000AA, 0xAA00AA, 0x00AAAA, 0xAAAAAA
@@ -916,7 +922,6 @@ void cmd_fastfetch(void) {
     }
     text_y += (box_h * 2 + 12);
 
-    // КАК ЖЕ ЭТА ХУЙНЯ МЕНЯ ЗАЕБАЛА
     cursor_x = 0;
     cursor_y = start_y + total_h + 48;
     while (cursor_y + 48 > screen_height) {
@@ -951,7 +956,8 @@ void hex_str(uint32_t val, char* out) {
     out[10] = '\0';
 }
 
-extern void show_bsod(const char* reason, uint32_t error_code, int exc_no, uint32_t fault_eip, uint32_t fault_esp);
+extern void show_bsod(const char* reason, uint32_t error_code, int exc_no, uint64_t fault_eip, uint64_t fault_esp);
+extern void handle_cpu_exception(int exc_no, uint64_t fault_eip, uint64_t fault_esp);
 
 struct idt_entry {
     uint16_t base_low;
@@ -960,37 +966,78 @@ struct idt_entry {
     uint8_t  flags;
     uint16_t base_high;
     uint32_t base_upper;
-    uint32_t reserved;   // 4 байта жесткого гей порна
+    uint32_t reserved;
 } __attribute__((packed));
 
 struct idt_ptr {
     uint16_t limit;
-    uint64_t base;       // 64-битный базовый адрес IDT
+    uint64_t base;
 } __attribute__((packed));
 
 static struct idt_entry idt[33];
 static struct idt_ptr   idtp;
 
-extern void handle_cpu_exception(int exc_no, uint64_t fault_eip, uint64_t fault_esp);
+// Массив оберток для каждого из 32 исключений CPU с передачей их номера
+#define DECLARE_ISR(vec) \
+    __attribute__((naked)) static void isr_wrapper_##vec(void) { \
+        __asm__ __volatile__ ( \
+            "pushq $0\n\t"        /* Денди-заглушка кода ошибки, если процессор его не шлет */ \
+            "pushq $" #vec "\n\t"  /* Передаем вектор прерывания */ \
+            "jmp isr_common_stub\n\t" \
+        ); \
+    }
 
-void default_exception_handler(uint64_t* frame) {
-    g_term_hook = 0;
-    // см. пункт 2 — frame нужно формировать правильно
-    int      exc_no    = (int)frame[15];   // вектор
-    uint64_t fault_eip = frame[17];        // RIP из аппаратного фрейма
-    uint64_t fault_esp = frame[20];        // RSP (см. нюанс ниже про ring3)
+// Общая точка входа для исключений CPU (глобальная, без static!)
+__attribute__((naked)) void isr_common_stub(void) {
+    __asm__ __volatile__ (
+        "push %rax\n\t"
+        "push %rcx\n\t"
+        "push %rdx\n\t"
+        "push %rsi\n\t"
+        "push %rdi\n\t"
+        "push %r8\n\t"
+        "push %r9\n\t"
+        "push %r10\n\t"
+        "push %r11\n\t"
+        
+        // Точные смещения с учетом сохраненных регистров (9 * 8 = 72 байта):
+        // 72(%rsp) — номер вектора (который мы запушили в макросе DEF_STUB)
+        // 88(%rsp) — RIP, сохраненный процессором при прерывании
+        // 112(%rsp) — RSP, сохраненный процессором
+        "movq 88(%rsp), %rsi\n\t" // RIP -> передаем как fault_eip (в rsi)
+        "movq 112(%rsp), %rdx\n\t" // RSP -> передаем как fault_esp (в rdx)
+        "movq 72(%rsp), %rdi\n\t" // Номер вектора -> передаем как exc_no (в rdi)
 
-    handle_cpu_exception(exc_no, fault_eip, fault_esp);
-}
+        "call handle_cpu_exception\n\t"
 
-__attribute__((naked)) static void isr_stub(void) {
-    __asm__ __volatile__(
-        "cli\n\t"
-        "call default_exception_handler\n\t"
+        "pop %r11\n\t"
+        "pop %r10\n\t"
+        "pop %r9\n\t"
+        "pop %r8\n\t"
+        "pop %rdi\n\t"
+        "pop %rsi\n\t"
+        "pop %rdx\n\t"
+        "pop %rcx\n\t"
+        "pop %rax\n\t"
+        "addq $16, %rsp\n\t"      // Очищаем вектор и код ошибки со стека
         "iretq\n\t"
     );
 }
 
+// Упрощенные отдельные макросы-точки входа для таблицы IDT
+#define DEF_STUB(n) \
+    __attribute__((naked)) static void isr_stub_##n(void) { \
+        __asm__ __volatile__("pushq $0\n\tpushq $" #n "\n\tjmp isr_common_stub"); \
+    }
+
+DEF_STUB(0)  DEF_STUB(1)  DEF_STUB(2)  DEF_STUB(3)
+DEF_STUB(4)  DEF_STUB(5)  DEF_STUB(6)  DEF_STUB(7)
+DEF_STUB(8)  DEF_STUB(9)  DEF_STUB(10) DEF_STUB(11)
+DEF_STUB(12) DEF_STUB(13) DEF_STUB(14) DEF_STUB(15)
+DEF_STUB(16) DEF_STUB(17) DEF_STUB(18) DEF_STUB(19)
+DEF_STUB(20) DEF_STUB(21) DEF_STUB(22) DEF_STUB(23)
+DEF_STUB(24) DEF_STUB(25) DEF_STUB(26) DEF_STUB(27)
+DEF_STUB(28) DEF_STUB(29) DEF_STUB(30) DEF_STUB(31)
 static int sched_preempt_counter = 0;
 
 
@@ -1040,24 +1087,33 @@ void pic_remap(void) {
 }
 
 void init_crash_guard_idt(void) {
-    uint64_t handler = (uint64_t)isr_stub;
+    uint64_t handlers[32] = {
+        (uint64_t)isr_stub_0,  (uint64_t)isr_stub_1,  (uint64_t)isr_stub_2,  (uint64_t)isr_stub_3,
+        (uint64_t)isr_stub_4,  (uint64_t)isr_stub_5,  (uint64_t)isr_stub_6,  (uint64_t)isr_stub_7,
+        (uint64_t)isr_stub_8,  (uint64_t)isr_stub_9,  (uint64_t)isr_stub_10, (uint64_t)isr_stub_11,
+        (uint64_t)isr_stub_12, (uint64_t)isr_stub_13, (uint64_t)isr_stub_14, (uint64_t)isr_stub_15,
+        (uint64_t)isr_stub_16, (uint64_t)isr_stub_17, (uint64_t)isr_stub_18, (uint64_t)isr_stub_19,
+        (uint64_t)isr_stub_20, (uint64_t)isr_stub_21, (uint64_t)isr_stub_22, (uint64_t)isr_stub_23,
+        (uint64_t)isr_stub_24, (uint64_t)isr_stub_25, (uint64_t)isr_stub_26, (uint64_t)isr_stub_27,
+        (uint64_t)isr_stub_28, (uint64_t)isr_stub_29, (uint64_t)isr_stub_30, (uint64_t)isr_stub_31
+    };
 
     for (int i = 0; i < 32; i++) {
-        idt[i].base_low   = handler & 0xFFFF;
+        idt[i].base_low   = handlers[i] & 0xFFFF;
         idt[i].sel        = 0x08;
         idt[i].always0    = 0;
         idt[i].flags      = 0x8E;
-        idt[i].base_high  = (handler >> 16) & 0xFFFF;
-        idt[i].base_upper = (handler >> 32) & 0xFFFFFFFF;
+        idt[i].base_high  = (handlers[i] >> 16) & 0xFFFF;
+        idt[i].base_upper = (handlers[i] >> 32) & 0xFFFFFFFF;
         idt[i].reserved   = 0;
     }
 
-    // Настраиваем вектор 32 (аппаратный таймер PIT / IRQ0) через чистый ассемблер
+    // Настройка таймера (IRQ0 / вектор 32)
     uint64_t timer_handler = (uint64_t)timer_isr_asm;
     idt[32].base_low   = timer_handler & 0xFFFF;
-    idt[32].sel        = 0x08;        // Селектор сегмента кода ядра
+    idt[32].sel        = 0x08;
     idt[32].always0    = 0;
-    idt[32].flags      = 0x8E;        // Атрибуты (Present, DPL=0, Interrupt Gate)
+    idt[32].flags      = 0x8E;
     idt[32].base_high  = (timer_handler >> 16) & 0xFFFF;
     idt[32].base_upper = (timer_handler >> 32) & 0xFFFFFFFF;
     idt[32].reserved   = 0;
@@ -1214,7 +1270,6 @@ void kernel_main(void) {
     de_stream_idx = 0;
     de_stream_line[0] = '\0';
 
-    init_crash_guard_idt();
     init_user_mode();
 
     pic_remap();                              // Переносим IRQ 0-7 на векторы 32-39
@@ -1225,6 +1280,8 @@ void kernel_main(void) {
 
     __asm__ volatile ("sti");
     tsc_calibrate();
+
+    init_crash_guard_idt();
 
     init_mc_monitor();
     init_ps2_mouse();
@@ -1257,7 +1314,6 @@ void kernel_main(void) {
     sched_init();
 
     task_create_kernel(tty1_task_entry, "tty1_shell")->tty_id = 0;
-
     kbd_layout = 0;
 
     uint8_t cursor_visible = 1;
