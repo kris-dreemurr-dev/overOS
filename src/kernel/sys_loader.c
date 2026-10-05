@@ -134,35 +134,16 @@ typedef uint64_t __attribute__((aligned(1))) u64_unaligned;
 // Единственный читатель клавиатуры для модулей.
 // Байты мыши уходят обработчику мыши, Alt+F1/F2 обрабатываются ядром,
 // чужому TTY порт не отдаём.
+// Единственный читатель порта 0x60/0x64 на всю систему — ps2_hw_service()
+// (keyboard.c), вызывается безусловно из простоя kernel_main. Он уже отфильтровал
+// Alt+F1/F2, Ctrl+C и байты мыши и разложил остальное по очередям TTY — модулю
+// остаётся только прочитать свою очередь.
 static int sys_kbd_poll(uint8_t* out) {
+    int tty_id = (g_module_tty >= 0) ? g_module_tty : tty_get_active_id();
     if (g_module_tty >= 0 && tty_get_active_id() != g_module_tty)
-        return 0;                                  // не наш TTY: порт не трогаем
+        return 0;                                  // не наш TTY сейчас активен
 
-    while (1) {
-        // статус + данные атомарно (таймер вытесняет задачи между двумя inb)
-        uint64_t fl;
-        __asm__ volatile("pushfq; popq %0; cli" : "=r"(fl) :: "memory");
-        uint8_t status = inb(0x64);
-        int have = status & 0x01;
-        uint8_t sc = have ? inb(0x60) : 0;
-        __asm__ volatile("pushq %0; popfq" :: "r"(fl) : "memory", "cc");
-
-        if (!have) return 0;
-
-        if (status & 0x20) {                       // байт мыши — не теряем, отдаём мыши
-            mouse_feed_byte(sc);
-            continue;
-        }
-
-        if (tty_check_hotkey(sc)) {                // переключение TTY
-            if (g_module_tty >= 0 && tty_get_active_id() != g_module_tty)
-                return 0;                          // ушли с нашего TTY
-            continue;
-        }
-
-        *out = sc;
-        return 1;
-    }
+    return tty_kbd_pop(tty_id, out);
 }
 
 // Общий api: живёт вечно (резидентные драйверы хранят на него указатель)

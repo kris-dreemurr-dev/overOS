@@ -120,11 +120,11 @@ static void format_size(uint32_t size, char* out_buf) {
     } else if (size < 1024 * 1024) {
         itoa(size / 1024, tmp);
         int i = 0; while(tmp[i]) { out_buf[i] = tmp[i]; i++; }
-        out_buf[i++] = ' '; out_buf[i++] = 'K'; out_buf[i] = '\0';
+        out_buf[i++] = ' '; out_buf[i++] = 'KB'; out_buf[i] = '\0';
     } else {
         itoa(size / (1024 * 1024), tmp);
         int i = 0; while(tmp[i]) { out_buf[i] = tmp[i]; i++; }
-        out_buf[i++] = ' '; out_buf[i++] = 'M'; out_buf[i] = '\0';
+        out_buf[i++] = ' '; out_buf[i++] = 'MB'; out_buf[i] = '\0';
     }
 }
 
@@ -250,7 +250,7 @@ void fat32_dir(void) {
     uint32_t cluster = g_current_cluster32;
     uint32_t spc = g_bpb32.sectors_per_cluster;
 
-    kputs("\nDirectory contents (FAT32):\n", 0x55FFFF);
+    kputs("\nDirectory contents:\n", 0x55FFFF);
     kputs("NAME                 SIZE\n", 0xAAAAAA);
     kputs("--------------------------------\n", 0xAAAAAA);
 

@@ -35,7 +35,7 @@ static void tty2_task_entry(void) {
 }
 
 void tty_init_core(void) {
-    // TTY 1 привязан к статическому back_buffer ядрa
+    // TTY 1 привязан к статическому back_buffer ядра
     g_ttys[0].id = 0;
     g_ttys[0].active = 1;
     g_ttys[0].buffer = back_buffer;
@@ -49,6 +49,9 @@ void tty_init_core(void) {
     g_ttys[0].input_len = 0;
     g_ttys[0].bg_color = 0x000000;
     g_ttys[0].gfx_mode = 0;
+    g_ttys[0].fg_pid = -1;
+    g_ttys[0].kbd_head = 0;
+    g_ttys[0].kbd_tail = 0;
 
     // TTY 2 не выделен до нажатия Alt+F2
     g_ttys[1].id = 1;
@@ -96,6 +99,9 @@ static int tty_spawn_second(void) {
     g_ttys[1].input_len = 0;
     g_ttys[1].bg_color = 0x000000;
     g_ttys[1].gfx_mode = 0;
+    g_ttys[1].fg_pid = -1;
+    g_ttys[1].kbd_head = 0;
+    g_ttys[1].kbd_tail = 0;
     g_ttys[1].active = 1;
 
     // Оболочка TTY 2: общий цикл, привязка к TTY через tty_id
@@ -228,6 +234,24 @@ void tty1_task_entry(void) {
     tty_shell_loop();
 }
 
+void tty_kbd_push(int tty_id, uint8_t scancode) {
+    tty_t* t = tty_get(tty_id);
+    if (!t) return;
+    int next = (t->kbd_head + 1) % TTY_KBD_Q_SIZE;
+    if (next != t->kbd_tail) {         // очередь полна — байт теряется (редкий случай)
+        t->kbd_q[t->kbd_head] = scancode;
+        t->kbd_head = next;
+    }
+}
+
+int tty_kbd_pop(int tty_id, uint8_t* out) {
+    tty_t* t = tty_get(tty_id);
+    if (!t || t->kbd_head == t->kbd_tail) return 0;
+    *out = t->kbd_q[t->kbd_tail];
+    t->kbd_tail = (t->kbd_tail + 1) % TTY_KBD_Q_SIZE;
+    return 1;
+}
+
 static int g_alt_state = 0;
 
 int tty_check_hotkey(uint8_t scancode) {
@@ -247,7 +271,7 @@ int tty_check_hotkey(uint8_t scancode) {
             tty_switch(0);
             return 1; 
         }
-        if (scancode == 0x3C) { // F2 -> TTY 2[
+        if (scancode == 0x3C) { // F2 -> TTY 2
             g_alt_state = 2;
             tty_switch(1);
             return 1; 

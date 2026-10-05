@@ -8,9 +8,6 @@ extern void put_pixel(int x, int y, uint32_t color);
 extern uint16_t screen_width;
 extern uint16_t screen_height;
 
-
-static int mouse_accum_dx = 0;
-static int mouse_accum_dy = 0;
 static int mouse_x = 200;
 static int mouse_y = 200;
 static uint8_t mouse_buttons = 0;
@@ -134,20 +131,18 @@ void mouse_feed_byte(uint8_t byte) {
         mouse_bytes[2] = byte;
         mouse_cycle = 0;
 
+        // Бит 0: Левая кнопка (ЛКМ), Бит 1: Правая (ПКМ), Бит 2: Средняя (СКМ)
         mouse_buttons = mouse_bytes[0] & 0x07;
 
         int dx = (int)mouse_bytes[1];
         int dy = (int)mouse_bytes[2];
 
+        // Знаковое расширение 9-битных дельт смещения
         if (mouse_bytes[0] & 0x10) dx |= ~0xFF;
         if (mouse_bytes[0] & 0x20) dy |= ~0xFF;
 
-        // Накапливаем дельту для игр (Quake / Doom)
-        mouse_accum_dx += dx;
-        mouse_accum_dy += dy;
-
         mouse_x += dx;
-        mouse_y -= dy;
+        mouse_y -= dy; // В PS/2 вертикальная ось инвертирована относительно экрана
 
         // Ограничение по видимой области экрана
         if (mouse_x < 0) mouse_x = 0;
@@ -157,38 +152,15 @@ void mouse_feed_byte(uint8_t byte) {
     }
 }
 
-// РАЗРЕШАЕМ ядру обновлять мышь, даже когда запущен Ring 3 процесс:
-static int mouse_should_defer(void) {
-    // Удаляем или комментируем: if (sched_get_foreground_task()) return 1;
-    return 0; 
-}
-
-// Функция для системного вызова: возвращает дельты и сбрасывает их
-void get_mouse_delta(int* out_dx, int* out_dy, uint8_t* out_buttons) {
-    if (out_dx) *out_dx = mouse_accum_dx;
-    if (out_dy) *out_dy = mouse_accum_dy;
-    if (out_buttons) *out_buttons = mouse_buttons;
-
-    // Сбрасываем накопленные смещения после чтения
-    mouse_accum_dx = 0;
-    mouse_accum_dy = 0;
-}
-
+// Единственный читатель порта 0x60/0x64 на всю систему теперь ps2_hw_service()
+// в keyboard.c (вызывается безусловно из простоя kernel_main) — он сам отдаёт
+// байты мыши в mouse_feed_byte(), так что состояние мыши всегда свежее без
+// отдельного чтения порта здесь. Функция оставлена как no-op ради API: .sys-модули
+// вроде de.sys по-прежнему могут звать api->update_mouse_state() перед
+// get_mouse_x()/y() — это просто ничего не делает и ничему не вредит, раз
+// состояние и так обновляется централизованно.
 void update_mouse_state(void) {
-    if (mouse_should_defer()) return;
-    while (1) {
-        // Статус и данные читаем атомарно: таймер может вытеснить задачу между ними,
-        // и другой читатель заберёт байт, который мы только что увидели в статусе
-        uint64_t fl;
-        __asm__ volatile("pushfq; popq %0; cli" : "=r"(fl) :: "memory");
-        uint8_t status = inb(0x64);
-        int take = (status & 0x01) && (status & 0x20);   // только байт мыши; клавиатуру не трогаем
-        uint8_t byte = take ? inb(0x60) : 0;
-        __asm__ volatile("pushq %0; popfq" :: "r"(fl) : "memory", "cc");
-
-        if (!take) break;
-        mouse_feed_byte(byte);
-    }
+    // намеренно пусто
 }
 
 int get_mouse_x(void) { return mouse_x; }

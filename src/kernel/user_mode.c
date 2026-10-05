@@ -16,6 +16,9 @@ extern void     update_mouse_state(void);
 extern void     sleep_ms(uint32_t ms);
 extern void     get_mouse_delta(int* out_dx, int* out_dy, uint8_t* out_buttons);
 extern uint8_t  inb(uint16_t port);
+extern int      get_mouse_x(void);
+extern int      get_mouse_y(void);
+extern int      get_mouse_btn(void);
 extern void     itoa(int n, char* str);
 extern uint16_t screen_width;
 extern uint16_t screen_height;
@@ -60,44 +63,15 @@ static tss_entry_t   tss;
 
 static uint32_t g_doom_palette[256];
 
-#define KBD_BUF_SIZE 64
-static uint8_t g_kbd_buf[KBD_BUF_SIZE];
-static int g_kbd_head = 0;
-static int g_kbd_tail = 0;
-
-static mouse_state_t g_mouse_state = {0, 0, 0};
-static uint8_t g_mouse_cycle = 0;
-static uint8_t g_mouse_bytes[3];
-
-static void ps2_pump(void) {
-    while (inb(0x64) & 1) {
-        uint8_t status = inb(0x64);
-        uint8_t data = inb(0x60);
-        if (status & 0x20) {
-            if (g_mouse_cycle == 0) {
-                if (!(data & 0x08)) continue;
-            }
-            g_mouse_bytes[g_mouse_cycle++] = data;
-            if (g_mouse_cycle == 3) {
-                g_mouse_cycle = 0;
-                g_mouse_state.buttons = g_mouse_bytes[0] & 0x07;
-                int32_t dx = (int32_t)g_mouse_bytes[1];
-                int32_t dy = (int32_t)g_mouse_bytes[2];
-                if (g_mouse_bytes[0] & 0x10) dx |= ~0xFF;
-                if (g_mouse_bytes[0] & 0x20) dy |= ~0xFF;
-                g_mouse_state.x += dx;
-                g_mouse_state.y += dy;
-            }
-        } else {
-            if (tty_check_hotkey(data)) { g_kbd_head = g_kbd_tail = 0; continue; }   // Alt+F1/F2
-            int next = (g_kbd_head + 1) % KBD_BUF_SIZE;
-            if (next != g_kbd_tail) {
-                g_kbd_buf[g_kbd_head] = data;
-                g_kbd_head = next;
-            }
-        }
-    }
-}
+// Относительные дельты мыши для get_mouse() (case 7): считаем их диффом от
+// абсолютной позиции mouse.c (get_mouse_x/y), а не из собственного разбора
+// пакетов — порт 0x60/0x64 читает только ps2_hw_service() (keyboard.c), вызывается
+// безусловно из простоя kernel_main. Клавиатура для .prg идёт через очередь
+// своего TTY (tty_kbd_pop), её туда раскладывает тот же ps2_hw_service.
+// NB: case 23 (get_mouse_delta) — отдельный, более старый путь опроса мыши,
+// я его не трогаю, не видя mouse.c целиком.
+static int g_mouse_last_init = 0;
+static int g_mouse_last_x = 0, g_mouse_last_y = 0;
 
 static void str_to_fat83(const char* in, char* out83) {
     for (int i = 0; i < 11; i++) out83[i] = ' ';
@@ -168,25 +142,28 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
 
         case 6: { // get_key() -> uint8_t
             if (!visible) return 0;   // фоновая программа клавиатуру не трогает
-            ps2_pump();
-            if (g_kbd_head != g_kbd_tail) {
-                uint8_t sc = g_kbd_buf[g_kbd_tail];
-                g_kbd_tail = (g_kbd_tail + 1) % KBD_BUF_SIZE;
-                return (uint64_t)sc;
-            }
+            if (!caller || caller->tty_id < 0) return 0;
+            uint8_t sc;
+            if (tty_kbd_pop(caller->tty_id, &sc)) return (uint64_t)sc;
             return 0;
         }
 
         case 7: { // get_mouse(mouse_state_t* out) -> int
             if (!visible) return 0;
-            ps2_pump();
+            int cx = get_mouse_x();
+            int cy = get_mouse_y();
+            if (!g_mouse_last_init) {   // первый опрос: дельта 0, а не прыжок с (0,0)
+                g_mouse_last_x = cx;
+                g_mouse_last_y = cy;
+                g_mouse_last_init = 1;
+            }
             if (arg1) {
                 mouse_state_t* user_ms = (mouse_state_t*)arg1;
-                user_ms->buttons = g_mouse_state.buttons;
-                user_ms->x = g_mouse_state.x;
-                user_ms->y = g_mouse_state.y;
-                g_mouse_state.x = 0;
-                g_mouse_state.y = 0;
+                user_ms->x = cx - g_mouse_last_x;
+                user_ms->y = cy - g_mouse_last_y;
+                user_ms->buttons = (uint8_t)get_mouse_btn();
+                g_mouse_last_x = cx;
+                g_mouse_last_y = cy;
                 return 1;
             }
             return 0;
@@ -290,11 +267,12 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
                 while (tty_get_active_id() != caller->tty_id) sched_yield();
                 paused = now_ms() - t0;
 
-                // Alt-up прочитала оболочка другого TTY: шлём релизы, чтобы клавиши не залипли
+                // Alt-up прочитала оболочка другого TTY: шлём релизы в НАШУ очередь TTY,
+                // чтобы клавиши не залипли (синтетические байты, в обход ps2_hw_service —
+                // прямиком в очередь, как раньше ps2_pump писал прямо в g_kbd_buf)
                 static const uint8_t rel[3] = {0xB8, 0x9D, 0xAA};   // Alt, Ctrl, Shift up
                 for (int i = 0; i < 3; i++) {
-                    int nx = (g_kbd_head + 1) % KBD_BUF_SIZE;
-                    if (nx != g_kbd_tail) { g_kbd_buf[g_kbd_head] = rel[i]; g_kbd_head = nx; }
+                    tty_kbd_push(caller->tty_id, rel[i]);
                 }
             }
 
@@ -340,7 +318,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
 
             int k_dx, k_dy;
             uint8_t k_btn;
-            get_mouse_delta(&k_dx, &k_dy, &k_btn);
+            //get_mouse_delta(&k_dx, &k_dy, &k_btn);
     
             if (u_dx) *u_dx = k_dx;
             if (u_dy) *u_dy = k_dy;
@@ -793,9 +771,8 @@ void init_user_mode(void) {
     __asm__ volatile ("outb %0, $0x21" : : "a"((uint8_t)0xFF));
     __asm__ volatile ("outb %0, $0xA1" : : "a"((uint8_t)0xFF));
 
-    g_kbd_head = g_kbd_tail = 0;
-    g_mouse_cycle = 0;
-    g_mouse_state.x = g_mouse_state.y = g_mouse_state.buttons = 0;
+    // Очереди клавиатуры по TTY уже обнулены в tty_init_core/tty_spawn_second;
+    // состояние мыши — в mouse.c, туда отдельного сброса тоже не нужно.
 
     for (int i = 0; i < (int)sizeof(kernel_tss); i++) ((uint8_t*)&kernel_tss)[i] = 0;
     

@@ -127,7 +127,8 @@ extern void usb_controller_init(void);
 extern void ehci_init(void);
 extern void keyboard_poll_handler(void);
 extern void init_ps2_mouse(void);
-extern void update_mouse_state(void);
+extern void update_mouse_state(void);   // читает мышь — нужна case 23 (get_mouse_delta), не трогаю
+extern void ps2_hw_service(void);       // клавиатура для .prg/.sys/оболочки + Ctrl+C (keyboard.c)
 extern void draw_cursor_shape(int x, int y);
 extern int get_mouse_x(void);
 extern int get_mouse_y(void);
@@ -1308,6 +1309,7 @@ void kernel_main(void) {
 
     while (1) {
         //keyboard_poll_handler();
+        ps2_hw_service();   // клавиатура: единый читатель, раскладывает по очередям TTY + ловит Ctrl+C
         update_mouse_state();
 
         sleep_ms(10);
@@ -1315,7 +1317,7 @@ void kernel_main(void) {
         if ((timer_ticks - last_blink) >= 500) {
             cursor_visible = !cursor_visible;
             tty_t* at = tty_get(tty_get_active_id());
-            if (!(at && at->gfx_mode)) {   // если экраном владеет модуль — курсор консоли не трогаем
+            if (!(at && at->gfx_mode)) {   // если экраном владеет модуль - курсор консоли не трогаем
                 draw_cursor(cursor_visible ? 0xFFFFFF : current_bg_color);
                 flush_buffer();
             }

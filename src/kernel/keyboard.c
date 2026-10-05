@@ -11,7 +11,7 @@ extern void kputs_at(int x, int y, const char* str, uint32_t color);
 extern void draw_cursor(uint32_t color);
 extern void print_prompt(void);
 extern void mouse_feed_byte(uint8_t byte);
-extern int sched_send_signal(uint64_t pid, int sig);
+extern int  sched_send_signal(uint64_t pid, int sig);
 
 extern int cursor_x;
 extern int cursor_y;
@@ -62,50 +62,55 @@ static void update_layout_indicator(void) {
     flush_buffer();
 }
 
+
+static uint8_t g_ps2_ctrl_pressed = 0;   // Ctrl — состояние на всю систему, как и Alt в tty.c
+
+void ps2_hw_service(void) {
+    while (1) {
+        // Статус + данные атомарно: таймер может вытеснить нас между двумя inb,
+        // но раз это единственный читатель порта, этого и так почти не бывает —
+        // атомарность тут скорее для аккуратности, чем от реальной гонки.
+        uint64_t fl;
+        __asm__ volatile("pushfq; popq %0; cli" : "=r"(fl) :: "memory");
+        uint8_t status = inb(0x64);
+        int have = status & 0x01;
+        uint8_t sc = have ? inb(0x60) : 0;
+        __asm__ volatile("pushq %0; popfq" :: "r"(fl) : "memory", "cc");
+
+        if (!have) return;
+
+        if (status & 0x20) { mouse_feed_byte(sc); continue; }   // байт мыши
+
+        if (tty_check_hotkey(sc)) continue;   // Alt+F1/F2 — поглощается здесь, глобально
+
+        if (sc == 0x1D) { g_ps2_ctrl_pressed = 1; continue; }    // Ctrl нажат
+        if (sc == 0x9D) { g_ps2_ctrl_pressed = 0; continue; }    // Ctrl отпущен
+
+        // Ctrl+C -> SIGINT процессу-владельцу АКТИВНОГО TTY (tty->fg_pid).
+        // SIGINT не перехватывается (обработчиков сигналов пока нет), поэтому
+        // сейчас это всегда немедленное завершение — "минимум: kill, Ctrl+C" из плана.
+        if (g_ps2_ctrl_pressed && sc == 0x2E && !(sc & 0x80)) {   // 'C' (make-код)
+            tty_t* at = tty_get(tty_get_active_id());
+            if (at && at->fg_pid > 0) sched_send_signal((uint64_t)at->fg_pid, SIGINT);
+            continue;
+        }
+
+        tty_kbd_push(tty_get_active_id(), sc);   // остальное — в очередь активного TTY
+    }
+}
+
 void keyboard_poll_handler(void) {
     task_t* me = sched_get_current_task();
     if (!me || me->tty_id < 0 || me->tty_id != tty_get_active_id()) return;
     int my_tty = me->tty_id;
     int extended_key = 0;
     uint8_t alt_pressed = 0;
-    static uint8_t ctrl_pressed = 0;   // состояние Ctrl общее на систему (как alt_pressed в tty.c)
 
-    while (inb(0x64) & 0x01) {
-        uint8_t status = inb(0x64);
-        uint8_t scancode = inb(0x60);
-
-        if (status & 0x20) { mouse_feed_byte(scancode); continue; } // Байт мыши — отдаём общему декодеру, не теряем
-
-        // Глобальный перехват виртуальных терминалов
-        if (tty_check_hotkey(scancode)) {
-            if (tty_get_active_id() != my_tty) return;
-            continue;
-        }
-
+    uint8_t scancode;
+    while (tty_kbd_pop(my_tty, &scancode)) {
         if (scancode == 0xE0) { 
             extended_key = 1; 
             continue; 
-        }
-
-        // Фиксация Ctrl (0x1D) — нужен для Ctrl+C
-        if (scancode == 0x1D) {
-            ctrl_pressed = 1;
-            continue;
-        }
-        if (scancode == 0x9D) {
-            ctrl_pressed = 0;
-            continue;
-        }
-
-        // Ctrl+C -> SIGINT процессу, который сейчас владеет этим TTY (tty->fg_pid).
-        // SIGINT не перехватывается (обработчиков сигналов пока нет), поэтому
-        // это пока всегда немедленное завершение — ровно как "минимум: kill, Ctrl+C" из плана.
-        if (ctrl_pressed && scancode == 0x2E && !(scancode & 0x80)) {   // 'C' (make-код)
-            tty_t* at = tty_get(my_tty);
-            if (at && at->fg_pid > 0) {
-                sched_send_signal((uint64_t)at->fg_pid, SIGINT);
-            }
-            continue;
         }
 
         // Фиксация нажатия Alt (0x38)
