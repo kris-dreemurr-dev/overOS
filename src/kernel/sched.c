@@ -1,7 +1,8 @@
 #include "sched.h"
 #include "../memory/pmm.h"
 #include "../memory/vmm.h"
-#include "tty.h"
+#include "../fs/vfs.h"
+#include "../fs/devfs.h"
 
 #define KERNEL_STACK_SIZE (64 * 1024)
 
@@ -16,14 +17,15 @@ extern volatile int g_user_mode_active;
 static void task_init_um(task_t* t) {
     t->saved_krsp = 0;
     t->in_user = 0;
-    t->open83[0] = '\0';
-    t->heap_start = 0;
-    t->heap_end = 0;
-    t->parent = NULL;
-    t->exit_code = 0;
-    t->is_process = 0;
-    t->user_entry = 0;
-    t->user_stack_top = 0;
+    t->heap_start = 0; 
+    t->heap_end = 0; 
+    t->parent = NULL; 
+    t->exit_code = 0; 
+    t->is_process = 0; 
+    t->user_entry = 0; 
+    t->user_stack_top = 0; 
+    t->cwd[0] = '/'; t->cwd[1] = '\0';
+    for (int i = 0; i < MAX_FD; i++) t->fd_table[i] = NULL;
 }
 
 static task_t* current_task = NULL;
@@ -154,7 +156,7 @@ void sched_yield(void) {
 }
 
 void sched_dump_tasks(void) {
-    kputs("\n====================== [ devOS TASK MANAGER ] ======================\n", 0x55FFFF);
+    kputs("\n====================== [ overOS TASK MANAGER ] ======================\n", 0x55FFFF);
     kputs("PID  NAME           STATE      RAM STACK ADDR      CR3 (PML4)   MEM\n", 0xAAAAAA);
     kputs("--------------------------------------------------------------------\n", 0x555555);
 
@@ -350,7 +352,7 @@ task_t* sched_spawn_process(const char* name, uint64_t cr3, uint64_t mem_size,
     t->state = TASK_READY;
     task_init_um(t);
     kstrncpy(t->name, name, 16);
-
+    
     t->parent = current_task;                                  // тот, кто запускает и будет ждать
     t->tty_id = current_task ? current_task->tty_id : -1;      // процесс работает на TTY оболочки
     t->cr3 = cr3;
@@ -361,6 +363,22 @@ task_t* sched_spawn_process(const char* name, uint64_t cr3, uint64_t mem_size,
     t->is_process = 1;
     t->user_entry = user_entry;
     t->user_stack_top = user_stack_top;
+
+    // --- Инициализация VFS для нового процесса ---
+    if (current_task && current_task->cwd[0] != '\0') {
+        kstrncpy(t->cwd, current_task->cwd, sizeof(t->cwd));
+    } else {
+        t->cwd[0] = '/';
+        t->cwd[1] = '\0';
+    }
+
+    // Привязка стандартных потоков (stdin: 0, stdout: 1, stderr: 2) к /dev/tty
+    vfs_node_t* tty_node = devfs_get_node("tty");
+    if (tty_node) {
+        t->fd_table[0] = vfs_allocate_fd(tty_node, O_RDONLY);
+        t->fd_table[1] = vfs_allocate_fd(tty_node, O_WRONLY);
+        t->fd_table[2] = vfs_allocate_fd(tty_node, O_WRONLY);
+    }
 
     uint64_t* stk = (uint64_t*)((uintptr_t)stack + PROC_KSTACK_SIZE);
     t->kstack_top = (uint64_t)stk;
@@ -474,6 +492,14 @@ int sched_wait_child(task_t* child) {
         c = c->next;
     } while (c != task_list_head);
     __asm__ volatile("pushq %0; popfq" :: "r"(fl) : "memory", "cc");
+
+    // --- VFS: закрываем и освобождаем все открытые файловые дескрипторы ---
+    for (int i = 0; i < MAX_FD; i++) {
+        if (child->fd_table[i]) {
+            vfs_release_fd(child->fd_table[i]);
+            child->fd_table[i] = NULL;
+        }
+    }
 
     // Освобождаем ресурсы процесса (он уже не исполняется: ушёл в ZOMBIE и отдал CPU)
     uint64_t cur_cr3;

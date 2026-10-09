@@ -62,20 +62,25 @@ static inline uint8_t get_key(void) {
 }
 
 // Файловые системные вызовы
-static inline int open(const char* filename) {
-    return (int)syscall4(10, (uint64_t)(uintptr_t)filename, 0, 0);
+static inline int open(const char* filename, int flags) {
+    return (int)syscall4(10, (uint64_t)(uintptr_t)filename, (uint64_t)flags, 0); //
 }
 
 static inline int read(int fd, void* buf, int size) {
-    return (int)syscall4(11, (uint64_t)fd, (uint64_t)(uintptr_t)buf, (uint64_t)size);
+    return (int)syscall4(11, (uint64_t)fd, (uint64_t)(uintptr_t)buf, (uint64_t)size); //
 }
 
 static inline void close(int fd) {
-    syscall4(12, (uint64_t)fd, 0, 0);
+    syscall4(12, (uint64_t)fd, 0, 0); //[cite: 19]
 }
 
-static inline int write(const char* filename, const void* buf, int size) {
-    return (int)syscall4(13, (uint64_t)(uintptr_t)filename, (uint64_t)(uintptr_t)buf, (uint64_t)size);
+// Теперь соответствует стандарту POSIX write(fd, buf, size)
+static inline int write(int fd, const void* buf, int size) {
+    return (int)syscall4(13, (uint64_t)fd, (uint64_t)(uintptr_t)buf, (uint64_t)size);
+}
+
+static inline int ioctl(int fd, uint64_t req, void* arg) {
+    return (int)syscall4(15, (uint64_t)fd, req, (uint64_t)(uintptr_t)arg);
 }
 
 // Куча процесса (sys_brk): текущий вызов — (uint64_t)-1 на ошибке,

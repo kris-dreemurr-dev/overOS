@@ -4,17 +4,28 @@
 
 extern void devos_set_palette(const uint8_t* raw_rgb);
 
+// 1. Предварительное объявление strlen (полная реализация лежит ниже)
+size_t strlen(const char* s);
+
 // -----------------------------------------------------------------------------
-// ВЫВОД НА ЭКРАН DEVOS (СИСТЕМНЫЙ ВЫЗОВ 1)
+// ВЫВОД НА ЭКРАН DEVOS ЧЕРЕЗ VFS (FD 1 -> /dev/tty)
 // -----------------------------------------------------------------------------
-void sys_print(const char* str) {
-    if (!str) return;
+
+static inline int sys_write(int fd, const void* buf, uint32_t sz) {
+    int ret;
     __asm__ volatile (
         "int $0x80"
-        :
-        : "a"(1), "b"(str), "c"(0x00FFFFFF)
+        : "=a"(ret)
+        : "a"(13), "b"(fd), "c"(buf), "d"(sz)
         : "memory"
     );
+    return ret;
+}
+
+
+void sys_print(const char* str) {
+    if (!str) return;
+    sys_write(1, str, (uint32_t)strlen(str));
 }
 
 void* stderr = (void*)2;
@@ -75,28 +86,84 @@ int vfprintf(void* stream, const char* fmt, va_list ap) {
 // -----------------------------------------------------------------------------
 static uintptr_t g_heap_top = 0x01600000;
 
+// Побайтовые memcpy/memset/memmove были реальным узким местом для движков вроде
+// Doom/Quake (софтверный рендерер гоняет их по своим внутренним буферам каждый
+// кадр, независимо от разрешения экрана). Ниже — та же логика блоками по 8 байт
+// (uint64_t) с байтовым хвостом, в духе rep movsq, который уже используется в
+// flush_buffer(). Быстрый путь включается только когда dest/src одинаково
+// выровнены по 8 байт (обычный случай для буферов кадра/кучи) — иначе честно
+// откатываемся на побайтовый цикл, который всегда корректен.
+
 void* memset(void* dest, int c, size_t n) {
     uint8_t* d = (uint8_t*)dest;
-    while (n--) *d++ = (uint8_t)c;
+    uint8_t byte = (uint8_t)c;
+
+    while (n && ((uintptr_t)d & 7)) { *d++ = byte; n--; }   // довыравниваем начало
+
+    if (n >= 8) {
+        uint64_t pattern = (uint64_t)byte * 0x0101010101010101ULL;
+        uint64_t* d64 = (uint64_t*)d;
+        size_t words = n / 8;
+        for (size_t i = 0; i < words; i++) d64[i] = pattern;
+        d += words * 8;
+        n -= words * 8;
+    }
+
+    while (n--) *d++ = byte;   // хвост < 8 байт
     return dest;
 }
 
 void* memcpy(void* dest, const void* src, size_t n) {
     uint8_t* d = (uint8_t*)dest;
     const uint8_t* s = (const uint8_t*)src;
-    while (n--) *d++ = *s++;
+
+    if ((((uintptr_t)d ^ (uintptr_t)s) & 7) == 0) {   // одинаковое выравнивание по 8
+        while (n && ((uintptr_t)d & 7)) { *d++ = *s++; n--; }
+
+        size_t words = n / 8;
+        uint64_t* d64 = (uint64_t*)d;
+        const uint64_t* s64 = (const uint64_t*)s;
+        for (size_t i = 0; i < words; i++) d64[i] = s64[i];
+        d += words * 8;
+        s += words * 8;
+        n -= words * 8;
+    }
+
+    while (n--) *d++ = *s++;   // хвост, либо весь n при разном выравнивании
     return dest;
 }
 
 void* memmove(void* dest, const void* src, size_t n) {
     uint8_t* d = (uint8_t*)dest;
     const uint8_t* s = (const uint8_t*)src;
+    if (d == s || n == 0) return dest;
+
     if (d < s) {
+        if ((((uintptr_t)d ^ (uintptr_t)s) & 7) == 0) {
+            while (n && ((uintptr_t)d & 7)) { *d++ = *s++; n--; }
+            size_t words = n / 8;
+            uint64_t* d64 = (uint64_t*)d;
+            const uint64_t* s64 = (const uint64_t*)s;
+            for (size_t i = 0; i < words; i++) d64[i] = s64[i];
+            d += words * 8;
+            s += words * 8;
+            n -= words * 8;
+        }
         while (n--) *d++ = *s++;
     } else {
         d += n;
         s += n;
-        while (n--) *--d = *--s;
+        if ((((uintptr_t)d ^ (uintptr_t)s) & 7) == 0) {
+            while (n && ((uintptr_t)d & 7)) { *--d = *--s; n--; }
+            size_t words = n / 8;
+            for (size_t i = 0; i < words; i++) {
+                d -= 8;
+                s -= 8;
+                *(uint64_t*)d = *(uint64_t*)s;
+            }
+            n -= words * 8;
+        }
+        while (n--) { *--d = *--s; }
     }
     return dest;
 }
@@ -554,23 +621,24 @@ int remove(const char* pathname) { (void)pathname; return 0; }
 int mkdir(const char* pathname, unsigned int mode) { (void)pathname; (void)mode; return 0; }
 
 void exit(int status) {
-    // Прямой вывод без буферизации
-    //sys_print("\n\n>>> [MINI_LIBC] exit() CALLED WITH STATUS: ");
-    char numbuf[16];
-    // Простой вывод hex-кода
-    for (int i = 7; i >= 0; i--) {
-        int nibble = (status >> (i * 4)) & 0xF;
-        numbuf[7 - i] = (nibble < 10) ? ('0' + nibble) : ('A' + nibble - 10);
+    if (status != 0) {
+        sys_print("\n>>> [MINI_LIBC] exit() with code: ");
+        char buf[16];
+        int s = status, p = 0;
+        if (s < 0) { sys_print("-"); s = -s; }
+        if (s == 0) buf[p++] = '0';
+        char tmp[16]; int tp = 0;
+        while (s > 0) { tmp[tp++] = '0' + (s % 10); s /= 10; }
+        while (tp > 0) buf[p++] = tmp[--tp];
+        buf[p] = '\0';
+        sys_print(buf);
+        sys_print("\n");
     }
-    numbuf[8] = '\n';
-    numbuf[9] = 0;
-    //sys_print(numbuf);
 
-    // Если это указатель на строку ошибки — выводим её
     if (status >= 0x01000000 && status < 0x02000000) {
-        sys_print(">>> [STRING TEXT]: ");
-        sys_print((const char*)status);
-        sys_print("\n\n");
+        sys_print(">>> [ERROR TEXT]: ");
+        sys_print((const char*)(uintptr_t)status);
+        sys_print("\n");
     }
 
     __asm__ volatile ("int $0x80" : : "a"(0), "b"(status) : "memory");
@@ -584,26 +652,35 @@ void abort(void) { exit(1); }
 // -----------------------------------------------------------------------------
 #define WAD_RAM_ADDR 0x05000000
 
-static inline int sys_open(const char* fn) {
+static inline int sys_open(const char* fn, int flags) {
     int ret;
-    __asm__ volatile ("int $0x80" : "=a"(ret) : "0"(10), "b"(fn) : "memory");
+    __asm__ volatile (
+        "int $0x80"
+        : "=a"(ret)
+        : "a"(10), "b"(fn), "c"(flags)
+        : "memory"
+    );
     return ret;
 }
 
 static inline int sys_read(int fd, void* buf, int sz) {
     int ret;
-    __asm__ volatile ("int $0x80" : "=a"(ret) : "0"(11), "b"(fd), "c"(buf), "d"(sz) : "memory");
+    __asm__ volatile (
+        "int $0x80"
+        : "=a"(ret)
+        : "a"(11), "b"(fd), "c"(buf), "d"(sz)
+        : "memory"
+    );
     return ret;
 }
 
 static inline void sys_close(int fd) {
-    __asm__ volatile ("int $0x80" : : "a"(12), "b"(fd) : "memory");
-}
-
-static inline int sys_write(const char* fn, const void* buf, uint32_t sz) {
-    int ret;
-    __asm__ volatile ("int $0x80" : "=a"(ret) : "0"(13), "b"(fn), "c"(buf), "d"(sz) : "memory");
-    return ret;
+    __asm__ volatile (
+        "int $0x80"
+        :
+        : "a"(12), "b"(fd)
+        : "memory"
+    );
 }
 
 #define MAX_FILES 16
@@ -639,15 +716,15 @@ void* fopen(const char* filename, const char* mode) {
     if (!f) return NULL;
     memset(f, 0, sizeof(devos_file_t));
 
-    // WAD файл читаем в динамически выделенную память, а не по фиксированному адресу!
-    
-    // Добавьте этот код в fopen() вместо проверки doom1.wad
-    if (strcasecmp(base_name, "pak0.pak") == 0 || strcasecmp(base_name, "pak1.pak") == 0 || strstr(base_name, ".wad")) {
-        int fd = sys_open(base_name); // Вызываем ваш сисколл
+    // Проверяем расширение без учета регистра (.wad / .WAD / .pak / .PAK)
+    const char* ext = strrchr(base_name, '.');
+    int is_archive = (ext && (strcasecmp(ext, ".wad") == 0 || strcasecmp(ext, ".pak") == 0));
+
+    if (is_archive) {
+        int fd = sys_open(base_name, 0); // 0 = O_RDONLY
         if (fd < 0) return NULL;
 
-        // Для Quake Shareware (pak0.pak) нужно около 18-20 МБ. 
-        // Для полной версии ставьте 55 * 1024 * 1024
+        // Выделяем память под полный образ архива
         f->capacity = 25 * 1024 * 1024; 
         f->buffer = (uint8_t*)malloc(f->capacity);
         if (!f->buffer) {
@@ -658,7 +735,7 @@ void* fopen(const char* filename, const char* mode) {
         int read_bytes = sys_read(fd, f->buffer, f->capacity);
         sys_close(fd);
 
-        f->is_wad = 1; // Используем тот же флаг, чтобы не писать на диск
+        f->is_wad = 1;
         f->size = (read_bytes > 0) ? read_bytes : 0;
         f->is_open = 1;
         return f;
@@ -667,7 +744,7 @@ void* fopen(const char* filename, const char* mode) {
     int is_write = (mode[0] == 'w' || mode[0] == 'a' || strchr(mode, '+'));
 
     if (is_write) {
-        f->capacity = 512 * 1024; // Сейв в Doom может весить до 200-300 КБ
+        f->capacity = 512 * 1024;
         f->buffer = malloc(f->capacity);
         if (!f->buffer) return NULL;
         f->is_write = 1;
@@ -675,11 +752,8 @@ void* fopen(const char* filename, const char* mode) {
         f->is_open = 1;
         return f;
     } else {
-        // Режим чтения: если файла нет на диске — ОБЯЗАТЕЛЬНО возвращаем NULL!
-        int fd = sys_open(base_name);
-        if (fd < 0) {
-            return NULL;
-        }
+        int fd = sys_open(base_name, 0); // 0 = O_RDONLY
+        if (fd < 0) return NULL;
 
         f->capacity = 512 * 1024;
         f->buffer = malloc(f->capacity);
@@ -734,8 +808,13 @@ int fclose(void* stream) {
     devos_file_t* f = (devos_file_t*)stream;
     if (!f->is_open) return 0;
 
-    if (f->is_write && !f->is_wad) {
-        sys_write(f->name, f->buffer, f->size);
+    // Запись файла через честный VFS open -> write -> close
+    if (f->is_write && !f->is_wad && f->size > 0) {
+        int fd = sys_open(f->name, 1 | 0x40); // 1 = O_WRONLY, 0x40 = O_CREAT
+        if (fd >= 0) {
+            sys_write(fd, f->buffer, f->size);
+            sys_close(fd);
+        }
     }
 
     if (f->buffer) free(f->buffer);
@@ -773,18 +852,26 @@ int rename(const char* oldpath, const char* newpath) {
     const char* base_old = get_base_name(oldpath);
     const char* base_new = get_base_name(newpath);
 
-    int fd = sys_open(base_old);
+    int fd = sys_open(base_old, 0); // 0 = O_RDONLY
     if (fd < 0) return -1;
 
     uint8_t* temp_buf = malloc(512 * 1024);
-    if (!temp_buf) { sys_close(fd); return -1; }
+    if (!temp_buf) { 
+        sys_close(fd); 
+        return -1; 
+    }
 
     int sz = sys_read(fd, temp_buf, 512 * 1024);
     sys_close(fd);
 
     if (sz > 0) {
-        sys_write(base_new, temp_buf, sz);
+        int out_fd = sys_open(base_new, 1 | 0x40); // 1 = O_WRONLY, 0x40 = O_CREAT
+        if (out_fd >= 0) {
+            sys_write(out_fd, temp_buf, sz);
+            sys_close(out_fd);
+        }
     }
+
     free(temp_buf);
     return 0;
 }
@@ -1062,14 +1149,14 @@ int fscanf(void *stream, const char *format, ...) __attribute__((alias("__isoc99
 // ТАНГЕНС, СТЕПЕНЬ И ОШИБКИ (ДЛЯ QUAKE)
 // -----------------------------------------------------------------------------
 
-// Вычисление тангенса через sin/cos на FPU[cite: 17]
+// Вычисление тангенса через sin/cos на FPU
 double tan(double x) {
     double sin_x, cos_x;
     __asm__ volatile ("fsincos" : "=t" (cos_x), "=u" (sin_x) : "0" (x));
     return sin_x / cos_x;
 }
 
-// Возведение в степень на x87 FPU: x^y = 2^(y * log2(x)) (нужно для гаммы в view.c)[cite: 17]
+// Возведение в степень на x87 FPU: x^y = 2^(y * log2(x)) (нужно для гаммы в view.c)
 double pow(double x, double y) {
     if (x <= 0.0) return 0.0;
     double res;
@@ -1093,7 +1180,7 @@ double pow(double x, double y) {
     return res;
 }
 
-// Заглушка текста ошибки (требуется в sys_null.c при неудачной записи файла)[cite: 17]
+// Заглушка текста ошибки (требуется в sys_null.c при неудачной записи файла)
 char* strerror(int errnum) {
     (void)errnum;
     return "I/O error";

@@ -239,3 +239,29 @@ uint64_t* vmm_clone_address_space(uint64_t* parent_pml4_phys) {
     
     return child_pml4_phys;
 }
+
+static inline uint64_t rdmsr(uint32_t msr) {
+    uint32_t lo, hi;
+    __asm__ volatile ("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+static inline void wrmsr(uint32_t msr, uint64_t val) {
+    __asm__ volatile ("wrmsr" : : "c"(msr), "a"((uint32_t)val), "d"((uint32_t)(val >> 32)));
+}
+
+// Включение режима Write-Combining в таблице PAT процессора
+void enable_write_combining(void) {
+    // Читаем текущий IA32_PAT MSR (0x277)
+    uint64_t pat = rdmsr(0x277);
+
+    // Запись PAT1 (биты 15:8) по умолчанию равна 0x04 (Write-Through).
+    // Перенастраиваем её на 0x01 (Write-Combining):
+    pat &= ~(0xFFULL << 8);
+    pat |=  (0x01ULL << 8);
+
+    wrmsr(0x277, pat);
+
+    // Сбрасываем кэш и конвейер процессора
+    __asm__ volatile ("wbinvd" ::: "memory");
+}

@@ -1,10 +1,13 @@
 #include "user_mode.h"
 #include "../fs/fs.h"
 #include "sched.h"
+#include "../drivers/mouse.h"
 #include "../memory/vmm.h"
 #include "../memory/pmm.h"
 #include "prog_loader.h"
 #include "tty.h"
+#include "../fs/vfs.h"
+#include "../fs/devfs.h"
 
 
 extern void     kputs(const char* str, uint32_t color);
@@ -148,65 +151,85 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
             return 0;
         }
 
-        case 7: { // get_mouse(mouse_state_t* out) -> int
+        case 7: { // sys_get_mouse(user_mouse_t* out) -> int
             if (!visible) return 0;
-            int cx = get_mouse_x();
-            int cy = get_mouse_y();
-            if (!g_mouse_last_init) {   // первый опрос: дельта 0, а не прыжок с (0,0)
-                g_mouse_last_x = cx;
-                g_mouse_last_y = cy;
-                g_mouse_last_init = 1;
-            }
+
+            update_mouse_state();
+
             if (arg1) {
-                mouse_state_t* user_ms = (mouse_state_t*)arg1;
-                user_ms->x = cx - g_mouse_last_x;
-                user_ms->y = cy - g_mouse_last_y;
-                user_ms->buttons = (uint8_t)get_mouse_btn();
-                g_mouse_last_x = cx;
-                g_mouse_last_y = cy;
+                typedef struct {
+                    int x;
+                    int y;
+                    uint8_t buttons;
+                    int last_dx;
+                    int last_dy;
+                } __attribute__((packed)) user_mouse_t;
+
+                extern int get_mouse_last_dx(void);
+                extern int get_mouse_last_dy(void);
+
+                user_mouse_t* ums = (user_mouse_t*)arg1;
+                ums->x = get_mouse_x();
+                ums->y = get_mouse_y();
+                ums->buttons = get_mouse_buttons_raw();
+                ums->last_dx = get_mouse_last_dx();
+                ums->last_dy = get_mouse_last_dy();
                 return 1;
             }
             return 0;
         }
+        case 8: { // sys_get_time(rtc_time_t* out) -> int
+            if (!arg1) return 0;
 
-        case 10: { // sys_open(filename)
-            if (!arg1) return (uint64_t)-1;
-            const char* filename = (const char*)arg1;
-            fs_lock();
-            int exists = fs_file_exists(filename);
-            fs_unlock();
-            if (exists) {
-                int idx = 0;
-                while (filename[idx] && idx < (int)sizeof(caller->open83) - 1) {
-                    caller->open83[idx] = filename[idx]; // Буфер для открытого файла в task_t
-                    idx++;
-                }
-                caller->open83[idx] = '\0';
-                return 1;
-            }
-            return (uint64_t)-1;
+            typedef struct {
+                uint8_t sec, min, hour;
+                uint8_t day, month, year;
+            } __attribute__((packed)) user_rtc_time_t;
+
+            extern uint8_t inb(uint16_t port);
+            extern void outb(uint16_t port, uint8_t val);
+
+            // Ждём готовности RTC (в Ring 0 inb/outb полностью легальны)
+            outb(0x70, 0x0A);
+            while (inb(0x71) & 0x80);
+
+            #define BCD2BIN(v) (((v) & 0x0F) + (((v) >> 4) * 10))
+
+            outb(0x70, 0x00); uint8_t s = BCD2BIN(inb(0x71));
+            outb(0x70, 0x02); uint8_t m = BCD2BIN(inb(0x71));
+            outb(0x70, 0x04); uint8_t h_raw = inb(0x71);
+            outb(0x70, 0x07); uint8_t d = BCD2BIN(inb(0x71));
+            outb(0x70, 0x08); uint8_t mo = BCD2BIN(inb(0x71));
+            outb(0x70, 0x09); uint8_t y = BCD2BIN(inb(0x71));
+
+            uint8_t is_pm = h_raw & 0x80;
+            uint8_t h = BCD2BIN(h_raw & 0x7F);
+            if (is_pm) h = (h + 12) % 24;
+
+            user_rtc_time_t* ut = (user_rtc_time_t*)arg1;
+            ut->sec = s;
+            ut->min = m;
+            ut->hour = h;
+            ut->day = d;
+            ut->month = mo;
+            ut->year = y;
+            return 1;
         }
 
-        case 11: // sys_read
-            if ((int)arg1 <= 0 || arg2 == 0 || arg3 == 0 || caller->open83[0] == '\0') return 0;
-            fs_lock();
-            uint64_t rd_ret = (uint64_t)fs_read_file(caller->open83, (void*)arg2, (uint32_t)arg3);
-            fs_unlock();
-            return rd_ret;
+        case 10: { // sys_open(const char* path, uint32_t flags)
+            return (uint64_t)(int64_t)vfs_sys_open((const char*)arg1, (uint32_t)arg2);
+        }
 
-        case 12: // sys_close
-            caller->open83[0] = '\0';
-            return 0;
+        case 11: { // sys_read(int fd, void* buf, size_t count)
+            return (uint64_t)vfs_sys_read((int)arg1, (void*)arg2, arg3);
+        }
 
-        case 13: { // sys_write(filename, buffer, size)
-            if (arg1 && arg2) {
-                const char* filename = (const char*)arg1;
-                fs_lock();
-                uint64_t wr_ret = (uint64_t)fs_write_file(filename, (const void*)arg2, (uint32_t)arg3);
-                fs_unlock();
-                return wr_ret;
-            }
-            return 0;
+        case 12: { // sys_close(int fd)
+            return (uint64_t)(int64_t)vfs_sys_close((int)arg1);
+        }
+
+        case 13: { // sys_write(int fd, const void* buf, size_t count)
+            return (uint64_t)vfs_sys_write((int)arg1, (const void*)arg2, arg3);
         }
         case 14: { // sys_brk(new_brk) -> uint64_t
             task_t* curr = sched_get_current_task();   // куча принадлежит задаче, а не «главному» процессу
@@ -244,7 +267,10 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
 
             curr->heap_end = new_brk;
             return curr->heap_end;
-        }   
+        }
+        case 15: { // sys_ioctl(int fd, uint64_t req, uint64_t arg)
+            return (uint64_t)(int64_t)vfs_sys_ioctl((int)arg1, arg2, arg3);
+        }
 
         case 20: // sys_set_palette
             if (arg1) {
@@ -307,7 +333,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
             return paused;
         }
         case 22: return g_tsc_per_ms;
-        // В диспетчере syscall ядра devOS:
+        // В диспетчере syscall ядра overOS:
         case 23: {
             // Вход: EBX = указатель на int dx, ECX = int dy, EDX = uint8_t buttons
             int* u_dx = (int*)arg1;       // вместо regs->rbx
@@ -333,25 +359,40 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
             task_t* child = (task_t*)pmm_alloc_page();
             if (!child) return (uint64_t)-1;
 
-            // 2. Копируем базовые поля из родителя и зануляем остальное
-            //    (как task_init_um в sched.c — та функция static, не экспортирована)
+            // 2. Копируем базовые поля процесса и сбрасываем состояние задач
             child->pid = sched_alloc_pid();
             child->state = TASK_READY;
             child->parent = parent;
             child->exit_code = 0;
             child->is_process = 1;        // ребёнок — такой же процесс Ring 3, как и родитель
             child->tty_id = parent->tty_id;
-            child->open83[0] = '\0';     // дескриптор не наследуется (fd-таблицы пока нет)
             child->heap_start = parent->heap_start;
             child->heap_end   = parent->heap_end;
             child->user_entry = 0;
             child->user_stack_top = 0;
 
+            // Очищаем таблицу дескрипторов перед аллокациями памяти
+            for (int fd = 0; fd < MAX_FD; fd++) {
+                child->fd_table[fd] = NULL;
+            }
+
+            // Копируем имя родительского процесса
             int i = 0;
-            while (parent->name[i] && i < 15) { child->name[i] = parent->name[i]; i++; }
+            while (parent->name[i] && i < 15) { 
+                child->name[i] = parent->name[i]; 
+                i++; 
+            }
             child->name[i] = '\0';
 
-            // 3. Клонируем виртуальное адресное пространство (память)
+            // Наследуем текущую рабочую директорию (CWD)
+            int c = 0;
+            while (parent->cwd[c] && c < (int)sizeof(child->cwd) - 1) {
+                child->cwd[c] = parent->cwd[c];
+                c++;
+            }
+            child->cwd[c] = '\0';
+
+            // 3. Клонируем виртуальное адресное пространство (память User Space)
             uint64_t* child_cr3 = vmm_clone_address_space((uint64_t*)parent->cr3);
             if (!child_cr3) {
                 pmm_free_page(child);
@@ -359,8 +400,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
             }
             child->cr3 = (uint64_t)child_cr3;
 
-            // 4. Свой ядерный стек (как у sched_spawn_process — 64 КБ, не одна страница:
-            //    в него ляжет полный кадр прерывания + будущие входы в ядро этого процесса)
+            // 4. Выделяем собственный ядерный стек процесса (64 КБ)
             void* kst_phys = pmm_alloc_pages(PROC_KSTACK_SIZE / 4096);
             if (!kst_phys) {
                 vmm_destroy_address_space(child_cr3);
@@ -372,16 +412,22 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
             child->kstack_top    = (uint64_t)(kstack + PROC_KSTACK_SIZE);
             child->mem_size = 4096 + PROC_KSTACK_SIZE;
 
-            // 5. Копируем на вершину стека ребёнка кадр прерывания родителя (160 байт:
-            //    r15..rax, rbp, RIP, CS, RFLAGS, RSP, SS), поэтому ребёнок возобновится
-            //    РОВНО в той же точке Ring 3, что и родитель — но с RAX = 0.
+            // 5. UNIX-WAY: Клонирование таблицы файловых дескрипторов
+            // Выполняется строго после всех аллокаций, чтобы при OOM не повреждать ref_count
+            for (int fd = 0; fd < MAX_FD; fd++) {
+                child->fd_table[fd] = parent->fd_table[fd];
+                if (child->fd_table[fd]) {
+                    child->fd_table[fd]->ref_count++;
+                }
+            }
+
+            // 6. Копируем на вершину стека ребёнка сохранённый кадр прерывания (160 байт).
+            //    Подменяем слот RAX на 0 (для ребёнка fork() возвращает 0)
             uint64_t* tf = (uint64_t*)(kstack + PROC_KSTACK_SIZE - 160);
             for (int k = 0; k < 20; k++) tf[k] = frame[k];
-            tf[13] = 0;   // слот rax ребёнка — fork() возвращает 0 только у ребёнка
+            tf[13] = 0;   // frame[13] = RAX дочернего процесса
 
-            // 6. Трамплин для switch_to (как в task_create_kernel/sched_spawn_process):
-            //    6 нулевых callee-saved + адрес fork_child_resume, который "вернувшись"
-            //    сразу попадёт на tf и раскрутит его через pop+iretq.
+            // 7. Трамплин для switch_to: 6 callee-saved регистров + fork_child_resume
             uint64_t* stk = tf;
             *(--stk) = (uint64_t)fork_child_resume;
             *(--stk) = 0; // rbp
@@ -392,9 +438,10 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
             *(--stk) = 0; // r15
             child->rsp = (uint64_t)stk;
 
-            child->in_user = 1;                 // следующие сисколлы ребёнка войдут через rsp0 = его стек
+            child->in_user = 1;
             child->saved_krsp = child->kstack_top;
 
+            // 8. Добавляем ребёнка в планировщик
             sched_enqueue_task(child);
 
             kputs("[fork] new child PID=", 0x55FFFF);
@@ -403,7 +450,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
             itoa((int)parent->pid, fbuf); kputs(fbuf, 0xFFFFFF); kputs("\n", 0x55FFFF);
             sched_dump_tasks();
 
-            // Родителю — PID ребёнка (у ребёнка в его копии кадра уже стоит RAX = 0)
+            // Родителю возвращаем PID ребёнка
             return child->pid;
         }
 
@@ -459,9 +506,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
             task_t* current = sched_get_current_task();
             if (!current) return (uint64_t)-1;
 
-            // 1. Разбор формата — как в prog_loader.c: нативный DPRG или плоский бинарник.
-            //    Старая версия этого не делала вовсе и грузила файл как плоский блоб,
-            //    игнорируя entry_point/bss_size из заголовка.
+            // 1. Разбор формата: нативный DPRG или плоский бинарник
             devos_prg_header_t* hdr = (devos_prg_header_t*)kernel_temp_buf;
             uint64_t load_base = PROG_LOAD_BASE;
             uint64_t entry_vaddr = PROG_LOAD_BASE;
@@ -479,9 +524,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
                 if (hdr->stack_size) stack_size = (uint32_t)hdr->stack_size;
             }
 
-            // 2. Новое адресное пространство создаём РАНЬШЕ, чем уничтожаем старое:
-            //    если здесь не хватит памяти, старое остаётся целым и можно спокойно
-            //    вернуть ошибку, не убивая вызывающий процесс (как и положено execve).
+            // 2. Новое адресное пространство создаём раньше уничтожения старого
             uint64_t* new_pml4 = vmm_create_address_space();
             if (!new_pml4) return (uint64_t)-1;
 
@@ -494,8 +537,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
                 vmm_map_page(new_pml4, v_addr, (uint64_t)p_addr, VMM_FLAG_USER | VMM_FLAG_WRITABLE);
             }
 
-            // 3. Свой стек — старой версии этого вообще не хватало (RSP указывал бы
-            //    в никуда после переключения CR3, первый же push дал бы page fault).
+            // 3. Выделяем стек под новый образ
             uint32_t num_stack_pages = (stack_size + 4095) / 4096;
             uint64_t stack_top = 0x00007FFFFFFF0000ULL;
             uint64_t stack_base = stack_top - (uint64_t)num_stack_pages * 4096;
@@ -505,7 +547,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
                                          (uint64_t)p_addr, VMM_FLAG_USER | VMM_FLAG_WRITABLE);
             }
 
-            // 4. Копируем тело и зануляем .bss — ровно как prog_loader.c
+            // 4. Копируем тело и зануляем .bss
             vmm_switch_directory(new_pml4);
 
             uint8_t* target = (uint8_t*)load_base;
@@ -513,25 +555,49 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
             for (uint64_t i = 0; i < payload_bytes; i++) target[i] = src[i];
             for (uint64_t i = payload_bytes; i < (uint64_t)num_image_pages * 4096; i++) target[i] = 0;
 
-            // 5. Старое пространство заменяем новым и только теперь освобождаем старое
+            // 5. Старое пространство заменяем новым и освобождаем его
             uint64_t old_cr3 = current->cr3;
             current->cr3 = (uint64_t)new_pml4;
             vmm_destroy_address_space((uint64_t*)old_cr3);
 
             current->heap_start = load_base + (uint64_t)num_image_pages * 4096;
             current->heap_end   = current->heap_start;
-            current->open83[0] = '\0';   // открытый файл из прошлого образа больше не существует
 
-            // 6. ГЛАВНОЕ: меняем RIP/RSP прямо в сохранённом кадре прерывания (тот же
-            //    frame[], что и в sys_fork). Старая версия этого не делала — обычный
-            //    возврат из сисколла иретнул бы на старый RIP/RSP, которых в новом
-            //    адресном пространстве больше нет как исполняемого кода и стека.
+            // 6. Обновляем имя процесса в task_t для sched_dump_tasks
+            const char* base_name = filename;
+            for (int p = 0; filename[p]; p++) {
+                if (filename[p] == '/') base_name = &filename[p + 1];
+            }
+            int ni = 0;
+            while (base_name[ni] && ni < 15) {
+                current->name[ni] = base_name[ni];
+                ni++;
+            }
+            current->name[ni] = '\0';
+
+            // 7. UNIX-WAY VFS: очистка дескрипторов старого образа
+            // Дескрипторы 0, 1, 2 (stdin, stdout, stderr) сохраняются для нового бинарника.
+            // Пользовательские файлы (FD >= 3), открытые старой программой, закрываются.
+            for (int fd = 3; fd < MAX_FD; fd++) {
+                if (current->fd_table[fd]) {
+                    vfs_release_fd(current->fd_table[fd]);
+                    current->fd_table[fd] = NULL;
+                }
+            }
+
+            // Гарантируем привязку стандартных потоков (0, 1, 2), если они были утеряны
+            vfs_node_t* tty_node = devfs_get_node("tty");
+            if (tty_node) {
+                if (!current->fd_table[0]) current->fd_table[0] = vfs_allocate_fd(tty_node, O_RDONLY);
+                if (!current->fd_table[1]) current->fd_table[1] = vfs_allocate_fd(tty_node, O_WRONLY);
+                if (!current->fd_table[2]) current->fd_table[2] = vfs_allocate_fd(tty_node, O_WRONLY);
+            }
+
+            // 8. Подменяем RIP/RSP в кадре прерывания для перехода в новую программу
             frame[15] = entry_vaddr;   // RIP
             frame[18] = stack_top;     // RSP
 
-            return 0;   // RAX тоже будет 0 на входе в новую программу — это ОК,
-                        // execve() в Unix в случае успеха вообще не возвращается в
-                        // вызвавший код, так что значение RAX здесь никто не прочитает
+            return 0;
         }
         default:
             return 0;
@@ -676,74 +742,28 @@ typedef struct {
 
 static tss64_t kernel_tss;
 
-extern void default_exception_handler(void);
 extern void timer_isr_asm(void); // Обработчик таймера PIT/IRQ0 (interrupts.asm) — нужен ниже для idt64[32]
 
-static void print_hex64(uint64_t val) {
-    const char hex[] = "0123456789ABCDEF";
-    char buf[19];
-    buf[0] = '0';
-    buf[1] = 'x';
-    for (int i = 15; i >= 0; i--) {
-        buf[2 + (15 - i)] = hex[(val >> (i * 4)) & 0xF];
-    }
-    buf[18] = '\0';
-    kputs(buf, 0x55FFFF);
-}
+// Настоящие обработчики исключений (interrupts.asm): каждый кладёт номер своего
+// вектора на стек перед общим кадром и зовёт default_exception_handler (bsod.c) —
+// именно оттуда bsod.c берёт exc_no/fault_eip/fault_esp (frame[15]/[17]/[20]).
+// Раньше здесь на все 32 вектора стоял один default_isr_stub, который номер
+// вектора вообще не знал и в Ring 0 просто делал hlt без всякой диагностики.
+extern void isr_0(void);  extern void isr_1(void);  extern void isr_2(void);  extern void isr_3(void);
+extern void isr_4(void);  extern void isr_5(void);  extern void isr_6(void);  extern void isr_7(void);
+extern void isr_8(void);  extern void isr_9(void);  extern void isr_10(void); extern void isr_11(void);
+extern void isr_12(void); extern void isr_13(void); extern void isr_14(void); extern void isr_15(void);
+extern void isr_16(void); extern void isr_17(void); extern void isr_18(void); extern void isr_19(void);
+extern void isr_20(void); extern void isr_21(void); extern void isr_22(void); extern void isr_23(void);
+extern void isr_24(void); extern void isr_25(void); extern void isr_26(void); extern void isr_27(void);
+extern void isr_28(void); extern void isr_29(void); extern void isr_30(void); extern void isr_31(void);
 
-// Честный перехватчик сбоя процесса: печатает реальный RIP и безопасно завершает процесс
-void handle_user_crash_c(uint64_t fault_rip, uint64_t fault_rsp, uint64_t err_code) {
-    (void)err_code;
-    kputs("\n\n[devOS Guard] Crash caught in User Mode (Ring 3)!\n", 0x00FF5555);
-    kputs(" * Fault RIP: ", 0x00AAAAAA);
-    print_hex64(fault_rip);
-    kputs("  Fault RSP: ", 0x00AAAAAA);
-    print_hex64(fault_rsp);
-    kputs("\n * Action:    Process killed. Safely returning to kernel shell.\n\n", 0x0055FF55);
-    flush_buffer();
-
-    // Процесс с собственным стеком: завершаем как exit(-1), родитель получит код из wait
-    task_t* t = sched_get_current_task();
-    if (t && t->is_process) sched_exit_current(-1);   // не возвращается
-}
-
-__attribute__((naked)) static void default_isr_stub(void) {
-    __asm__ __volatile__(
-        "cli\n\t"
-
-        // Если сбой произошел в Ring 3 (User Mode):
-        "cmpq $1, g_user_mode_active(%rip)\n\t"
-        "jne .L_kernel_fatal\n\t"
-
-        // Стек x86_64 при входе из Ring 3:
-        // [rsp+0]  = Error Code (или RIP)
-        // [rsp+8]  = RIP
-        // [rsp+32] = RSP
-        "movq (%rsp), %rdx\n\t"       // arg3: err_code
-        "movq 8(%rsp), %rdi\n\t"      // arg1: fault_rip
-        "movq 32(%rsp), %rsi\n\t"     // arg2: fault_rsp
-        "call handle_user_crash_c\n\t"
-
-        // БЕЗОПАСНЫЙ ВЫХОД В ШЕЛЛ (как при Syscall 0 exit):
-        "movq saved_kernel_rsp(%rip), %rsp\n\t"
-
-        "pop %r15\n\t"
-        "pop %r14\n\t"
-        "pop %r13\n\t"
-        "pop %r12\n\t"
-        "pop %rdi\n\t"
-        "pop %rsi\n\t"
-        "pop %rbx\n\t"
-        "pop %rbp\n\t"
-
-        "movq $0, g_user_mode_active(%rip)\n\t"
-        "movq $-1, %rax\n\t"
-        "ret\n\t"
-
-    ".L_kernel_fatal:\n\t"
-        "hlt\n\t"
-    );
-}
+static void (*const exc_isr_table[32])(void) = {
+    isr_0,  isr_1,  isr_2,  isr_3,  isr_4,  isr_5,  isr_6,  isr_7,
+    isr_8,  isr_9,  isr_10, isr_11, isr_12, isr_13, isr_14, isr_15,
+    isr_16, isr_17, isr_18, isr_19, isr_20, isr_21, isr_22, isr_23,
+    isr_24, isr_25, isr_26, isr_27, isr_28, isr_29, isr_30, isr_31,
+};
 
 extern uint64_t gdt64_tss[];
 
@@ -807,9 +827,9 @@ void init_user_mode(void) {
         idt64[i].reserved    = 0;
     }
 
-    // 1. Исключения процессора (векторы 0..31, DPL 0)
-    uint64_t exc_handler = (uint64_t)default_isr_stub;
+    // 1. Исключения процессора (векторы 0..31, DPL 0) — настоящий isr_N на каждый
     for (int i = 0; i < 32; i++) {
+        uint64_t exc_handler = (uint64_t)exc_isr_table[i];
         idt64[i].base_low    = exc_handler & 0xFFFF;
         idt64[i].selector    = 0x08;
         idt64[i].ist         = 0;

@@ -7,6 +7,7 @@
 #define VMM_FLAG_PRESENT  (1 << 0)
 #define VMM_FLAG_WRITABLE (1 << 1)
 #define VMM_FLAG_USER     (1 << 2)
+#define VMM_FLAG_WC (1 << 3)
 
 #define PHYS_TO_VIRT(p) ((void*)((uint64_t)(p) + 0xFFFFFFFF80000000ULL))
 
@@ -25,5 +26,8 @@ void vmm_switch_directory(uint64_t* pml4);
 void vmm_destroy_address_space(uint64_t* pml4);
 
 uint64_t* vmm_clone_address_space(uint64_t* pml4);
+
+// Функция настройки регистра IA32_PAT
+void enable_write_combining(void);
 
 #endif

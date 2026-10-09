@@ -57,6 +57,11 @@ QUAKE_DIR   := $(SRC_DIR)/files/progs/Quake
 QUAKE_PRG   := $(QUAKE_DIR)/QUAKE.PRG
 QUAKE_PAK   := $(QUAKE_DIR)/pak0.pak
 
+# Пути к DESKTOP
+DESKTOP_DIR := $(SRC_DIR)/files/progs/Desktop
+DESKTOP_PRG := $(DESKTOP_DIR)/desktop.prg
+WITH_DESKTOP ?= 1
+
 # ==============================================================================
 # ИСХОДНЫЕ ФАЙЛЫ ЯДРА
 # ==============================================================================
@@ -70,17 +75,19 @@ C_SRC   := $(SRC_DIR)/kernel/kernel.c \
            $(SRC_DIR)/kernel/prog_loader.c \
            $(SRC_DIR)/kernel/bsod.c \
            $(SRC_DIR)/kernel/keyboard.c \
-           $(SRC_DIR)/kernel/mouse.c \
            $(SRC_DIR)/memory/pmm.c \
            $(SRC_DIR)/memory/vmm.c \
            $(SRC_DIR)/font/fontdata_ru_8x16.c \
            $(SRC_DIR)/drivers/acpi.c \
            $(SRC_DIR)/drivers/display.c \
            $(SRC_DIR)/drivers/pci.c \
+           $(SRC_DIR)/drivers/mouse.c \
            $(SRC_DIR)/drivers/usb/ehci.c \
            $(SRC_DIR)/drivers/usb/ehci-msc.c \
            $(SRC_DIR)/fs/fat16.c \
            $(SRC_DIR)/fs/fat32.c \
+		   $(SRC_DIR)/fs/vfs.c \
+		   $(SRC_DIR)/fs/devfs.c \
            $(SRC_DIR)/fs/fs.c
 
 OBJS    := $(BUILD_DIR)/entry_kernel.o \
@@ -238,10 +245,17 @@ $(QUAKE_PRG):
 		$(MAKE) -C $(QUAKE_DIR) clean && $(MAKE) -C $(QUAKE_DIR); \
 	fi
 
+# Автосборка desktop.prg через clean + make
+$(DESKTOP_PRG):
+	@if [ -d "$(DESKTOP_DIR)" ]; then \
+		echo ">>> Сборка Desktop Environment..."; \
+		$(MAKE) -C $(DESKTOP_DIR); \
+	fi
+
 # -----------------------------------------------------------------------------
 # Создание раздела FAT32 и упаковка софта
 # -----------------------------------------------------------------------------
-$(PART_IMG): $(BUILD_DIR)/kernel.bin $(BUILD_DIR)/boot_stage1.bin $(MODULE_BINS) $(PROG_BINS) $(DOOM_PRG) $(QUAKE_PRG)
+$(PART_IMG): $(BUILD_DIR)/kernel.bin $(BUILD_DIR)/boot_stage1.bin $(MODULE_BINS) $(PROG_BINS) $(DOOM_PRG) $(QUAKE_PRG) $(DESKTOP_PRG)
 	@mkdir -p $(BUILD_DIR)
 	@echo ">>> Создаем раздел FAT32 на $(PART_SIZE_MB) МБ..."
 	@rm -f $@
@@ -280,6 +294,9 @@ $(PART_IMG): $(BUILD_DIR)/kernel.bin $(BUILD_DIR)/boot_stage1.bin $(MODULE_BINS)
 	            mcopy -i $@ $(QUAKE_PAK) ::programs/Quake/pak0.pak; \
 	        fi; \
 	    fi; \
+		if [ "$(WITH_DESKTOP)" = "1" ] && [ -f "$(DESKTOP_PRG)" ]; then \
+	        mcopy -i $@ $(DESKTOP_PRG) ::programs/desktop.prg; \
+	    fi; \
 	fi
 
 # ------------------------------------------------------------------------------
@@ -310,32 +327,32 @@ $(DISK_IMG): $(BUILD_DIR)/boot_stage1.bin $(BUILD_DIR)/boot_stage2.bin $(BUILD_D
 # Запуск в QEMU x86_64
 # ------------------------------------------------------------------------------
 run: all
-	qemu-system-x86_64 \
-	    -m 1G \
-	    -cpu max \
-	    -serial stdio \
-	    -d int,cpu_reset,guest_errors \
-	    -D qemu_error.log \
-	    -no-reboot \
-	    -no-shutdown \
-	    -device usb-ehci,id=ehci \
-	    -drive if=none,id=usb_drive,file=$(DISK_IMG),format=raw \
-	    -device usb-storage,bus=ehci.0,drive=usb_drive \
-        -vga std -global VGA.vgamem_mb=4
+	GDK_BACKEND=x11 qemu-system-x86_64 \
+		-m 1G \
+		-cpu max \
+		-serial stdio \
+		-d int,cpu_reset,guest_errors \
+		-D qemu_error.log \
+		-no-reboot \
+		-no-shutdown \
+		-device usb-ehci,id=ehci \
+		-drive if=none,id=usb_drive,file=$(DISK_IMG),format=raw \
+		-device usb-storage,bus=ehci.0,drive=usb_drive \
+		-vga std -global VGA.vgamem_mb=16
 
 run-usb: all
-	qemu-system-x86_64 \
-	    -m 1G \
-	    -cpu max \
-	    -serial stdio \
-	    -d int,cpu_reset,guest_errors \
-	    -D qemu_error.log \
-	    -no-reboot \
-	    -no-shutdown \
-	    -device usb-ehci,id=ehci \
-	    -drive if=none,id=usb_drive,file=/dev/sdc,format=raw \
-	    -device usb-storage,bus=ehci.0,drive=usb_drive \
-        -vga std -global VGA.vgamem_mb=4
+	GDK_BACKEND=x11 qemu-system-x86_64 \
+		-m 1G \
+		-cpu max \
+		-serial stdio \
+		-d int,cpu_reset,guest_errors \
+		-D qemu_error.log \
+		-no-reboot \
+		-no-shutdown \
+		-device usb-ehci,id=ehci \
+		-drive if=none,id=usb_drive,file=/dev/sdc,format=raw \
+		-device usb-storage,bus=ehci.0,drive=usb_drive \
+		-vga std -global VGA.vgamem_mb=16
 
 # ------------------------------------------------------------------------------
 # Быстрое обновление модулей и программ на уже размеченной флешке
@@ -379,5 +396,6 @@ _write_disk:
 
 clean:
 	rm -rf $(BUILD_DIR)
+	@if [ -d "$(DESKTOP_DIR)" ]; then $(MAKE) -C $(DESKTOP_DIR) clean; fi
 
 .PHONY: all modules progs run install install-modules clean run-usb test-menu _write_disk

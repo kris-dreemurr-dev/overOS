@@ -1,7 +1,6 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "../font/font.h"
-#include "../drivers/display.h"
 #include "../drivers/pci.h"
 #include "../fs/fs.h"
 #include "../memory/pmm.h"
@@ -302,6 +301,8 @@ void flush_buffer(void) {
                 :
                 : "memory"
             );
+            // Сбрасываем буферы записи в PCIe
+            __asm__ volatile ("sfence" ::: "memory");
             return;
         }
 
@@ -317,6 +318,7 @@ void flush_buffer(void) {
                 : "memory"
             );
         }
+        __asm__ volatile ("sfence" ::: "memory");
     } else {
         int virtual_y = total_scrolled_px - scroll_offset_px;
         for (int y = 0; y < screen_height; y++) {
@@ -336,6 +338,7 @@ void flush_buffer(void) {
                 dst[x] = color;
             }
         }
+        __asm__ volatile ("sfence" ::: "memory");
     }
 }
 
@@ -1249,6 +1252,7 @@ void kernel_main(void) {
 
     pmm_init(512 * 1024 * 1024); 
     vmm_init();
+    enable_write_combining();
     pmm_mark_region_free(0x000000, 512 * 1024 * 1024);
 
     // Защищаем первые 32 МБ физической памяти:
@@ -1263,7 +1267,10 @@ void kernel_main(void) {
     size_t fb_size = screen_pitch * screen_height;
 
     for (size_t offset = 0; offset < fb_size; offset += 0x1000) {
-        vmm_map_page(vmm_get_kernel_pml4_phys(), lfb_phys + offset, lfb_phys + offset, VMM_FLAG_PRESENT | VMM_FLAG_WRITABLE);
+        vmm_map_page(vmm_get_kernel_pml4_phys(), 
+                     lfb_phys + offset, 
+                     lfb_phys + offset, 
+                     VMM_FLAG_PRESENT | VMM_FLAG_WRITABLE | VMM_FLAG_WC);
     }
 
     lfb = (uint32_t*)lfb_phys;
@@ -1286,7 +1293,6 @@ void kernel_main(void) {
     //init_crash_guard_idt();
 
     init_mc_monitor();
-    init_ps2_mouse();
     clear_screen(0x000000);
 
     kernel_system_bootstrap();
@@ -1300,6 +1306,7 @@ void kernel_main(void) {
 
     tty_init_core();
     sched_init();
+    init_ps2_mouse();
 
     task_create_kernel(tty1_task_entry, "tty1_shell")->tty_id = 0;
     kbd_layout = 0;

@@ -2,6 +2,7 @@
 #include "user_mode.h"
 #include <stdint.h>
 #include "config.h"
+#include "sched.h"
 
 volatile jit_crash_guard_t g_jit_guard = { 0, 0, 0 };
 
@@ -238,7 +239,17 @@ void handle_cpu_exception(int exc_no, uint64_t fault_eip, uint64_t fault_esp) {
         kputs("  * Action:    Process terminated. Safely returning to kernel shell.\n\n", 0x55FF55);
         flush_buffer();
 
-        return_from_user_mode(-1);
+        // return_from_user_mode() - это старый путь единого общего стека (до того,
+        // как появились настоящие процессы со своим CR3/стеком через fork/spawn);
+        // сейчас это пустая заглушка и сюда ничего не возвращало бы вообще.
+        // Настоящее восстановление - ровно то же, что sys_exit/kill делают для
+        // живого процесса: sched_exit_current не возвращается, родитель заберёт
+        // код через wait()/waitpid().
+        task_t* t = sched_get_current_task();
+        if (t && t->is_process) {
+            sched_exit_current(-1);
+        }
+        return_from_user_mode(-1);   // страховка: недостижимо для настоящих процессов
         return;
     }
 

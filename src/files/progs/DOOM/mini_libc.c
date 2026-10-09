@@ -4,17 +4,28 @@
 
 extern void devos_set_palette(const uint8_t* raw_rgb);
 
+// 1. Предварительное объявление strlen (полная реализация лежит ниже)
+size_t strlen(const char* s);
+
 // -----------------------------------------------------------------------------
-// ВЫВОД НА ЭКРАН DEVOS (СИСТЕМНЫЙ ВЫЗОВ 1)
+// ВЫВОД НА ЭКРАН DEVOS ЧЕРЕЗ VFS (FD 1 -> /dev/tty)
 // -----------------------------------------------------------------------------
-void sys_print(const char* str) {
-    if (!str) return;
+
+static inline int sys_write(int fd, const void* buf, uint32_t sz) {
+    int ret;
     __asm__ volatile (
         "int $0x80"
-        :
-        : "a"(1), "b"(str), "c"(0x00FFFFFF)
+        : "=a"(ret)
+        : "a"(13), "b"(fd), "c"(buf), "d"(sz)
         : "memory"
     );
+    return ret;
+}
+
+
+void sys_print(const char* str) {
+    if (!str) return;
+    sys_write(1, str, (uint32_t)strlen(str));
 }
 
 void* stderr = (void*)2;
@@ -75,28 +86,84 @@ int vfprintf(void* stream, const char* fmt, va_list ap) {
 // -----------------------------------------------------------------------------
 static uintptr_t g_heap_top = 0x01600000;
 
+// Побайтовые memcpy/memset/memmove были реальным узким местом для движков вроде
+// Doom/Quake (софтверный рендерер гоняет их по своим внутренним буферам каждый
+// кадр, независимо от разрешения экрана). Ниже — та же логика блоками по 8 байт
+// (uint64_t) с байтовым хвостом, в духе rep movsq, который уже используется в
+// flush_buffer(). Быстрый путь включается только когда dest/src одинаково
+// выровнены по 8 байт (обычный случай для буферов кадра/кучи) — иначе честно
+// откатываемся на побайтовый цикл, который всегда корректен.
+
 void* memset(void* dest, int c, size_t n) {
     uint8_t* d = (uint8_t*)dest;
-    while (n--) *d++ = (uint8_t)c;
+    uint8_t byte = (uint8_t)c;
+
+    while (n && ((uintptr_t)d & 7)) { *d++ = byte; n--; }   // довыравниваем начало
+
+    if (n >= 8) {
+        uint64_t pattern = (uint64_t)byte * 0x0101010101010101ULL;
+        uint64_t* d64 = (uint64_t*)d;
+        size_t words = n / 8;
+        for (size_t i = 0; i < words; i++) d64[i] = pattern;
+        d += words * 8;
+        n -= words * 8;
+    }
+
+    while (n--) *d++ = byte;   // хвост < 8 байт
     return dest;
 }
 
 void* memcpy(void* dest, const void* src, size_t n) {
     uint8_t* d = (uint8_t*)dest;
     const uint8_t* s = (const uint8_t*)src;
-    while (n--) *d++ = *s++;
+
+    if ((((uintptr_t)d ^ (uintptr_t)s) & 7) == 0) {   // одинаковое выравнивание по 8
+        while (n && ((uintptr_t)d & 7)) { *d++ = *s++; n--; }
+
+        size_t words = n / 8;
+        uint64_t* d64 = (uint64_t*)d;
+        const uint64_t* s64 = (const uint64_t*)s;
+        for (size_t i = 0; i < words; i++) d64[i] = s64[i];
+        d += words * 8;
+        s += words * 8;
+        n -= words * 8;
+    }
+
+    while (n--) *d++ = *s++;   // хвост, либо весь n при разном выравнивании
     return dest;
 }
 
 void* memmove(void* dest, const void* src, size_t n) {
     uint8_t* d = (uint8_t*)dest;
     const uint8_t* s = (const uint8_t*)src;
+    if (d == s || n == 0) return dest;
+
     if (d < s) {
+        if ((((uintptr_t)d ^ (uintptr_t)s) & 7) == 0) {
+            while (n && ((uintptr_t)d & 7)) { *d++ = *s++; n--; }
+            size_t words = n / 8;
+            uint64_t* d64 = (uint64_t*)d;
+            const uint64_t* s64 = (const uint64_t*)s;
+            for (size_t i = 0; i < words; i++) d64[i] = s64[i];
+            d += words * 8;
+            s += words * 8;
+            n -= words * 8;
+        }
         while (n--) *d++ = *s++;
     } else {
         d += n;
         s += n;
-        while (n--) *--d = *--s;
+        if ((((uintptr_t)d ^ (uintptr_t)s) & 7) == 0) {
+            while (n && ((uintptr_t)d & 7)) { *--d = *--s; n--; }
+            size_t words = n / 8;
+            for (size_t i = 0; i < words; i++) {
+                d -= 8;
+                s -= 8;
+                *(uint64_t*)d = *(uint64_t*)s;
+            }
+            n -= words * 8;
+        }
+        while (n--) { *--d = *--s; }
     }
     return dest;
 }
@@ -554,23 +621,24 @@ int remove(const char* pathname) { (void)pathname; return 0; }
 int mkdir(const char* pathname, unsigned int mode) { (void)pathname; (void)mode; return 0; }
 
 void exit(int status) {
-    // Прямой вывод без буферизации
-    //sys_print("\n\n>>> [MINI_LIBC] exit() CALLED WITH STATUS: ");
-    char numbuf[16];
-    // Простой вывод hex-кода
-    for (int i = 7; i >= 0; i--) {
-        int nibble = (status >> (i * 4)) & 0xF;
-        numbuf[7 - i] = (nibble < 10) ? ('0' + nibble) : ('A' + nibble - 10);
+    if (status != 0) {
+        sys_print("\n>>> [MINI_LIBC] exit() with code: ");
+        char buf[16];
+        int s = status, p = 0;
+        if (s < 0) { sys_print("-"); s = -s; }
+        if (s == 0) buf[p++] = '0';
+        char tmp[16]; int tp = 0;
+        while (s > 0) { tmp[tp++] = '0' + (s % 10); s /= 10; }
+        while (tp > 0) buf[p++] = tmp[--tp];
+        buf[p] = '\0';
+        sys_print(buf);
+        sys_print("\n");
     }
-    numbuf[8] = '\n';
-    numbuf[9] = 0;
-    //sys_print(numbuf);
 
-    // Если это указатель на строку ошибки — выводим её
     if (status >= 0x01000000 && status < 0x02000000) {
-        sys_print(">>> [STRING TEXT]: ");
-        sys_print((const char*)status);
-        sys_print("\n\n");
+        sys_print(">>> [ERROR TEXT]: ");
+        sys_print((const char*)(uintptr_t)status);
+        sys_print("\n");
     }
 
     __asm__ volatile ("int $0x80" : : "a"(0), "b"(status) : "memory");
@@ -584,26 +652,35 @@ void abort(void) { exit(1); }
 // -----------------------------------------------------------------------------
 #define WAD_RAM_ADDR 0x05000000
 
-static inline int sys_open(const char* fn) {
+static inline int sys_open(const char* fn, int flags) {
     int ret;
-    __asm__ volatile ("int $0x80" : "=a"(ret) : "0"(10), "b"(fn) : "memory");
+    __asm__ volatile (
+        "int $0x80"
+        : "=a"(ret)
+        : "a"(10), "b"(fn), "c"(flags)
+        : "memory"
+    );
     return ret;
 }
 
 static inline int sys_read(int fd, void* buf, int sz) {
     int ret;
-    __asm__ volatile ("int $0x80" : "=a"(ret) : "0"(11), "b"(fd), "c"(buf), "d"(sz) : "memory");
+    __asm__ volatile (
+        "int $0x80"
+        : "=a"(ret)
+        : "a"(11), "b"(fd), "c"(buf), "d"(sz)
+        : "memory"
+    );
     return ret;
 }
 
 static inline void sys_close(int fd) {
-    __asm__ volatile ("int $0x80" : : "a"(12), "b"(fd) : "memory");
-}
-
-static inline int sys_write(const char* fn, const void* buf, uint32_t sz) {
-    int ret;
-    __asm__ volatile ("int $0x80" : "=a"(ret) : "0"(13), "b"(fn), "c"(buf), "d"(sz) : "memory");
-    return ret;
+    __asm__ volatile (
+        "int $0x80"
+        :
+        : "a"(12), "b"(fd)
+        : "memory"
+    );
 }
 
 #define MAX_FILES 16
@@ -639,14 +716,16 @@ void* fopen(const char* filename, const char* mode) {
     if (!f) return NULL;
     memset(f, 0, sizeof(devos_file_t));
 
-    // WAD файл читаем в динамически выделенную память, а не по фиксированному адресу!
-    
-    if (strcasecmp(base_name, "doom1.wad") == 0 || strcasecmp(base_name, "doom.wad") == 0) {
-        int fd = sys_open("DOOM1.WAD");
-        if (fd < 0) fd = sys_open("doom1.wad");
+    // Проверяем расширение без учета регистра (.wad / .WAD / .pak / .PAK)
+    const char* ext = strrchr(base_name, '.');
+    int is_archive = (ext && (strcasecmp(ext, ".wad") == 0 || strcasecmp(ext, ".pak") == 0));
+
+    if (is_archive) {
+        int fd = sys_open(base_name, 0); // 0 = O_RDONLY
         if (fd < 0) return NULL;
 
-        f->capacity = 4300000;
+        // Выделяем память под полный образ архива
+        f->capacity = 25 * 1024 * 1024; 
         f->buffer = (uint8_t*)malloc(f->capacity);
         if (!f->buffer) {
             sys_close(fd);
@@ -665,7 +744,7 @@ void* fopen(const char* filename, const char* mode) {
     int is_write = (mode[0] == 'w' || mode[0] == 'a' || strchr(mode, '+'));
 
     if (is_write) {
-        f->capacity = 512 * 1024; // Сейв в Doom может весить до 200-300 КБ
+        f->capacity = 512 * 1024;
         f->buffer = malloc(f->capacity);
         if (!f->buffer) return NULL;
         f->is_write = 1;
@@ -673,11 +752,8 @@ void* fopen(const char* filename, const char* mode) {
         f->is_open = 1;
         return f;
     } else {
-        // Режим чтения: если файла нет на диске — ОБЯЗАТЕЛЬНО возвращаем NULL!
-        int fd = sys_open(base_name);
-        if (fd < 0) {
-            return NULL;
-        }
+        int fd = sys_open(base_name, 0); // 0 = O_RDONLY
+        if (fd < 0) return NULL;
 
         f->capacity = 512 * 1024;
         f->buffer = malloc(f->capacity);
@@ -732,8 +808,13 @@ int fclose(void* stream) {
     devos_file_t* f = (devos_file_t*)stream;
     if (!f->is_open) return 0;
 
-    if (f->is_write && !f->is_wad) {
-        sys_write(f->name, f->buffer, f->size);
+    // Запись файла через честный VFS open -> write -> close
+    if (f->is_write && !f->is_wad && f->size > 0) {
+        int fd = sys_open(f->name, 1 | 0x40); // 1 = O_WRONLY, 0x40 = O_CREAT
+        if (fd >= 0) {
+            sys_write(fd, f->buffer, f->size);
+            sys_close(fd);
+        }
     }
 
     if (f->buffer) free(f->buffer);
@@ -771,18 +852,26 @@ int rename(const char* oldpath, const char* newpath) {
     const char* base_old = get_base_name(oldpath);
     const char* base_new = get_base_name(newpath);
 
-    int fd = sys_open(base_old);
+    int fd = sys_open(base_old, 0); // 0 = O_RDONLY
     if (fd < 0) return -1;
 
     uint8_t* temp_buf = malloc(512 * 1024);
-    if (!temp_buf) { sys_close(fd); return -1; }
+    if (!temp_buf) { 
+        sys_close(fd); 
+        return -1; 
+    }
 
     int sz = sys_read(fd, temp_buf, 512 * 1024);
     sys_close(fd);
 
     if (sz > 0) {
-        sys_write(base_new, temp_buf, sz);
+        int out_fd = sys_open(base_new, 1 | 0x40); // 1 = O_WRONLY, 0x40 = O_CREAT
+        if (out_fd >= 0) {
+            sys_write(out_fd, temp_buf, sz);
+            sys_close(out_fd);
+        }
     }
+
     free(temp_buf);
     return 0;
 }
@@ -831,4 +920,268 @@ void wad_reset(void) {
         if (g_files[i].buffer) free(g_files[i].buffer);
         memset(&g_files[i], 0, sizeof(devos_file_t));
     }
+}
+
+// -----------------------------------------------------------------------------
+// АЛГОРИТМЫ (QSORT)
+// -----------------------------------------------------------------------------
+static void swap_bytes(char *a, char *b, size_t size) {
+    do {
+        char tmp = *a;
+        *a++ = *b;
+        *b++ = tmp;
+    } while (--size > 0);
+}
+
+void qsort(void *base, size_t num, size_t size, int (*cmp)(const void *, const void *)) {
+    char *pi, *pj, *pn;
+    char *a = (char *)base;
+
+    if (num <= 1) return;
+
+    pi = a + (num / 2) * size;
+    swap_bytes(a, pi, size);
+    pi = a;
+    pj = a + size;
+    pn = a + num * size;
+
+    while (pj < pn) {
+        if (cmp(pj, a) < 0) {
+            pi += size;
+            swap_bytes(pi, pj, size);
+        }
+        pj += size;
+    }
+    swap_bytes(a, pi, size);
+
+    size_t left_num = (pi - a) / size;
+    size_t right_num = num - left_num - 1;
+
+    if (left_num > 1) qsort(a, left_num, size, cmp);
+    if (right_num > 1) qsort(pi + size, right_num, size, cmp);
+}
+
+// -----------------------------------------------------------------------------
+// РАНДОМИЗАЦИЯ
+// -----------------------------------------------------------------------------
+static unsigned long int next = 1;
+
+int rand(void) {
+    next = next * 1103515245 + 12345;
+    return (unsigned int)(next / 65536) % 32768;
+}
+
+void srand(unsigned int seed) {
+    next = seed;
+}
+
+// -----------------------------------------------------------------------------
+// УПРАВЛЕНИЕ КОНТЕКСТОМ (SETJMP / LONGJMP x86_64)
+// -----------------------------------------------------------------------------
+__attribute__((naked)) int setjmp(void* env) {
+    __asm__ volatile (
+        "mov %%rbx, 0x00(%%rdi)\n"
+        "mov %%rbp, 0x08(%%rdi)\n"
+        "mov %%r12, 0x10(%%rdi)\n"
+        "mov %%r13, 0x18(%%rdi)\n"
+        "mov %%r14, 0x20(%%rdi)\n"
+        "mov %%r15, 0x28(%%rdi)\n"
+        "lea 8(%%rsp), %%rdx\n" // Сохраняем RSP до вызова функции
+        "mov %%rdx, 0x30(%%rdi)\n"
+        "mov (%%rsp), %%rdx\n"  // Сохраняем адрес возврата (RIP)
+        "mov %%rdx, 0x38(%%rdi)\n"
+        "xor %%eax, %%eax\n"    // Возвращаем 0 при первом вызове
+        "ret\n"
+        ::: "memory"
+    );
+}
+
+__attribute__((naked)) void longjmp(void* env, int val) {
+    __asm__ volatile (
+        "mov %%esi, %%eax\n"
+        "test %%eax, %%eax\n"
+        "jnz 1f\n"
+        "inc %%eax\n"           // longjmp не может вернуть 0
+        "1:\n"
+        "mov 0x00(%%rdi), %%rbx\n"
+        "mov 0x08(%%rdi), %%rbp\n"
+        "mov 0x10(%%rdi), %%r12\n"
+        "mov 0x18(%%rdi), %%r13\n"
+        "mov 0x20(%%rdi), %%r14\n"
+        "mov 0x28(%%rdi), %%r15\n"
+        "mov 0x30(%%rdi), %%rsp\n"
+        "mov 0x38(%%rdi), %%rdx\n"
+        "jmp *%%rdx\n"          // Прыжок по сохраненному RIP
+        ::: "memory"
+    );
+}
+
+typedef long time_t;
+time_t time(time_t *tloc) {
+    // Временно возвращаем тики таймера, чтобы движок не застрял в одном сиде
+    uint32_t lo, hi;
+    __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
+    time_t current = lo; 
+    if (tloc) *tloc = current;
+    return current;
+}
+
+// -----------------------------------------------------------------------------
+// МАТЕМАТИКА FPU (ДЛЯ QUAKE)
+// -----------------------------------------------------------------------------
+double sin(double x) {
+    double res;
+    __asm__ volatile ("fsin" : "=t" (res) : "0" (x));
+    return res;
+}
+
+double cos(double x) {
+    double res;
+    __asm__ volatile ("fcos" : "=t" (res) : "0" (x));
+    return res;
+}
+
+double sqrt(double x) {
+    double res;
+    __asm__ volatile ("fsqrt" : "=t" (res) : "0" (x));
+    return res;
+}
+
+double atan2(double y, double x) {
+    double res;
+    __asm__ volatile ("fpatan" : "=t" (res) : "0" (x), "u" (y) : "st(1)");
+    return res;
+}
+
+double atan(double x) {
+    return atan2(x, 1.0);
+}
+
+double floor(double x) {
+    int64_t i = (int64_t)x;
+    return (x < 0 && x != (double)i) ? (double)(i - 1) : (double)i;
+}
+
+double ceil(double x) {
+    int64_t i = (int64_t)x;
+    return (x > 0 && x != (double)i) ? (double)(i + 1) : (double)i;
+}
+
+// -----------------------------------------------------------------------------
+// ВВОД/ВЫВОД И ФОРМАТИРОВАНИЕ (ДЛЯ QUAKE)
+// -----------------------------------------------------------------------------
+int vsprintf(char *str, const char *format, va_list ap) {
+    return vsnprintf(str, 32768, format, ap);
+}
+
+int fgetc(void *stream) {
+    if (!stream) return -1;
+    devos_file_t* f = (devos_file_t*)stream;
+    if (f->pos >= f->size) return -1;
+    return (int)f->buffer[f->pos++];
+}
+
+int getc(void *stream) {
+    return fgetc(stream);
+}
+
+int __isoc99_fscanf(void *stream, const char *format, ...) {
+    if (!stream) return -1;
+    devos_file_t* f = (devos_file_t*)stream;
+    va_list ap;
+    va_start(ap, format);
+    int count = 0;
+
+    while (*format && f->pos < f->size) {
+        if (*format == '%') {
+            format++;
+            if (*format == 'i' || *format == 'd') {
+                int* out = va_arg(ap, int*);
+                while (f->pos < f->size && (f->buffer[f->pos] == ' ' || f->buffer[f->pos] == '\t' || 
+                       f->buffer[f->pos] == '\n' || f->buffer[f->pos] == '\r')) {
+                    f->pos++;
+                }
+                int val = 0, sign = 1;
+                if (f->pos < f->size && f->buffer[f->pos] == '-') { sign = -1; f->pos++; }
+                else if (f->pos < f->size && f->buffer[f->pos] == '+') { f->pos++; }
+                int read_any = 0;
+                while (f->pos < f->size && f->buffer[f->pos] >= '0' && f->buffer[f->pos] <= '9') {
+                    val = val * 10 + (f->buffer[f->pos] - '0');
+                    f->pos++;
+                    read_any = 1;
+                }
+                if (read_any) {
+                    *out = val * sign;
+                    count++;
+                }
+            } else if (*format == 's') {
+                char* out = va_arg(ap, char*);
+                while (f->pos < f->size && (f->buffer[f->pos] == ' ' || f->buffer[f->pos] == '\t' || 
+                       f->buffer[f->pos] == '\n' || f->buffer[f->pos] == '\r')) {
+                    f->pos++;
+                }
+                int read_any = 0;
+                while (f->pos < f->size && f->buffer[f->pos] != ' ' && f->buffer[f->pos] != '\t' && 
+                       f->buffer[f->pos] != '\n' && f->buffer[f->pos] != '\r') {
+                    *out++ = f->buffer[f->pos++];
+                    read_any = 1;
+                }
+                *out = '\0';
+                if (read_any) count++;
+            }
+        } else if (*format == ' ' || *format == '\t' || *format == '\n' || *format == '\r') {
+            while (f->pos < f->size && (f->buffer[f->pos] == ' ' || f->buffer[f->pos] == '\t' || 
+                   f->buffer[f->pos] == '\n' || f->buffer[f->pos] == '\r')) {
+                f->pos++;
+            }
+        } else {
+            if (f->buffer[f->pos] == *format) f->pos++;
+        }
+        format++;
+    }
+    va_end(ap);
+    return count == 0 ? -1 : count;
+}
+
+int fscanf(void *stream, const char *format, ...) __attribute__((alias("__isoc99_fscanf")));
+
+// -----------------------------------------------------------------------------
+// ТАНГЕНС, СТЕПЕНЬ И ОШИБКИ (ДЛЯ QUAKE)
+// -----------------------------------------------------------------------------
+
+// Вычисление тангенса через sin/cos на FPU
+double tan(double x) {
+    double sin_x, cos_x;
+    __asm__ volatile ("fsincos" : "=t" (cos_x), "=u" (sin_x) : "0" (x));
+    return sin_x / cos_x;
+}
+
+// Возведение в степень на x87 FPU: x^y = 2^(y * log2(x)) (нужно для гаммы в view.c)
+double pow(double x, double y) {
+    if (x <= 0.0) return 0.0;
+    double res;
+    __asm__ volatile (
+        "fldl %2\n"              // st(1) = y
+        "fldl %1\n"              // st(0) = x
+        "fyl2x\n"                // st(0) = y * log2(x)
+        "fld %%st(0)\n"          // дублируем значение
+        "frndint\n"              // st(0) = round(val) — целая часть
+        "fxch %%st(1)\n"         // st(0) = val, st(1) = round(val)
+        "fsub %%st(1), %%st(0)\n"// st(0) = дробная часть
+        "f2xm1\n"                // st(0) = 2^(дробь) - 1
+        "fld1\n"
+        "faddp\n"                // st(0) = 2^(дробь)
+        "fscale\n"               // st(0) = 2^(дробь) * 2^(целое) = x^y
+        "fstp %%st(1)\n"         // очищаем стек
+        : "=t"(res)
+        : "m"(x), "m"(y)
+        : "st(1)"
+    );
+    return res;
+}
+
+// Заглушка текста ошибки (требуется в sys_null.c при неудачной записи файла)
+char* strerror(int errnum) {
+    (void)errnum;
+    return "I/O error";
 }

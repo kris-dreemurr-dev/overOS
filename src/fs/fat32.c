@@ -113,18 +113,19 @@ static uint32_t fat32_find_free_cluster(void) {
 
 static void format_size(uint32_t size, char* out_buf) {
     char tmp[16];
+    int i = 0;
     if (size < 1024) {
         itoa(size, tmp);
-        int i = 0; while(tmp[i]) { out_buf[i] = tmp[i]; i++; }
+        while (tmp[i]) { out_buf[i] = tmp[i]; i++; }
         out_buf[i++] = ' '; out_buf[i++] = 'B'; out_buf[i] = '\0';
     } else if (size < 1024 * 1024) {
         itoa(size / 1024, tmp);
-        int i = 0; while(tmp[i]) { out_buf[i] = tmp[i]; i++; }
-        out_buf[i++] = ' '; out_buf[i++] = 'KB'; out_buf[i] = '\0';
+        while (tmp[i]) { out_buf[i] = tmp[i]; i++; }
+        out_buf[i++] = ' '; out_buf[i++] = 'K'; out_buf[i++] = 'B'; out_buf[i] = '\0';
     } else {
         itoa(size / (1024 * 1024), tmp);
-        int i = 0; while(tmp[i]) { out_buf[i] = tmp[i]; i++; }
-        out_buf[i++] = ' '; out_buf[i++] = 'MB'; out_buf[i] = '\0';
+        while (tmp[i]) { out_buf[i] = tmp[i]; i++; }
+        out_buf[i++] = ' '; out_buf[i++] = 'M'; out_buf[i++] = 'B'; out_buf[i] = '\0';
     }
 }
 

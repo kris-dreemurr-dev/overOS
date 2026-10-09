@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "../fs/vfs.h"
 
 // Минимальный набор сигналов (как просил план): оба пока не перехватываются —
 // обработчиков ("signal handlers") в системе нет, поэтому и SIGKILL, и SIGINT
@@ -37,7 +38,10 @@ typedef struct task {
     // Состояние Ring 3 (у каждой задачи своё, переносится в sched_yield)
     uint64_t        saved_krsp;    // saved_kernel_rsp: низ ring0-стека для входа из Ring 3
     int             in_user;       // 1 = задача в Ring 3 или внутри своего сисколла
-    char            open83[64];    // полное имя файла, открытого sys_open (FAT32 LFN, своё у каждой программы)
+    
+    // UNIX-WAY: Таблица файловых дескрипторов процесса вместо open83[64]
+    file_descriptor_t* fd_table[MAX_FD];
+    char               cwd[128];
 
     // Самостоятельный процесс Ring 3 (свой ядерный стек), см. sched_spawn_process
     struct task*    parent;        // кто ждёт завершения (оболочка, запустившая программу)

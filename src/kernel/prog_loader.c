@@ -26,7 +26,7 @@ int prog_load_module(const char* filename, const char* args) {
 
     char name83[11];
 
-    kputs("[devOS] Loading program ", 0x00AAAAAA); 
+    kputs("[overOS] Loading program ", 0x00AAAAAA); 
     kputs(filename, 0x00FFFFFF); 
     kputs(" into kernel buffer...\n", 0x00AAAAAA); 
     flush_buffer(); 
@@ -44,7 +44,7 @@ int prog_load_module(const char* filename, const char* args) {
         return -1; 
     }
 
-    kputs("[devOS] Read bytes: ", 0x00AAAAAA);
+    kputs("[overOS] Read bytes: ", 0x00AAAAAA);
     char bbuf[16];
     itoa(bytes, bbuf); 
     kputs(bbuf, 0x0055FF55); 
@@ -61,7 +61,7 @@ int prog_load_module(const char* filename, const char* args) {
     uint32_t stack_size = 512 * 1024;
 
     if (hdr->magic[0] == 'D' && hdr->magic[1] == 'P' && hdr->magic[2] == 'R' && hdr->magic[3] == 'G') {
-        kputs("[devOS] Native DPRG format detected!\n", 0x0055FF55);
+        kputs("[overOS] Native DPRG format detected!\n", 0x0055FF55);
         load_base = hdr->load_vaddr ? hdr->load_vaddr : PROG_LOAD_BASE;
         entry_vaddr = hdr->entry_point ? hdr->entry_point : load_base;
         payload_offset = sizeof(devos_prg_header_t);
@@ -69,7 +69,7 @@ int prog_load_module(const char* filename, const char* args) {
         total_image_bytes = hdr->code_size + hdr->bss_size;
         if (hdr->stack_size) stack_size = (uint32_t)hdr->stack_size;
     } else {
-        kputs("[devOS] Legacy flat binary detected.\n", 0x00FFFF55);
+        kputs("[overOS] Legacy flat binary detected.\n", 0x00FFFF55);
     }
     flush_buffer();
 
@@ -90,7 +90,7 @@ int prog_load_module(const char* filename, const char* args) {
     uint32_t num_image_pages = (total_image_bytes + 4095) / 4096;
     if (num_image_pages == 0) num_image_pages = 1;
 
-    kputs("[devOS] Mapped image pages (Code + Data + BSS): ", 0x00AAAAAA);
+    kputs("[overOS] Mapped image pages (Code + Data + BSS): ", 0x00AAAAAA);
     itoa(num_image_pages, bbuf);
     kputs(bbuf, 0x0055FF55);
     kputs("\n", 0x00AAAAAA);
@@ -159,7 +159,7 @@ int prog_load_module(const char* filename, const char* args) {
         return -1;
     }
 
-    kputs("[devOS] Process started, PID: ", 0x00AAAAAA);
+    kputs("[overOS] Process started, PID: ", 0x00AAAAAA);
     itoa((int)proc->pid, bbuf);
     kputs(bbuf, 0x00FFFFFF);
     kputs("\n", 0x00FFFFFF);
@@ -175,7 +175,7 @@ int prog_load_module(const char* filename, const char* args) {
     sched_set_foreground_task(NULL);
     if (my_tty) { my_tty->gfx_mode = 0; my_tty->fg_pid = -1; }
 
-    kputs("\n[devOS] Process finished with exit code: ", 0x00AAAAAA);
+    kputs("\n[overOS] Process finished with exit code: ", 0x00AAAAAA);
     itoa(exit_code, bbuf);
     kputs(bbuf, 0x0055FF55);
     kputs("\n", 0x00AAAAAA);
