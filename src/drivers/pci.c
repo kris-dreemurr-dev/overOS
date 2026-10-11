@@ -208,3 +208,48 @@ const char* pci_get_audio_controller_name(void) {
     }
     return "Not Detected";
 }
+
+// Поиск любого PCI-устройства по паре Base Class / Subclass
+// Возвращает 0 при успехе, -1 если устройство не найдено
+int pci_find_by_class(uint8_t base_class, uint8_t subclass, pci_device_t* out_dev) {
+    for (uint16_t bus = 0; bus < 256; bus++) {
+        for (uint8_t slot = 0; slot < 32; slot++) {
+            for (uint8_t func = 0; func < 8; func++) {
+                uint32_t vendor_device = pci_config_read(bus, slot, func, 0x00);
+                if ((vendor_device & 0xFFFF) == 0xFFFF) continue;
+
+                uint32_t class_rev = pci_config_read(bus, slot, func, 0x08);
+                uint8_t b_class = (class_rev >> 24) & 0xFF;
+                uint8_t s_class = (class_rev >> 16) & 0xFF;
+
+                if (b_class == base_class && s_class == subclass) {
+                    if (out_dev) {
+                        out_dev->bus        = bus;
+                        out_dev->slot       = slot;
+                        out_dev->func       = func;
+                        out_dev->base_class = b_class;
+                        out_dev->subclass   = s_class;
+                        out_dev->prog_if    = (class_rev >> 8) & 0xFF;
+                        out_dev->vendor_id  = vendor_device & 0xFFFF;
+                        out_dev->device_id  = (vendor_device >> 16) & 0xFFFF;
+                        out_dev->bar0       = pci_config_read(bus, slot, func, 0x10) & ~0xF;
+                    }
+                    return 0; // Нашли!
+                }
+            }
+        }
+    }
+    return -1; // Не найдено
+}
+
+// Включение прямого доступа к памяти (Bus Master) и адресного пространства MMIO
+void pci_enable_bus_master(const pci_device_t* dev) {
+    // Регистр Command находится по смещению 0x04
+    uint32_t cmd = pci_config_read(dev->bus, dev->slot, dev->func, 0x04);
+    
+    // Бит 1 = Memory Space (включает MMIO BAR0)
+    // Бит 2 = Bus Master (разрешает контроллеру инициировать DMA-передачу)
+    cmd |= (1U << 1) | (1U << 2);
+    
+    pci_config_write(dev->bus, dev->slot, dev->func, 0x04, cmd);
+}

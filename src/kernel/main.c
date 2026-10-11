@@ -3,6 +3,7 @@
 #include "../drivers/acpi.h"
 #include "../drivers/pci.h"
 #include "../drivers/ethernet.h"
+#include "../drivers/hda.h"
 #include "../fs/fs.h"
 #include "sys_loader.h"
 #include "prog_loader.h"
@@ -31,7 +32,6 @@ extern int  strcmp(const char* s1, const char* s2);
 extern void enter_render_mode(void);
 extern void cmd_fastfetch(void);
 extern void acpi_power_off(void);
-extern void cmd_ehci_log(void);
 extern void intel_set_backlight(int level, int silent);
 
 // Текущий путь в файловой системе (корень "/")
@@ -189,6 +189,7 @@ void execute_command(void) {
         kputs("ver                 ", 0xFFFF55); kputs("- Display Kernel version\n", 0xFFFFFF);
         kputs("ping <ip>           ", 0xFFFF55); kputs("- Ping IP-Address\n", 0xFFFFFF);
         kputs("pong                ", 0xFFFF55); kputs("- Get IP-Ping from another PC/Device\n", 0xFFFFFF);
+        kputs("play-sound          ", 0xFFFF55); kputs("- Playing Sound on HDA Device\n", 0xFFFFFF);
         kputs("rus                 ", 0xFFFF55); kputs("- Turning Russian lang if ALT is broken\n", 0xFFFFFF);
         kputs("1972                ", 0xFFFF55); kputs("- Turning English lang if ALT is broken\n", 0xFFFFFF);
 
@@ -209,7 +210,6 @@ void execute_command(void) {
         kputs("fastfetch           ", 0xFFFF55); kputs("- Display system information\n", 0xFFFFFF);
         kputs("fastfetch -a        ", 0xFFFF55); kputs("- Pci scaner all pc (USB, Audio, Net)\n", 0xFFFFFF);
         kputs("brightness <0-100>  ", 0xFFFF55); kputs("- Set screen backlight brightness\n", 0xFFFFFF);
-        kputs("ehci-log            ", 0xFFFF55); kputs("- Display EHCI host controller debug log\n", 0xFFFFFF);
         kputs("netinfo             ", 0xFFFF55); kputs("- Network info\n", 0xFFFFFF);
         kputs("taskmgr / ps        ", 0xFFFF55); kputs("- Task Manager\n", 0xFFFFFF);
         kputs("pkill <pid> [sig]   ", 0xFFFF55); kputs("- Send a signal to PID (default SIGKILL=9)\n", 0xFFFFFF);
@@ -227,8 +227,6 @@ void execute_command(void) {
         cmd_fastfetch_audio();
     } else if (strcmp(cmd, "fastfetch") == 0) {
         cmd_fastfetch();
-    } else if (strcmp(cmd, "ehci-log") == 0) {
-        cmd_ehci_log();
     } else if (strcmp(cmd, "taskmgr") == 0 || strcmp(cmd, "ps") == 0) {
         sched_dump_tasks();
     } else if (strncmp(cmd, "ping", 4) == 0) {
@@ -237,6 +235,45 @@ void execute_command(void) {
         cmd_ping(arg);
     } else if (strcmp(cmd, "pong") == 0 || strcmp(cmd, "pingd") == 0) {
         cmd_pong();
+    } else if (strcmp(cmd, "play sound") == 0 || strcmp(cmd, "play-sound") == 0 || strcmp(cmd, "playsound") == 0) {
+        // 1. Проверяем инициализацию HDA
+        if (hda_get_status() == HDA_STATUS_NOT_FOUND) {
+            kputs("[HDA] Контроллер не был инициализирован. Пробуем инициализацию...\n", 0xFFFF55);
+            flush_buffer();
+            if (hda_init() != 0) {
+                kputs("[HDA] Ошибка: Intel HDA контроллер не найден на шине PCI!\n", 0xFF5555);
+                flush_buffer();
+                return;
+            }
+        }
+
+        // 2. Запуск низкого тестового тона (100 Гц, ~2% амплитуды)
+        kputs("[HDA] Запуск тестового тона (100 Гц, безопасная громкость)\n", 0x55FFFF);
+        kputs("[HDA] Воспроизведение на 10 секунд: ", 0xAAAAAA);
+        flush_buffer();
+
+        hda_play_test_tone();
+
+        // 3. Обратный отсчёт на 10 секунд с шагом в 1 секунду
+        for (int sec = 10; sec > 0; sec--) {
+            // Печатаем оставшиеся секунды
+            char sec_char = '0' + (sec % 10);
+            if (sec == 10) {
+                kputs("10.. ", 0x55FF55);
+            } else {
+                char buf[5] = { sec_char, '.', '.', ' ', '\0' };
+                kputs(buf, 0x55FF55);
+            }
+            flush_buffer();
+
+            sleep_ms(1000);
+        }
+
+        // 4. Остановка звукового DMA-стрима
+        hda_stop();
+
+        kputs("СТОП\n[HDA] Воспроизведение завершено, поток остановлен.\n", 0x55FFFF);
+        flush_buffer();
 
     } else if (strncmp(cmd, "pkill ", 6) == 0) {
         char* arg = cmd + 6;

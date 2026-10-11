@@ -251,4 +251,71 @@ static inline int sys_get_net_info(sys_net_info_t* info) {
     return ret;
 }
 
+// -----------------------------------------------------------------------------
+// Аудиоподсистема Intel HDA (ABI Ring 3)
+// -----------------------------------------------------------------------------
+#define HDA_STATUS_NOT_FOUND   0
+#define HDA_STATUS_INITIALIZED 1
+#define HDA_STATUS_PLAYING     2
+
+#define HDA_OUT_AUTO       0   // Автовыбор (динамики / наушники / HDMI)
+#define HDA_OUT_SPEAKERS   1   // Только встроенные динамики
+#define HDA_OUT_HEADPHONES 2   // Только наушники (3.5 мм Jack)
+#define HDA_OUT_HDMI       3   // Только HDMI / DisplayPort
+
+typedef struct {
+    int controllers;
+    int codecs;
+    int has_speakers;
+    int has_headphones;
+    int has_lineout;
+    int has_hdmi;
+    int has_spdif;
+    int headphones_plugged;
+    int lineout_plugged;
+    int hdmi_connected;
+    int analog_playback;
+    int hdmi_playback;
+} __attribute__((packed)) sys_hda_outputs_t;
+
+static inline int sys_audio_get_status(void) {
+    int ret;
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(70), "b"(0) : "memory");
+    return ret;
+}
+
+static inline int sys_audio_get_outputs(sys_hda_outputs_t* out) {
+    int ret;
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(70), "b"(1), "c"(out) : "memory");
+    return ret;
+}
+
+static inline int sys_audio_set_output(int mode) {
+    int ret;
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(70), "b"(2), "c"(mode) : "memory");
+    return ret;
+}
+
+static inline int sys_audio_get_output(void) {
+    int ret;
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(70), "b"(3) : "memory");
+    return ret;
+}
+
+static inline void sys_audio_play_test(void) {
+    uint64_t r = 70;
+    __asm__ volatile ("int $0x80" : "+a"(r) : "b"(4) : "memory");
+}
+
+static inline void sys_audio_stop(void) {
+    uint64_t r = 70;
+    __asm__ volatile ("int $0x80" : "+a"(r) : "b"(5) : "memory");
+}
+
+static inline int sys_audio_jack_poll(void) {
+    int ret;
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(70), "b"(6) : "memory");
+    return ret;
+}
+
 #endif

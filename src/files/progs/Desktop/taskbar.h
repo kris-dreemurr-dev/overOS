@@ -26,6 +26,10 @@ extern menu_app_t g_menu_apps[MAX_MENU_APPS];
 extern int        g_menu_app_count;
 extern int        g_power_menu_open;
 extern sys_net_info_t g_net_info;
+extern sys_hda_outputs_t g_audio_outputs;
+extern int               g_audio_status;
+extern int g_net_driver_ok;
+extern int g_volume_dragging;
 
 void taskbar_refresh_menu_apps(void);
 void taskbar_render(int mouse_x, int mouse_y, const rtc_time_t* t);

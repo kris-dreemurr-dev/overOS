@@ -2,6 +2,7 @@
 #include "../drivers/display.h"
 #include "../drivers/pci.h"
 #include "../drivers/ethernet.h"
+#include "../drivers/hda.h"
 #include "../fs/fs.h"
 #include "../memory/pmm.h"
 #include "../memory/vmm.h"
@@ -25,13 +26,13 @@ extern void sleep_ms(uint32_t ms);
 
 // Хелпер для красивого вывода статуса в стиле Arch/systemd
 static void log_status(const char* name, int success) {
-    kputs("  [ ", 0xFFFFFF);
+    kputs("  [  ", 0xbfbfbf);
     if (success) {
         kputs("OK", 0x55FF55);
     } else {
         kputs("FAIL", 0xFF5555);
     }
-    kputs(" ] ", 0xFFFFFF);
+    kputs("  ] ", 0xbfbfbf);
     kputs(name, 0xFFFFFF);
     kputs("\n", 0xFFFFFF);
     flush_buffer();
@@ -60,10 +61,13 @@ void kernel_system_bootstrap(void) {
     intel_set_backlight(100, 1);
     log_status("Display Backlight & VBE Framebuffer LFB", 1);
 
+    int hda_ok = (hda_init() == 0);
+    log_status("Intel High Definition Audio (HDA)", hda_ok);
+
     log_status("Kernel Scheduler & Virtual Terminals (TTY)", 1);
 
-    net_bootstrap();
-    log_status("Ethernet Network", 1);
+    int net_ok = (net_bootstrap() == 0);
+    log_status("Ethernet Network", net_ok);
 
     kputs("\n:: System has been started\n\n", 0x55FF55);
     flush_buffer();

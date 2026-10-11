@@ -656,9 +656,10 @@ int net_get_status_info(void* out_buf) {
 
     k_net_info_t* info = (k_net_info_t*)out_buf;
 
+    // Если сетевая карта физически отсутствует — возвращаем ошибку (-1)!
     if (!rtl_initialized && !rtl8168_init()) {
         info->state = 0;
-        return 0;
+        return -1;
     }
 
     // 1. Аппаратный статус разъема RJ45
@@ -670,7 +671,7 @@ int net_get_status_info(void* out_buf) {
         info->link_speed = 0;
         net_configured = 0;
         gateway_resolved = 0;
-        return 0;
+        return 0; // Драйвер работает, но кабеля нет
     }
 
     if (phy & 0x10)      info->link_speed = 1000;
@@ -688,26 +689,24 @@ int net_get_status_info(void* out_buf) {
     info->ip = my_ip;
     info->gateway_ip = gateway_ip;
 
-    // 2. Фоновая вычитка очереди: ловим ответы от любых внешних хостов
+    // 2. Фоновая вычитка очереди
     uint8_t rx_tmp[1536];
     int rlen;
     while ((rlen = net_poll_packet(rx_tmp, sizeof(rx_tmp))) > 0) {
         eth_hdr_t* eth = (eth_hdr_t*)rx_tmp;
 
-        // Автоответ на ARP роутера
         if (ntohs(eth->ethertype) == 0x0806 && rlen >= (int)(sizeof(eth_hdr_t) + sizeof(arp_pkt_t))) {
             arp_pkt_t* arp = (arp_pkt_t*)(rx_tmp + sizeof(eth_hdr_t));
             if (ntohs(arp->opcode) == 1 && ntohl(arp->dst_ip) == my_ip) {
                 send_arp(2, arp->src_mac, ntohl(arp->src_ip));
             }
         }
-        // Обработка входящих ICMP Echo Reply
         else if (ntohs(eth->ethertype) == 0x0800 && rlen >= (int)(sizeof(eth_hdr_t) + sizeof(ipv4_hdr_t) + sizeof(icmp_hdr_t))) {
             ipv4_hdr_t* ip = (ipv4_hdr_t*)(rx_tmp + sizeof(eth_hdr_t));
             if (ip->protocol == 1) {
                 icmp_hdr_t* icmp = (icmp_hdr_t*)(rx_tmp + sizeof(eth_hdr_t) + sizeof(ipv4_hdr_t));
                 if (icmp->type == 0 && is_external_ip(ntohl(ip->src_ip))) {
-                    s_last_external_pong_tick = timer_ticks; // ФИКСИРУЕМ ОНЛАЙН
+                    s_last_external_pong_tick = timer_ticks;
                 }
             }
         }
@@ -721,11 +720,11 @@ int net_get_status_info(void* out_buf) {
         }
     }
 
-    // 4. Определение финального статуса (окно удержания — 15 секунд)
+    // 4. Финальный статус
     if (net_configured && s_last_external_pong_tick != 0 && (timer_ticks - s_last_external_pong_tick < 15000)) {
-        info->state = 2; // NET_STATE_ONLINE (Интернет подключен)
+        info->state = 2; // NET_STATE_ONLINE
     } else if (net_configured) {
-        info->state = 1; // NET_STATE_LOCAL_ONLY (Локальная сеть)
+        info->state = 1; // NET_STATE_LOCAL_ONLY
     } else {
         info->state = 0; // NET_STATE_DISCONNECTED
     }
@@ -734,20 +733,27 @@ int net_get_status_info(void* out_buf) {
 }
 
 // Запуск сети на этапе загрузки ядра
-void net_bootstrap(void) {
+int net_bootstrap(void) {
     kdebug("[*] Initializing Network Subsystem...\n", 0x55FFFF);
 
+    // 1. Проверяем наличие и инициализацию чипа на шине PCI
     if (!rtl8168_init()) {
         kdebug("[-] Network: RTL8168 controller not detected.\n", 0xFF5555);
-        return;
+        return -1; // Контроллера нет на плате — честный FAIL
     }
 
+    // Железо найдено и готово к работе!
+    kdebug("[+] Network: RTL8168 hardware adapter initialized.\n", 0x55FF55);
+
+    // 2. Проверяем физический линк (подключен ли кабель)
     uint8_t phy = inb(rtl_io_base + 0x6C);
     if (!(phy & 0x02)) {
-        kdebug("[!] Network: Ethernet cable disconnected. Skipping.\n", 0xFFFF55);
-        return;
+        kdebug("[!] Network: Cable is disconnected. Skipping DHCP.\n", 0xFFFF55);
+        // Адаптер инициализирован, просто нет кабеля. Возвращаем 0 (OK)!
+        return 0;
     }
 
+    // 3. Кабель подключен — запрашиваем IP по DHCP
     if (net_auto_dhcp()) {
         kdebug("[+] Network ready: IP ", 0x55FF55);
         dbg_print_ip(my_ip);
@@ -755,10 +761,8 @@ void net_bootstrap(void) {
         dbg_print_ip(gateway_ip);
         kdebug(")\n", 0xAAAAAA);
 
-        // Сразу прогреваем статус онлайна перед входом в GUI
         if (gateway_resolved) {
             send_multi_probes();
-
             uint8_t rx_b[1536];
             uint32_t t0 = timer_ticks;
             while ((timer_ticks - t0) < 180) {
@@ -780,6 +784,8 @@ void net_bootstrap(void) {
             }
         }
     }
+
+    return 0; // Инициализация подсистемы успешна
 }
 
 // Консольный ping в TTY

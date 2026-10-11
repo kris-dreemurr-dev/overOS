@@ -13,12 +13,21 @@ int        g_brightness_dragging = 0;
 menu_app_t g_menu_apps[MAX_MENU_APPS];
 int        g_menu_app_count = 0;
 int        g_power_menu_open = 0;
+int        g_net_driver_ok = 0;
+int g_volume_dragging = 0;
 
 static window_t* s_err_win = 0;
 static char      s_err_msg[512] = "";
 
 sys_net_info_t g_net_info = {0};
 static uint8_t s_last_net_check_sec = 255;
+
+sys_hda_outputs_t g_audio_outputs = {0};
+int               g_audio_status  = HDA_STATUS_NOT_FOUND;
+static uint8_t    s_last_audio_check_sec = 255;
+static int        s_tone_playing  = 0;
+static int        s_tone_frames   = 0; // обратный отсчет кадров для 1 сек звука
+static int        s_audio_boot_applied = 0;
 
 static void itoa(int n, char* str) {
     int i = 0;
@@ -195,7 +204,7 @@ int taskbar_is_inside_popup(int mx, int my) {
         int pop_x = g_screen_w - pop_w - 60, pop_y = bar_y - pop_h - 6;
         return (mx >= pop_x && mx <= pop_x + pop_w && my >= pop_y && my <= pop_y + pop_h);
     } else if (g_active_popup == POPUP_SOUND) {
-        int pop_w = 220, pop_h = 56;
+        int pop_w = 260, pop_h = 210;
         int pop_x = g_screen_w - pop_w - 60, pop_y = bar_y - pop_h - 6;
         return (mx >= pop_x && mx <= pop_x + pop_w && my >= pop_y && my <= pop_y + pop_h);
     }
@@ -253,7 +262,22 @@ void taskbar_render(int mouse_x, int mouse_y, const rtc_time_t* t) {
     // Периодический опрос сети раз в 5 секунд
     if ((t->sec % 5 == 0) && (t->sec != s_last_net_check_sec)) {
         s_last_net_check_sec = t->sec;
-        sys_get_net_info(&g_net_info);
+        int res = sys_get_net_info(&g_net_info);
+        g_net_driver_ok = (res >= 0);
+    }
+
+    // Опрос аудио-портов раз в 1 секунду
+    if (t->sec != s_last_audio_check_sec) {
+        s_last_audio_check_sec = t->sec;
+        g_audio_status = sys_audio_get_status();
+        if (g_audio_status != HDA_STATUS_NOT_FOUND) {
+            sys_audio_jack_poll();
+            sys_audio_get_outputs(&g_audio_outputs);
+            if (!s_audio_boot_applied) {
+                sys_audio_set_output(g_audio_output);
+                s_audio_boot_applied = 1;
+            }
+        }
     }
 
     int bar_y = g_screen_h - TASKBAR_HEIGHT;
@@ -312,22 +336,25 @@ void taskbar_render(int mouse_x, int mouse_y, const rtc_time_t* t) {
     // 3. Системный трей
     int tray_x = g_screen_w - 270;
     
-    // Аудио иконка в трее (подсветка синим при открытом попапе)
-    uint32_t snd_col = (g_active_popup == POPUP_SOUND) ? COLOR_ACCENT_BLUE : COLOR_TEXT_MUTED;
-    gfx_draw_mono_icon(tray_x, bar_y + 14, icon_sound_mute, snd_col, COLOR_WARN_RED, 1);
+    // Аудио иконка в трее (KDE Breeze: звук с волнами либо перечеркнутый динамик)
+    int hda_ok = (g_audio_status != HDA_STATUS_NOT_FOUND);
+    uint32_t snd_col = (g_active_popup == POPUP_SOUND) ? COLOR_ACCENT_BLUE : (hda_ok ? COLOR_TEXT_MAIN : COLOR_TEXT_MUTED);
+    const uint16_t* snd_icon = hda_ok ? icon_sound : icon_sound_mute;
+    gfx_draw_mono_icon(tray_x, bar_y + 14, snd_icon, snd_col, COLOR_WARN_RED, hda_ok ? 0 : 1);
 
-    // [СЕТЬ]: 3 состояния в стиле KDE Breeze
-    if (g_net_info.state == NET_STATE_ONLINE) {
-        // Состояние 2: Интернет подключен (чистый монитор LAN с кабелем)
+    // [СЕТЬ]: 4 состояния в стиле KDE Breeze
+    if (!g_net_driver_ok) {
+        // Драйвер не работает / сетевая карта не найдена
+        gfx_draw_mono_icon(tray_x + 28, bar_y + 14, icon_network_none, COLOR_TEXT_MUTED, COLOR_WARN_RED, 1);
+    }
+    else if (g_net_info.state == NET_STATE_ONLINE) {
         uint32_t col = (g_active_popup == POPUP_NET) ? COLOR_ACCENT_BLUE : COLOR_TEXT_MAIN;
         gfx_draw_mono_icon(tray_x + 28, bar_y + 14, icon_network_eth, col, 0, 0);
     } 
     else if (g_net_info.state == NET_STATE_LOCAL_ONLY) {
-        // Состояние 1: Локальная сеть без интернета (восклицательный знак)
         gfx_draw_mono_icon(tray_x + 28, bar_y + 14, icon_network_alert, 0xFFFF55, 0, 0);
     } 
     else {
-        // Состояние 0: Кабель отключен (разрыв связи)
         gfx_draw_mono_icon(tray_x + 28, bar_y + 14, icon_network_none, COLOR_TEXT_MUTED, COLOR_WARN_RED, 1);
     }
 
@@ -473,7 +500,11 @@ void taskbar_render(int mouse_x, int mouse_y, const rtc_time_t* t) {
         gfx_draw_rect(pop_x - 1, pop_y - 1, pop_w + 2, pop_h + 2, COLOR_PANEL_BORDER);
         gfx_draw_rect(pop_x, pop_y, pop_w, pop_h, COLOR_PANEL_BG);
 
-        if (g_net_info.state == NET_STATE_ONLINE) {
+        if (!g_net_driver_ok) {
+            gfx_draw_mono_icon(pop_x + 12, pop_y + 12, icon_network_none, COLOR_WARN_RED, COLOR_WARN_RED, 1);
+            gfx_draw_string(pop_x + 34, pop_y + 8, "Ethernet (LAN)", COLOR_TEXT_MAIN);
+            gfx_draw_string(pop_x + 34, pop_y + 22, "Драйвер не работает", COLOR_WARN_RED);
+        } else if (g_net_info.state == NET_STATE_ONLINE) {
             gfx_draw_mono_icon(pop_x + 12, pop_y + 12, icon_network_eth, COLOR_ACCENT_BLUE, 0, 0);
             gfx_draw_string(pop_x + 34, pop_y + 8, "Ethernet (LAN)", COLOR_TEXT_MAIN);
             gfx_draw_string(pop_x + 34, pop_y + 22, "Подключено к Сети", 0x55FF55);
@@ -489,8 +520,13 @@ void taskbar_render(int mouse_x, int mouse_y, const rtc_time_t* t) {
 
         gfx_draw_rect(pop_x + 10, pop_y + 38, pop_w - 20, 1, COLOR_PANEL_BORDER);
 
-        char ip_str[24];
-        if (g_net_info.state != NET_STATE_DISCONNECTED) {
+        if (!g_net_driver_ok) {
+            gfx_draw_string(pop_x + 12, pop_y + 54, "Статус:", COLOR_TEXT_MUTED);
+            gfx_draw_string(pop_x + 75, pop_y + 54, "Драйвер не найден", COLOR_WARN_RED);
+            gfx_draw_string(pop_x + 12, pop_y + 74, "Адаптер:", COLOR_TEXT_MUTED);
+            gfx_draw_string(pop_x + 95, pop_y + 74, "Недоступен", COLOR_TEXT_MUTED);
+        } else if (g_net_info.state != NET_STATE_DISCONNECTED) {
+            char ip_str[24];
             gfx_draw_string(pop_x + 12, pop_y + 46, "IP:", COLOR_TEXT_MUTED);
             int p = 0;
             for (int i = 3; i >= 0; i--) {
@@ -520,27 +556,98 @@ void taskbar_render(int mouse_x, int mouse_y, const rtc_time_t* t) {
             gfx_draw_string(pop_x + 58, pop_y + 82, sp_str, 0x55FFFF);
         } else {
             gfx_draw_string(pop_x + 12, pop_y + 54, "Статус:", COLOR_TEXT_MUTED);
-            gfx_draw_string(pop_x + 80, pop_y + 54, "Соединения нету", COLOR_TEXT_MUTED);
+            gfx_draw_string(pop_x + 80, pop_y + 54, "Кабель не подключен", COLOR_TEXT_MUTED);
         }
-    } 
-    // 8. Полноценное окно аудио
+    }
+    // 8. Полноценное окно аудио в стиле KDE Plasma
     else if (g_active_popup == POPUP_SOUND) {
-        int pop_w = 220, pop_h = 56;
+        int pop_w = 260, pop_h = 210;
         int pop_x = g_screen_w - pop_w - 60;
         int pop_y = bar_y - pop_h - 6;
 
         gfx_draw_rect(pop_x - 1, pop_y - 1, pop_w + 2, pop_h + 2, COLOR_PANEL_BORDER);
         gfx_draw_rect(pop_x, pop_y, pop_w, pop_h, COLOR_PANEL_BG);
 
-        gfx_draw_string(pop_x + 12, pop_y + 10, "АУДИО", COLOR_WARN_RED);
-        gfx_draw_string(pop_x + 12, pop_y + 30, "Драйвер не найден", COLOR_TEXT_MUTED);
+        // Шапка
+        gfx_draw_string(pop_x + 12, pop_y + 10, "Громкость", COLOR_TEXT_MAIN);
+        if (g_audio_status != HDA_STATUS_NOT_FOUND) {
+            gfx_draw_string(pop_x + 160, pop_y + 10, "[HDA: Готов]", 0x55FF55);
+        } else {
+            gfx_draw_string(pop_x + 152, pop_y + 10, "[HDA: Нет]", COLOR_WARN_RED);
+        }
+
+        // Заглушка слайдера громкости (100%)
+        int track_x = pop_x + 14, track_y = pop_y + 36, track_w = 180, track_h = 6;
+        gfx_draw_rect(track_x, track_y, track_w, track_h, 0x141618);
+        int fill_w = (track_w * g_volume) / 100;
+        gfx_draw_rect(track_x, track_y, fill_w, track_h, COLOR_ACCENT_BLUE);
+        int knob_x = track_x + fill_w - 4;
+        gfx_draw_rect(knob_x, track_y - 4, 8, 14, COLOR_TEXT_MAIN);
+        gfx_draw_dec(pop_x + 204, pop_y + 32, g_volume, COLOR_ACCENT_BLUE);
+        gfx_draw_string(pop_x + (g_volume == 100 ? 230 : 222), pop_y + 32, "%", COLOR_ACCENT_BLUE);
+
+        // Разделитель
+        gfx_draw_rect(pop_x + 10, pop_y + 56, pop_w - 20, 1, COLOR_PANEL_BORDER);
+
+        // Список физических устройств вывода
+        const char* names[4] = {
+            "Автовыбор (AUTO)",
+            "Встроенные динамики",
+            "Наушники (Jack 3.5)",
+            "HDMI / DisplayPort"
+        };
+
+        int list_y = pop_y + 64;
+        int item_h = 26;
+
+        for (int i = 0; i < 4; i++) {
+            int iy = list_y + (i * item_h);
+            int is_selected = (g_audio_output == i);
+
+            // Проверка физической доступности выхода
+            int is_available = 1;
+            if (i == 1 && !g_audio_outputs.has_speakers && !g_audio_outputs.analog_playback) is_available = 0;
+            if (i == 2 && !g_audio_outputs.has_headphones && !g_audio_outputs.has_lineout) is_available = 0;
+            if (i == 3 && (!g_audio_outputs.has_hdmi || !g_audio_outputs.hdmi_playback)) is_available = 0;
+
+            int hover = (mouse_x >= pop_x + 4 && mouse_x <= pop_x + pop_w - 4 && mouse_y >= iy && mouse_y < iy + item_h);
+            uint32_t bg = hover ? COLOR_DOCK_HOVER : (is_selected ? 0x2A323D : 0);
+            if (bg) {
+                gfx_draw_rect(pop_x + 4, iy, pop_w - 8, item_h - 2, bg);
+            }
+
+            // Маркер выбора и имя
+            uint32_t title_color = is_available ? COLOR_TEXT_MAIN : COLOR_TEXT_MUTED;
+            gfx_draw_string(pop_x + 10, iy + 4, is_selected ? "[X]" : "[ ]", is_selected ? COLOR_ACCENT_BLUE : COLOR_TEXT_MUTED);
+            gfx_draw_string(pop_x + 36, iy + 4, names[i], title_color);
+
+            // Статус подключения
+            if (!is_available) {
+                gfx_draw_string(pop_x + 185, iy + 4, "Нет", COLOR_TEXT_MUTED);
+            } else if (i == 2) {
+                if (g_audio_outputs.headphones_plugged) {
+                    gfx_draw_string(pop_x + 185, iy + 4, "Подкл.", 0x55FF55);
+                } else {
+                    gfx_draw_string(pop_x + 185, iy + 4, "Откл.", COLOR_TEXT_MUTED);
+                }
+            } else if (i == 3) {
+                if (g_audio_outputs.hdmi_connected > 0) {
+                    gfx_draw_string(pop_x + 185, iy + 4, "Сигнал", 0x55FF55);
+                } else {
+                    gfx_draw_string(pop_x + 185, iy + 4, "Спит", COLOR_TEXT_MUTED);
+                }
+            }
+        }
+
+        // Подсказка снизу
+        gfx_draw_string(pop_x + 16, pop_y + 184, "Клик: переключить и тест (1с)", COLOR_TEXT_MUTED);
     }
 }
 
 int taskbar_handle_click(int mx, int my) {
     int bar_y = g_screen_h - TASKBAR_HEIGHT;
 
-    // 1. Повторный клик по кнопке [overOS] (Пуск) — ТОГГЛ (закрыть, если открыто)
+    // 1. Повторный клик по кнопке [overOS] (Пуск)
     if (mx >= 6 && mx <= 90 && my >= bar_y + 5) {
         if (g_menu_open) {
             g_menu_open = 0; // Закрываем при повторном клике!
@@ -647,7 +754,16 @@ int taskbar_handle_click(int mx, int my) {
     int tray_x = g_screen_w - 270;
     if (mx >= tray_x && mx < tray_x + 24 && my >= bar_y + 10) {
         g_menu_open = 0;
-        g_active_popup = (g_active_popup == POPUP_SOUND) ? POPUP_NONE : POPUP_SOUND;
+        if (g_active_popup == POPUP_SOUND) {
+            g_active_popup = POPUP_NONE;
+        } else {
+            g_active_popup = POPUP_SOUND;
+            g_audio_status = sys_audio_get_status();
+            if (g_audio_status != HDA_STATUS_NOT_FOUND) {
+                sys_audio_jack_poll();
+                sys_audio_get_outputs(&g_audio_outputs);
+            }
+        }
         return 1;
     } else if (mx >= tray_x + 28 && mx < tray_x + 52 && my >= bar_y + 10) {
         g_menu_open = 0;
@@ -680,6 +796,70 @@ int taskbar_handle_click(int mx, int my) {
             else if (my >= cl_y + 52 && my < cl_y + 74) { g_tz_offset = 3; settings_save(); return 1; }
             else if (my >= cl_y + 76 && my < cl_y + 98) { g_tz_offset = 9; settings_save(); return 1; }
         }
+    }
+
+    // Клик внутри попапа звука
+    if (g_active_popup == POPUP_SOUND) {
+        int pop_w = 260, pop_h = 210;
+        int pop_x = g_screen_w - pop_w - 60;
+        int pop_y = bar_y - pop_h - 6;
+
+        if (mx >= pop_x && mx <= pop_x + pop_w && my >= pop_y && my <= pop_y + pop_h) {
+
+            // 1. Клик по полосе громкости
+            int track_x = pop_x + 14, track_y = pop_y + 36, track_w = 180, track_h = 6;
+            if (mx >= track_x - 6 && mx <= track_x + track_w + 6 &&
+                my >= track_y - 8 && my <= track_y + track_h + 8) {
+                int val = ((mx - track_x) * 100) / track_w;
+                if (val < 0) val = 0;
+                if (val > 100) val = 100;
+                g_volume = val;
+                g_volume_dragging = 1;
+                settings_save();
+                return 1;
+            }
+
+            // 2. Выбор устройства вывода
+            int list_y = pop_y + 64;
+            int item_h = 26;
+
+            for (int i = 0; i < 4; i++) {
+                int iy = list_y + (i * item_h);
+                if (my >= iy && my < iy + item_h) {
+                    int can_switch = 1;
+                    if (i == 1 && !g_audio_outputs.has_speakers && !g_audio_outputs.analog_playback) can_switch = 0;
+                    if (i == 2 && !g_audio_outputs.has_headphones && !g_audio_outputs.has_lineout) can_switch = 0;
+                    if (i == 3 && (!g_audio_outputs.has_hdmi || !g_audio_outputs.hdmi_playback)) can_switch = 0;
+
+                    if (can_switch && sys_audio_set_output(i) == 0) {
+                        g_audio_output = i;
+                        settings_save();
+
+                        // Точный тест на 200 мс (0.2 сек) через таймер ядра
+                        sys_audio_play_test();
+                        sys_sleep(200);
+                        sys_audio_stop();
+
+                        sys_audio_get_outputs(&g_audio_outputs);
+                    }
+                    return 1;
+                }
+            }
+            return 1;
+        }
+    }
+
+    // Клик по иконке сети в трее
+    else if (mx >= tray_x + 28 && mx < tray_x + 52 && my >= bar_y + 10) {
+        g_menu_open = 0;
+        if (g_active_popup == POPUP_NET) {
+            g_active_popup = POPUP_NONE;
+        } else {
+            g_active_popup = POPUP_NET;
+            int res = sys_get_net_info(&g_net_info);
+            g_net_driver_ok = (res >= 0);
+        }
+        return 1;
     }
 
     return 0;

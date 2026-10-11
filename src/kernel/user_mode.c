@@ -3,6 +3,7 @@
 #include "sched.h"
 #include "../drivers/mouse.h"
 #include "../drivers/ethernet.h"
+#include "../drivers/hda.h"
 #include "../memory/vmm.h"
 #include "../memory/pmm.h"
 #include "prog_loader.h"
@@ -963,6 +964,38 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
             int res = net_get_status_info((void*)arg1);
             __asm__ volatile ("cli");
             return (uint64_t)res;
+        }
+        case 70: { // sys_audio(cmd, arg1, arg2)
+            uint64_t cmd = arg1; // подкоманда из RBX
+            switch (cmd) {
+                case 0: // get_status
+                    return (uint64_t)hda_get_status();
+
+                case 1: { // get_outputs (arg2 = указатель на hda_outputs_t)
+                    if (!arg2) return (uint64_t)-2;
+                    return (uint64_t)check_audio_outputs((hda_outputs_t*)arg2);
+                }
+
+                case 2: // set_output (arg2 = mode: 0 AUTO, 1 SPEAKERS, 2 HEADPHONES, 3 HDMI)
+                    return (uint64_t)hda_set_output((int)arg2);
+
+                case 3: // get_output
+                    return (uint64_t)hda_get_output();
+
+                case 4: // play_test
+                    hda_play_test_tone();
+                    return 0;
+
+                case 5: // stop
+                    hda_stop();
+                    return 0;
+
+                case 6: // jack_poll
+                    return (uint64_t)hda_jack_poll();
+
+                default:
+                    return (uint64_t)-1;
+            }
         }
 
         default:

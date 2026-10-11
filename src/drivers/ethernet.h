@@ -82,6 +82,6 @@ void cmd_ping(const char* target_ip_str);
 void cmd_pong(void);
 void cmd_net_info(void);
 int net_get_status_info(void* out_buf);
-void net_bootstrap(void);
+int net_bootstrap(void);
 
 #endif

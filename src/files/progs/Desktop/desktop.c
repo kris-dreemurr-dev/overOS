@@ -68,7 +68,7 @@ int main(void) {
         while (sc != 0) {
             need_redraw = 1;
 
-            // [КЛАВИША META / SUPER / WIN]: Открытие и закрытие меню Пуск
+            // [КЛАВИША META]: Открытие и закрытие меню Пуск
             if (sc == 0x5B || sc == 0x5C) {
                 if (g_menu_open) {
                     g_menu_open = 0;
@@ -149,6 +149,25 @@ int main(void) {
             }
         }
 
+        if (ms.buttons & 1) {
+        // Перетаскивание слайдера громкости
+        if (g_volume_dragging && g_active_popup == POPUP_SOUND) {
+            int bar_y = g_screen_h - TASKBAR_HEIGHT;
+            int pop_w = 260, pop_h = 210;
+            int pop_x = g_screen_w - pop_w - 60;
+            int track_x = pop_x + 14, track_w = 180;
+
+            int val = ((ms.x - track_x) * 100) / track_w;
+            if (val < 0) val = 0;
+            if (val > 100) val = 100;
+            g_volume = val;
+        }
+    } else {
+        if (g_volume_dragging) {
+            g_volume_dragging = 0;
+            settings_save();
+        }
+    }
         prev_mx = cursor_x;
         prev_my = cursor_y;
         prev_buttons = ms.buttons;

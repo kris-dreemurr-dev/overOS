@@ -21,6 +21,10 @@ void pci_config_write(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, u
 void pci_scan_all(void);
 int pci_find_usb_controller(pci_device_t* out_dev);
 
+// --- НОВЫЕ ФУНКЦИИ ДЛЯ HDA И ДРУГИХ ДРАЙВЕРОВ ---
+int  pci_find_by_class(uint8_t base_class, uint8_t subclass, pci_device_t* out_dev);
+void pci_enable_bus_master(const pci_device_t* dev);
+
 void cmd_fastfetch_audio(void);
 const char* pci_get_audio_controller_name(void);
 

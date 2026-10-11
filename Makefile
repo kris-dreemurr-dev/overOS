@@ -85,6 +85,7 @@ C_SRC   := $(SRC_DIR)/kernel/kernel.c \
            $(SRC_DIR)/drivers/display.c \
            $(SRC_DIR)/drivers/pci.c \
            $(SRC_DIR)/drivers/ethernet.c \
+		   $(SRC_DIR)/drivers/hda.c \
            $(SRC_DIR)/drivers/mouse.c \
            $(SRC_DIR)/drivers/usb/ehci.c \
            $(SRC_DIR)/drivers/usb/ehci-msc.c \
@@ -353,7 +354,8 @@ run: all
 		-device usb-ehci,id=ehci \
 		-drive if=none,id=usb_drive,file=$(DISK_IMG),format=raw \
 		-device usb-storage,bus=ehci.0,drive=usb_drive \
-		-device intel-hda -device hda-duplex \
+		-audiodev pa,id=snd0 \
+		-device intel-hda -device hda-duplex,audiodev=snd0 \
 		-vga std -global VGA.vgamem_mb=16
 
 run-debug: all
@@ -369,6 +371,8 @@ run-debug: all
 		-device usb-ehci,id=ehci \
 		-drive if=none,id=usb_drive,file=$(DISK_IMG),format=raw \
 		-device usb-storage,bus=ehci.0,drive=usb_drive \
+		-audiodev pa,id=snd0 \
+		-device intel-hda -device hda-duplex,audiodev=snd0 \
 		-vga std -global VGA.vgamem_mb=16
 
 run-usb: all
