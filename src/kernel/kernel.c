@@ -45,6 +45,18 @@ uint16_t screen_width;
 uint16_t screen_height;
 uint16_t screen_pitch;
 
+// Прототипы графики (определены ниже в этом файле)
+void flush_buffer(void);
+void flush_dirty(void);
+void gfx_mark_all_dirty(void);
+void fill_rect(int x, int y, int w, int h, uint32_t color);
+
+// Счётчик "кто-то кроме /dev/fb0 записал в LFB" (devfs.c по нему понимает, что его копия экрана устарела)
+volatile uint32_t g_lfb_gen = 0;
+// Когда и с какого TTY последний раз писали в /dev/fb0 (пока пишут — курсор консоли не рисуем поверх)
+volatile uint32_t g_fb_last_write_tick = 0;
+volatile int      g_fb_write_tty = -2;
+
 #define MAX_SCREEN_WIDTH  1920
 #define MAX_SCREEN_HEIGHT 1080
 uint32_t back_buffer[MAX_SCREEN_WIDTH * MAX_SCREEN_HEIGHT];
@@ -87,10 +99,6 @@ void console_save_state(void) {
     tty_t* owner = console_task_tty();
     if (owner) owner->gfx_mode = 1;   // экран занят модулем: мигание курсора консоли выключено
     if (console_is_saved) return; // Не перезаписываем снимок повторно во время работы подмодулей!
-    uint32_t total_pixels = screen_width * screen_height;
-    for (uint32_t i = 0; i < total_pixels; i++) {
-        //saved_console_buffer[i] = back_buffer[i];
-    }
     saved_cursor_x = cursor_x;
     saved_cursor_y = cursor_y;
     saved_total_scrolled_px = total_scrolled_px;
@@ -101,12 +109,6 @@ void console_save_state(void) {
 void console_restore_state(void) {
     tty_t* owner = console_task_tty();
     if (owner) owner->gfx_mode = 0;
-    uint32_t stride = screen_pitch / 4;
-    uint32_t total_pixels = screen_width * screen_height;
-
-    for (uint32_t i = 0; i < total_pixels; i++) {
-        //back_buffer[i] = saved_console_buffer[i];
-    }
     cursor_x = saved_cursor_x;
     cursor_y = saved_cursor_y;
     total_scrolled_px = saved_total_scrolled_px;
@@ -114,11 +116,7 @@ void console_restore_state(void) {
 
     current_bg_color = 0x000000;
 
-    for (int y = 0; y < screen_height; y++) {
-        for (int x = 0; x < screen_width; x++) {
-            lfb[y * stride + x] = back_buffer[y * screen_width + x];
-        }
-    }
+    flush_buffer();
     console_is_saved = 0;
 }
 
@@ -136,6 +134,7 @@ extern volatile int g_user_mode_active;
 extern void return_from_user_mode(int exit_code);
 extern uint64_t* vmm_get_kernel_pml4_phys(void);
 extern void timer_isr_asm(void);
+extern int prog_load_module(const char* filename, const char* args);
 
 #define MAX_INPUT 256
 extern char input_buffer[MAX_INPUT];
@@ -286,60 +285,94 @@ void wait_vsync(void) {
     while ((inb(0x3DA) & 0x08) == 0);
 }
 
+// ---------- быстрые примитивы копирования/заливки (счётчик в ПИКСЕЛЯХ) ----------
+static inline void copy32(void* d, const void* s, size_t n) {
+    size_t q = n >> 1;
+    __asm__ volatile ("rep movsq" : "+D"(d), "+S"(s), "+c"(q) :: "memory");
+    if (n & 1) *(uint32_t*)d = *(const uint32_t*)s;
+}
+
+static inline void fill32(void* d, uint32_t v, size_t n) {
+    uint64_t v2 = ((uint64_t)v << 32) | v;
+    size_t q = n >> 1;
+    __asm__ volatile ("rep stosq" : "+D"(d), "+c"(q) : "a"(v2) : "memory");
+    if (n & 1) *(uint32_t*)d = v;
+}
+
+// ---------- dirty rectangle: что изменилось с прошлого сброса в LFB (пусто, если x0 >= x1) ----------
+static int dirty_x0, dirty_y0, dirty_x1, dirty_y1;
+
+static inline void dirty_reset(void) { dirty_x0 = dirty_y0 = dirty_x1 = dirty_y1 = 0; }
+
+static inline void mark_dirty(int x0, int y0, int x1, int y1) {
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > screen_width)  x1 = screen_width;
+    if (y1 > screen_height) y1 = screen_height;
+    if (x0 >= x1 || y0 >= y1) return;
+    if (dirty_x0 >= dirty_x1) {
+        dirty_x0 = x0; dirty_y0 = y0; dirty_x1 = x1; dirty_y1 = y1;
+        return;
+    }
+    if (x0 < dirty_x0) dirty_x0 = x0;
+    if (y0 < dirty_y0) dirty_y0 = y0;
+    if (x1 > dirty_x1) dirty_x1 = x1;
+    if (y1 > dirty_y1) dirty_y1 = y1;
+}
+
+void gfx_mark_all_dirty(void) { mark_dirty(0, 0, screen_width, screen_height); }
+
+// Полный сброс буфера в LFB. Рисует ВСЁ — безопасен для кода, который пишет
+// в current_draw_buffer напрямую (put_pixel, модули, desktop).
 void flush_buffer(void) {
     uint8_t* lfb_bytes = (uint8_t*)lfb;
+    const size_t w = screen_width;
 
     if (scroll_offset_px == 0) {
-        if (screen_pitch == screen_width * sizeof(uint32_t)) {
-            uint64_t* dst = (uint64_t*)lfb_bytes;
-            const uint64_t* src = (const uint64_t*)current_draw_buffer;
-            size_t qwords = ((size_t)screen_width * screen_height) / 2;
-
-            __asm__ volatile (
-                "rep movsq"
-                : "+D"(dst), "+S"(src), "+c"(qwords)
-                :
-                : "memory"
-            );
-            // Сбрасываем буферы записи в PCIe
-            __asm__ volatile ("sfence" ::: "memory");
-            return;
+        if (screen_pitch == w * sizeof(uint32_t)) {
+            copy32(lfb_bytes, current_draw_buffer, w * screen_height);
+        } else {
+            for (int y = 0; y < screen_height; y++)
+                copy32(lfb_bytes + (size_t)y * screen_pitch, &current_draw_buffer[y * w], w);
         }
-
-        size_t qwords_per_line = ((size_t)screen_width * sizeof(uint32_t)) / 8;
-        for (int y = 0; y < screen_height; y++) {
-            uint64_t* dst = (uint64_t*)(lfb_bytes + (y * (uint32_t)screen_pitch));
-            const uint64_t* src = (const uint64_t*)(&current_draw_buffer[y * screen_width]);
-
-            __asm__ volatile (
-                "rep movsq"
-                : "+D"(dst), "+S"(src), "+c"(qwords_per_line)
-                :
-                : "memory"
-            );
-        }
-        __asm__ volatile ("sfence" ::: "memory");
     } else {
+        // Просмотр истории: копируем целыми строками, а не по пикселю
         int virtual_y = total_scrolled_px - scroll_offset_px;
         for (int y = 0; y < screen_height; y++) {
             int src_y = virtual_y + y;
-            volatile uint32_t* dst = (volatile uint32_t*)(lfb_bytes + (y * (uint32_t)screen_pitch));
-            for (int x = 0; x < screen_width; x++) {
-                uint32_t color = 0x000000;
-                if (src_y >= 0 && src_y < total_scrolled_px) {
-                    int hist_y = src_y % HIST_HEIGHT;
-                    color = screen_history[hist_y * MAX_SCREEN_WIDTH + x];
-                } else if (src_y >= total_scrolled_px) {
-                    int back_y = src_y - total_scrolled_px;
-                    if (back_y < screen_height) {
-                        color = current_draw_buffer[back_y * screen_width + x];
-                    }
-                }
-                dst[x] = color;
+            void* dst = lfb_bytes + (size_t)y * screen_pitch;
+            if (src_y >= 0 && src_y < total_scrolled_px) {
+                copy32(dst, &screen_history[(src_y % HIST_HEIGHT) * MAX_SCREEN_WIDTH], w);
+            } else if (src_y >= total_scrolled_px && (src_y - total_scrolled_px) < screen_height) {
+                copy32(dst, &current_draw_buffer[(src_y - total_scrolled_px) * w], w);
+            } else {
+                fill32(dst, 0, w);
             }
         }
-        __asm__ volatile ("sfence" ::: "memory");
     }
+    __asm__ volatile ("sfence" ::: "memory");
+    dirty_reset();
+    g_lfb_gen++;
+}
+
+// Сброс только изменённого прямоугольника (консоль: символ = 8x16, курсор = 8x2)
+void flush_dirty(void) {
+    if (dirty_x0 >= dirty_x1) return;
+    if (scroll_offset_px != 0) { flush_buffer(); return; }
+
+    int x0 = dirty_x0, y0 = dirty_y0, x1 = dirty_x1, y1 = dirty_y1;
+    dirty_reset();
+
+    size_t n = (size_t)(x1 - x0);
+    uint8_t* dst = (uint8_t*)lfb + (size_t)y0 * screen_pitch + (size_t)x0 * 4;
+    const uint32_t* src = current_draw_buffer + (size_t)y0 * screen_width + x0;
+    for (int y = y0; y < y1; y++) {
+        copy32(dst, src, n);
+        dst += screen_pitch;
+        src += screen_width;
+    }
+    __asm__ volatile ("sfence" ::: "memory");
+    g_lfb_gen++;
 }
 
 void put_pixel(int x, int y, uint32_t color) {
@@ -347,46 +380,46 @@ void put_pixel(int x, int y, uint32_t color) {
     current_draw_buffer[y * screen_width + x] = color;
 }
 
+void fill_rect(int x, int y, int w, int h, uint32_t color) {
+    int x1 = x + w, y1 = y + h;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x1 > screen_width)  x1 = screen_width;
+    if (y1 > screen_height) y1 = screen_height;
+    if (x >= x1 || y >= y1) return;
+    uint32_t* row = current_draw_buffer + (size_t)y * screen_width + x;
+    for (int yy = y; yy < y1; yy++, row += screen_width)
+        fill32(row, color, (size_t)(x1 - x));
+    mark_dirty(x, y, x1, y1);
+}
+
 void draw_cursor(uint32_t color) {
-    for (int row = 14; row < 16; row++) {
-        for (int col = 0; col < 8; col++) {
-            put_pixel(cursor_x + col, cursor_y + row, color);
-        }
-    }
+    fill_rect(cursor_x, cursor_y + 14, 8, 2, color);
 }
 
 void clear_screen(uint32_t color) {
     current_bg_color = color;
-    uint32_t total_pixels = (uint32_t)screen_width * screen_height;
-    for (uint32_t i = 0; i < total_pixels; i++) {
-        current_draw_buffer[i] = color;
-    }
+    fill32(current_draw_buffer, color, (size_t)screen_width * screen_height);
     cursor_x = 0;
     cursor_y = 0;
     total_scrolled_px = 0;
     scroll_offset_px = 0;
+    gfx_mark_all_dirty();
 }
 
 void scroll_screen(void) {
+    const size_t w = screen_width;
     for (int y = 0; y < 16; y++) {
         int hist_y = (total_scrolled_px + y) % HIST_HEIGHT;
-        for (int x = 0; x < screen_width; x++) {
-            screen_history[hist_y * MAX_SCREEN_WIDTH + x] = current_draw_buffer[y * screen_width + x];
-        }
+        copy32(&screen_history[hist_y * MAX_SCREEN_WIDTH], &current_draw_buffer[y * w], w);
     }
     total_scrolled_px += 16;
 
-    for (int y = 0; y < screen_height - 16; y++) {
-        for (int x = 0; x < screen_width; x++) {
-            current_draw_buffer[y * screen_width + x] = current_draw_buffer[(y + 16) * screen_width + x];
-        }
-    }
-    for (int y = screen_height - 16; y < screen_height; y++) {
-        for (int x = 0; x < screen_width; x++) {
-            current_draw_buffer[y * screen_width + x] = current_bg_color;
-        }
-    }
+    // один непрерывный сдвиг вверх (dst < src, прямой rep movs корректен)
+    copy32(current_draw_buffer, current_draw_buffer + 16 * w, (size_t)(screen_height - 16) * w);
+    fill32(current_draw_buffer + (size_t)(screen_height - 16) * w, current_bg_color, 16 * w);
     cursor_y -= 16;
+    gfx_mark_all_dirty();
 }
 
 static uint8_t utf8_to_cp866(uint8_t b1, uint8_t b2) {
@@ -401,20 +434,41 @@ static uint8_t utf8_to_cp866(uint8_t b1, uint8_t b2) {
     return '?';
 }
 
-// Отрисовка символа с возможностью прозрачного фона
+// Отрисовка символа с возможностью прозрачного фона (быстрый путь без проверок на каждый пиксель)
 void draw_char_ex(int start_x, int start_y, char c, uint32_t color, int opaque) {
     unsigned char uc = (unsigned char)c;
     const uint8_t* glyph = &fontdata_ru_8x16[uc * 16];
-    for (int row = 0; row < 16; row++) {
-        uint8_t bits = glyph[row];
-        for (int col = 0; col < 8; col++) {
-            if (bits & (0x80 >> col)) {
-                put_pixel(start_x + col, start_y + row, color);
-            } else if (opaque) {
-                put_pixel(start_x + col, start_y + row, current_bg_color);
+
+    if (start_x < 0 || start_y < 0 ||
+        start_x + 8 > screen_width || start_y + 16 > screen_height) {
+        // редкий случай: символ на краю экрана — медленный путь с клиппингом
+        for (int row = 0; row < 16; row++) {
+            uint8_t bits = glyph[row];
+            for (int col = 0; col < 8; col++) {
+                if (bits & (0x80 >> col)) {
+                    put_pixel(start_x + col, start_y + row, color);
+                } else if (opaque) {
+                    put_pixel(start_x + col, start_y + row, current_bg_color);
+                }
             }
         }
+        mark_dirty(start_x, start_y, start_x + 8, start_y + 16);
+        return;
     }
+
+    uint32_t* d = current_draw_buffer + (size_t)start_y * screen_width + start_x;
+    const uint32_t bg = current_bg_color;
+    for (int row = 0; row < 16; row++, d += screen_width) {
+        unsigned bits = glyph[row];
+        if (opaque) {
+#pragma GCC unroll 8
+            for (int i = 0; i < 8; i++) d[i] = (bits & (0x80u >> i)) ? color : bg;
+        } else {
+#pragma GCC unroll 8
+            for (int i = 0; i < 8; i++) if (bits & (0x80u >> i)) d[i] = color;
+        }
+    }
+    mark_dirty(start_x, start_y, start_x + 8, start_y + 16);
 }
 
 // Стандартный draw_char (непрозрачный для консоли)
@@ -480,11 +534,7 @@ void kputc(char c, uint32_t color) {
     if (uc == '\b') {
         if (cursor_x >= 8) {
             cursor_x -= 8;
-            for (int dy = 0; dy < 16; dy++) {
-                for (int dx = 0; dx < 8; dx++) {
-                    put_pixel(cursor_x + dx, cursor_y + dy, current_bg_color);
-                }
-            }
+            fill_rect(cursor_x, cursor_y, 8, 16, current_bg_color);
             draw_cursor(0xFFFFFF);
         }
         return;
@@ -533,7 +583,7 @@ void print_prompt(void) {
     kputs("root@" OS_LOWER_NAME ":", 0x55FF55);
     kputs(current_path, 0x55FFFF);
     kputs("$ ", 0xFFFFFF);
-    flush_buffer();
+    flush_dirty();
 }
 
 int strcmp(const char* s1, const char* s2) {
@@ -1243,6 +1293,41 @@ float get_uptime_seconds(void) {
     return (float)timer_ticks / 1000.0f;
 }
 
+void check_and_run_autostart(void) {
+    fs_file_info_t auto_files[16];
+    fs_lock();
+    int count = fs_get_dir_files("/autostart", auto_files, 16);
+    fs_unlock();
+
+    if (count <= 0) return;
+
+    for (int i = 0; i < count; i++) {
+        // Пропускаем директории
+        if (auto_files[i].attr & 0x10) continue;
+
+        const char* fn = auto_files[i].name;
+        int len = 0;
+        while (fn[len]) len++;
+
+        // Проверяем расширение .prg / .PRG
+        if (len > 4 && (fn[len-4] == '.' &&
+           (fn[len-3] == 'p' || fn[len-3] == 'P') &&
+           (fn[len-2] == 'r' || fn[len-2] == 'R') &&
+           (fn[len-1] == 'g' || fn[len-1] == 'G'))) {
+
+            char path[64] = "/autostart/";
+            int p = 11;
+            for (int k = 0; fn[k] && p < 63; k++) {
+                path[p++] = fn[k];
+            }
+            path[p] = '\0';
+
+            // Запускаем программу в графическом/пользовательском режиме
+            prog_load_module(path, 0);
+        }
+    }
+}
+
 void kernel_main(void) {
     vbe_info_t* vbe = (vbe_info_t*)(uintptr_t)0x8000;
 
@@ -1293,7 +1378,6 @@ void kernel_main(void) {
     //init_crash_guard_idt();
 
     init_mc_monitor();
-    clear_screen(0x000000);
 
     kernel_system_bootstrap();
 
@@ -1319,14 +1403,16 @@ void kernel_main(void) {
         ps2_hw_service();   // клавиатура: единый читатель, раскладывает по очередям TTY + ловит Ctrl+C
         update_mouse_state();
 
-        sleep_ms(10);
+        sleep_ms(2);   // чаще опрашиваем PS/2: мышь не должна ждать 10 мс на каждый пакет
 
         if ((timer_ticks - last_blink) >= 500) {
             cursor_visible = !cursor_visible;
             tty_t* at = tty_get(tty_get_active_id());
-            if (!(at && at->gfx_mode)) {   // если экраном владеет модуль - курсор консоли не трогаем
+            // экраном владеет модуль (gfx_mode) или программа пишет кадры в /dev/fb0 — курсор консоли не трогаем
+            int fb_busy = (g_fb_write_tty == tty_get_active_id()) && ((timer_ticks - g_fb_last_write_tick) < 2000);
+            if (!(at && at->gfx_mode) && !fb_busy) {
                 draw_cursor(cursor_visible ? 0xFFFFFF : current_bg_color);
-                flush_buffer();
+                flush_dirty();
             }
             last_blink = timer_ticks;
         }

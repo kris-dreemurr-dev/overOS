@@ -4,6 +4,7 @@
 #include "../kernel/sched.h"
 
 extern void kputs(const char* str, uint32_t color);
+extern int  strcmp(const char* s1, const char* s2);
 
 static file_descriptor_t g_fd_pool[MAX_GLOBAL_FDS];
 static vfs_node_t        g_fat32_nodes[MAX_VFS_NODES];
@@ -83,32 +84,30 @@ vfs_node_t* vfs_resolve_path(const char* path) {
     const char* p = path;
     if (p[0] == '/') p++;
 
-    // 1. Маршрутизация в devfs
+    // 1. Устройства /dev/
     if (kstrncmp(p, "dev/", 4) == 0) {
         return devfs_get_node(p + 4);
     }
 
-    // 2. Маршрутизация в смонтированную FAT32
+    // 2. Для FAT32 проверяем абсолютный путь (с сохранением '/')
     fs_lock();
-    int exists = fs_file_exists(p);
+    int exists = fs_file_exists(path);
+    if (!exists && p != path) {
+        exists = fs_file_exists(p);
+    }
     fs_unlock();
 
     if (!exists) return NULL;
 
-    // Ищем узел в пуле или регистрируем новый
     for (int i = 0; i < g_fat32_node_count; i++) {
-        const char* n1 = g_fat32_nodes[i].name;
-        const char* n2 = p;
-        int match = 1;
-        while (*n1 && *n2) {
-            if (*n1++ != *n2++) { match = 0; break; }
+        if (strcmp(g_fat32_nodes[i].name, path) == 0) {
+            return &g_fat32_nodes[i];
         }
-        if (match && *n1 == *n2) return &g_fat32_nodes[i];
     }
 
     if (g_fat32_node_count < MAX_VFS_NODES) {
         vfs_node_t* node = &g_fat32_nodes[g_fat32_node_count++];
-        kstrncpy(node->name, p, sizeof(node->name));
+        kstrncpy(node->name, path, sizeof(node->name));
         node->type = VFS_FILE;
         node->ops = &g_fat32_ops;
         node->size = 0;
@@ -159,13 +158,12 @@ int vfs_sys_open(const char* path, uint32_t flags) {
 
     // Если файла еще нет, но мы открываем его на запись — создаем через fs_touch
     if (!node && (flags & (O_WRONLY | O_RDWR | O_CREAT))) {
+        // В виртуальном каталоге /dev файлы создавать нельзя
         const char* p = path;
         if (p[0] == '/') p++;
-
-        // В виртуальном каталоге /dev файлы создавать нельзя
         if (kstrncmp(p, "dev/", 4) != 0) {
             fs_lock();
-            int created = fs_touch(p);
+            int created = fs_touch(path); // Передаем полный путь path!
             fs_unlock();
 
             if (created) {

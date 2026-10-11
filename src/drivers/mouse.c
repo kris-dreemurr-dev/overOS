@@ -22,8 +22,22 @@ static int g_last_dx = 0;
 static int g_last_dy = 0;
 static uint8_t g_mouse_btn = 0;
 
+// Накопленное движение с момента последнего чтения get_mouse_delta() (для mouselook в играх).
+// В отличие от g_mouse_x/y, не упирается в края экрана.
+static int g_accum_dx = 0;
+static int g_accum_dy = 0;
+
 static uint8_t g_packet[3];
 static uint8_t g_cycle = 0;
+
+static inline uint64_t mouse_irq_save(void) {
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    return flags;
+}
+static inline void mouse_irq_restore(uint64_t flags) {
+    __asm__ volatile ("pushq %0; popfq" :: "r"(flags) : "memory", "cc");
+}
 
 static void mouse_wait(uint8_t type) {
     uint32_t timeout = 100000;
@@ -108,6 +122,16 @@ void mouse_feed_byte(uint8_t byte) {
         g_last_dx = dx;
         g_last_dy = dy;
 
+        // Копим дельты атомарно: читатель (syscall игры) может прервать нас таймером
+        uint64_t fl = mouse_irq_save();
+        g_accum_dx += dx;
+        g_accum_dy += dy;
+        if (g_accum_dx >  100000) g_accum_dx =  100000;
+        if (g_accum_dx < -100000) g_accum_dx = -100000;
+        if (g_accum_dy >  100000) g_accum_dy =  100000;
+        if (g_accum_dy < -100000) g_accum_dy = -100000;
+        mouse_irq_restore(fl);
+
         g_mouse_x += dx;
         g_mouse_y += dy;
 
@@ -130,6 +154,19 @@ int get_mouse_x(void)   { return g_mouse_x; }
 int get_mouse_y(void)   { return g_mouse_y; }
 int get_mouse_btn(void) { return g_mouse_btn & 0x01; }
 uint8_t get_mouse_buttons_raw(void) { return g_mouse_btn; }
+
+// Движение мыши (экранные координаты: вправо +, вниз +) накопленное с прошлого вызова,
+// и текущие кнопки (бит0 ЛКМ, бит1 ПКМ, бит2 СКМ). После вызова накопитель обнуляется.
+void get_mouse_delta(int* dx, int* dy, uint8_t* buttons) {
+    uint64_t fl = mouse_irq_save();
+    int ax = g_accum_dx, ay = g_accum_dy;
+    g_accum_dx = 0;
+    g_accum_dy = 0;
+    mouse_irq_restore(fl);
+    if (dx) *dx = ax;
+    if (dy) *dy = ay;
+    if (buttons) *buttons = g_mouse_btn;
+}
 
 int get_mouse_last_dx(void) { return g_last_dx; }
 int get_mouse_last_dy(void) { return g_last_dy; }

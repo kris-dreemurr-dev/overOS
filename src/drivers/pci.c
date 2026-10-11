@@ -103,6 +103,54 @@ void pci_scan_all(void) {
                     kdebug("  BAR0: ", 0xAAAAAA);
                     print_hex(bar0 & ~0xF, 0x55FF55);
                     kdebug("\n\n", 0);
+                } else if (base_class == 0x02) {
+                    kdebug("[PCI] Found Network Controller:\n", 0x55FF55);
+                    kdebug("  Bus: ", 0xAAAAAA); print_num(bus, 0xFFFFFF);
+                    kdebug(" | Slot: ", 0xAAAAAA); print_num(slot, 0xFFFFFF);
+                    kdebug(" | Func: ", 0xAAAAAA); print_num(func, 0xFFFFFF);
+
+                    kdebug("\n  Category: ", 0xAAAAAA);
+                    if (subclass == 0x00) {
+                        kdebug("Ethernet Controller (Wired LAN)\n", 0x55FFFF);
+                    } else if (subclass == 0x80) {
+                        kdebug("Wireless / Network Controller (Wi-Fi)\n", 0xFFFF55);
+                    } else {
+                        kdebug("Other Network Device (Subclass ", 0xAAAAAA);
+                        print_hex(subclass, 0xFFFFFF);
+                        kdebug(")\n", 0);
+                    }
+
+                    // Выводим Vendor ID и Device ID
+                    kdebug("  Hardware ID: [", 0xAAAAAA);
+                    print_hex(vendor_id, 0x55FF55);
+                    kdebug(":", 0xAAAAAA);
+                    print_hex((vendor_device >> 16) & 0xFFFF, 0x55FF55);
+                    kdebug("] ", 0);
+
+                    // Расшифровка ключевых сетевых вендоров
+                    if (vendor_id == 0x8086)      kdebug("(Intel Corporation)\n", 0x55FFFF);
+                    else if (vendor_id == 0x10EC) kdebug("(Realtek Semiconductor)\n", 0x55FFFF);
+                    else if (vendor_id == 0x14E4) kdebug("(Broadcom)\n", 0x55FFFF);
+                    else if (vendor_id == 0x168C) kdebug("(Qualcomm Atheros)\n", 0x55FFFF);
+                    else if (vendor_id == 0x1969) kdebug("(Atheros / Killer LAN)\n", 0x55FFFF);
+                    else                          kdebug("(Unknown Vendor)\n", 0xAAAAAA);
+
+                    // Проверяем тип BAR0: бит 0 = 1 -> Port I/O, бит 0 = 0 -> MMIO
+                    kdebug("  BAR0: ", 0xAAAAAA);
+                    if (bar0 & 1) {
+                        kdebug("I/O Port ", 0xFFFF55);
+                        print_hex(bar0 & ~0x3, 0xFFFFFF);
+                    } else {
+                        kdebug("MMIO ", 0x55FF55);
+                        print_hex(bar0 & ~0xF, 0xFFFFFF);
+                    }
+
+                    // Читаем IRQ из PCI Config Space (смещение 0x3C: байт 0 — Interrupt Line)
+                    uint32_t intr = pci_config_read(bus, slot, func, 0x3C);
+                    uint8_t irq_line = intr & 0xFF;
+                    kdebug(" | IRQ: ", 0xAAAAAA);
+                    print_num(irq_line, 0xFFFFFF);
+                    kdebug("\n\n", 0);
                 }
             }
         }

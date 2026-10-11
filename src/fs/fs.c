@@ -106,10 +106,11 @@ int fs_is_mounted(void) {
 #endif
 }
 
-int fs_get_dir_files(fs_file_info_t* out_list, int max_files) {
+int fs_get_dir_files(const char* path, fs_file_info_t* out_list, int max_files) {
 #if USE_FAT32
-    return fat32_get_dir_files(out_list, max_files);
+    return fat32_get_dir_files(path, out_list, max_files);
 #else
+    (void)path;
     return fat16_get_dir_files((fat16_file_info_t*)out_list, max_files);
 #endif
 }

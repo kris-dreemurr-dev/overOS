@@ -17,6 +17,7 @@ extern char      input_buffer[];
 extern int       input_len;
 extern void      keyboard_poll_handler(void);
 extern char      current_path[128];
+extern void      check_and_run_autostart(void);
 
 extern void clear_screen(uint32_t color);
 extern void print_prompt(void);
@@ -228,6 +229,9 @@ static void tty_shell_loop(void) {
 
 void tty1_task_entry(void) {
     clear_screen(0x000000);
+
+    check_and_run_autostart();
+    
     print_tty_banner(0);
     print_prompt();
     flush_buffer();

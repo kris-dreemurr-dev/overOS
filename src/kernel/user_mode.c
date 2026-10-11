@@ -2,12 +2,69 @@
 #include "../fs/fs.h"
 #include "sched.h"
 #include "../drivers/mouse.h"
+#include "../drivers/ethernet.h"
 #include "../memory/vmm.h"
 #include "../memory/pmm.h"
 #include "prog_loader.h"
 #include "tty.h"
 #include "../fs/vfs.h"
 #include "../fs/devfs.h"
+#include "win_proto.h"
+#include "config.h"
+
+// Реестр окон ядра
+static kernel_window_t g_windows[MAX_SYS_WINDOWS];
+static int             g_window_count = 0;
+static int             g_next_win_id = 1;
+
+// --- Поверхности окон и очереди событий (оконный сервер) ---
+#ifndef WEV_MOUSE_DOWN
+typedef struct {
+    int type;        // WEV_*
+    int x, y;        // координаты внутри клиентской области окна
+    int buttons;
+    int key;         // скан-код для WEV_KEY
+} win_event_t;
+#define WEV_MOUSE_DOWN 1
+#define WEV_MOUSE_UP   2
+#define WEV_KEY        3
+#endif
+
+#define WIN_EV_QUEUE 32
+
+typedef struct {
+    uint8_t*    surf;        // виртуальный адрес поверхности (w*h*4 байт)
+    uint64_t    surf_phys;   // физический адрес (для освобождения)
+    uint32_t    surf_pages;
+    uint32_t    seq;         // растёт при каждом sys_win_present
+    win_event_t ev[WIN_EV_QUEUE];
+    uint32_t    ev_head, ev_tail;
+} win_priv_t;
+
+static win_priv_t g_wpriv[MAX_SYS_WINDOWS];   // индекс совпадает с g_windows[]
+
+// В ядре нет libc: при -ffreestanding GCC всё равно превращает циклы копирования/зануления
+// и копии крупных структур в вызовы memcpy/memset, которых при линковке нет
+// ("undefined reference to memcpy"). Поэтому все массовые операции — через rep movsb/stosb.
+static inline void wm_copy(void* dst, const void* src, uint64_t bytes) {
+    __asm__ volatile ("rep movsb" : "+D"(dst), "+S"(src), "+c"(bytes) : : "memory");
+}
+static inline void wm_zero(void* dst, uint64_t bytes) {
+    __asm__ volatile ("rep stosb" : "+D"(dst), "+c"(bytes) : "a"(0) : "memory");
+}
+
+static int wm_index_by_id(int id) {
+    for (int i = 0; i < g_window_count; i++)
+        if (g_windows[i].id == id) return i;
+    return -1;
+}
+
+static void wm_free_priv(int i) {
+    for (uint32_t k = 0; k < g_wpriv[i].surf_pages; k++)
+        pmm_free_page((void*)(g_wpriv[i].surf_phys + (uint64_t)k * 4096));
+    g_wpriv[i].surf_pages = 0;
+    g_wpriv[i].surf = 0;
+}
 
 
 extern void     kputs(const char* str, uint32_t color);
@@ -15,6 +72,7 @@ extern int      strcmp(const char* s1, const char* s2);
 extern void     put_pixel(int x, int y, uint32_t color);
 extern void     clear_screen(uint32_t color);
 extern void     flush_buffer(void);
+extern void     flush_dirty(void);
 extern void     update_mouse_state(void);
 extern void     sleep_ms(uint32_t ms);
 extern void     get_mouse_delta(int* out_dx, int* out_dy, uint8_t* out_buttons);
@@ -22,14 +80,53 @@ extern uint8_t  inb(uint16_t port);
 extern int      get_mouse_x(void);
 extern int      get_mouse_y(void);
 extern int      get_mouse_btn(void);
+extern void     sys_reboot(void);
+extern void     acpi_power_off(void);
 extern void     itoa(int n, char* str);
 extern uint16_t screen_width;
 extern uint16_t screen_height;
 extern void*    lfb;
-extern uint32_t screen_pitch;
+extern uint16_t screen_pitch;   // в kernel.c это uint16_t
+extern volatile uint32_t g_lfb_gen;   // +1 при каждой записи в LFB не через /dev/fb0 (см. devfs.c)
+extern volatile uint32_t g_fb_last_write_tick;   // "программа сейчас выводит кадры" (см. keyboard.c, kernel.c)
+extern volatile int      g_fb_write_tty;
 extern uint32_t back_buffer[];
 extern uint64_t g_tsc_per_ms;
 extern uint32_t timer_ticks;
+
+// Чтение исполняемого файла с поддержкой полных путей (например "/desprogs/overfiles.prg")
+static int kernel_read_file_by_path(const char* path, uint8_t* buf, uint32_t max_size) {
+
+    if (!path || !path[0]) return -1;
+
+    fs_go_root();
+
+    const char* p = path;
+    if (p[0] == '/') p++;
+
+    // Ищем последний слэш
+    const char* last_slash = 0;
+    for (const char* s = p; *s; s++) {
+        if (*s == '/') last_slash = s;
+    }
+
+    if (last_slash) {
+        char dir_name[64];
+        int dlen = (int)(last_slash - p);
+        if (dlen >= (int)sizeof(dir_name)) dlen = sizeof(dir_name) - 1;
+        for (int i = 0; i < dlen; i++) dir_name[i] = p[i];
+        dir_name[dlen] = '\0';
+
+        fs_change_dir(dir_name);
+        int bytes = fs_read_file(last_slash + 1, buf, max_size);
+        fs_go_root();
+        return bytes;
+    } else {
+        int bytes = fs_read_file(p, buf, max_size);
+        fs_go_root();
+        return bytes;
+    }
+}
 
 static uint32_t now_ms(void) {
     if (!g_tsc_per_ms) return timer_ticks;
@@ -66,13 +163,6 @@ static tss_entry_t   tss;
 
 static uint32_t g_doom_palette[256];
 
-// Относительные дельты мыши для get_mouse() (case 7): считаем их диффом от
-// абсолютной позиции mouse.c (get_mouse_x/y), а не из собственного разбора
-// пакетов — порт 0x60/0x64 читает только ps2_hw_service() (keyboard.c), вызывается
-// безусловно из простоя kernel_main. Клавиатура для .prg идёт через очередь
-// своего TTY (tty_kbd_pop), её туда раскладывает тот же ps2_hw_service.
-// NB: case 23 (get_mouse_delta) — отдельный, более старый путь опроса мыши,
-// я его не трогаю, не видя mouse.c целиком.
 static int g_mouse_last_init = 0;
 static int g_mouse_last_x = 0, g_mouse_last_y = 0;
 
@@ -97,6 +187,82 @@ static void str_to_fat83(const char* in, char* out83) {
 
 static void fork_child_resume(void);   // определена ниже, нужна форвард-декларация для case 30
 
+// Растяжка кадра 320x200 -> экран (sys_blit_frame). Таблица X строится один раз на разрешение.
+static uint16_t blit_xmap[1920];
+static uint32_t blit_xmap_w = 0;
+
+static void blit_320x200_scaled(const uint32_t* user_fb, uint32_t* dst_buf) {
+    const uint32_t W = screen_width, H = screen_height;
+
+    if (blit_xmap_w != W) {
+        uint32_t step = (320u << 16) / W, fp = 0;
+        for (uint32_t x = 0; x < W; x++, fp += step) {
+            uint32_t sx = fp >> 16;
+            blit_xmap[x] = (uint16_t)(sx > 319 ? 319 : sx);
+        }
+        blit_xmap_w = W;
+    }
+
+    uint32_t step_y = (200u << 16) / H, y_fp = 0, prev_sy = 0xFFFFFFFFu;
+    uint32_t* prev_row = 0;
+    for (uint32_t y = 0; y < H; y++, y_fp += step_y) {
+        uint32_t sy = y_fp >> 16;
+        if (sy > 199) sy = 199;
+        uint32_t* dst_row = dst_buf + (size_t)y * W;
+        if (sy == prev_sy) {   // та же исходная строка: копируем готовую
+            uint32_t* d = dst_row; const uint32_t* sp = prev_row; uint64_t n = W >> 1;
+            __asm__ volatile ("rep movsq" : "+D"(d), "+S"(sp), "+c"(n) :: "memory");
+            if (W & 1) *d = *sp;
+        } else {
+            const uint32_t* src_row = user_fb + sy * 320;
+            for (uint32_t x = 0; x < W; x++) dst_row[x] = src_row[blit_xmap[x]];
+        }
+        prev_sy = sy;
+        prev_row = dst_row;
+    }
+}
+
+// 1 = растягивать кадр прямо в LFB построчно (через маленький буфер в L1-кэше), минуя буфер TTY:
+//     нет записи 6 МБ в RAM и повторного чтения их же при flush_buffer().
+// 0 = старый путь: растяжка в буфер TTY + flush_buffer() (если что-то читает буфер TTY как "экран").
+#define BLIT_DIRECT_TO_LFB 1
+
+static uint32_t blit_row[1920] __attribute__((aligned(64)));   // одна растянутая строка
+
+static void blit_320x200_to_lfb(const uint32_t* user_fb) {
+    const uint32_t W = screen_width, H = screen_height;
+    uint8_t* lfb8 = (uint8_t*)lfb;
+    if (W > 1920) return;   // размер blit_row / blit_xmap
+
+    if (blit_xmap_w != W) {
+        uint32_t step = (320u << 16) / W, fp = 0;
+        for (uint32_t x = 0; x < W; x++, fp += step) {
+            uint32_t sx = fp >> 16;
+            blit_xmap[x] = (uint16_t)(sx > 319 ? 319 : sx);
+        }
+        blit_xmap_w = W;
+    }
+
+    uint32_t step_y = (200u << 16) / H, y_fp = 0, prev_sy = 0xFFFFFFFFu;
+    for (uint32_t y = 0; y < H; y++, y_fp += step_y) {
+        uint32_t sy = y_fp >> 16;
+        if (sy > 199) sy = 199;
+        if (sy != prev_sy) {   // новая исходная строка: растягиваем по X в L1-кэше
+            const uint32_t* src_row = user_fb + sy * 320;
+            for (uint32_t x = 0; x < W; x++) blit_row[x] = src_row[blit_xmap[x]];
+            prev_sy = sy;
+        }
+        // одна и та же готовая строка уходит в LFB столько раз, сколько нужно по вертикали
+        void* d = lfb8 + (size_t)y * screen_pitch;
+        const void* sp = blit_row;
+        uint64_t n = W >> 1;
+        __asm__ volatile ("rep movsq" : "+D"(d), "+S"(sp), "+c"(n) :: "memory");
+        if (W & 1) *(uint32_t*)d = *(const uint32_t*)sp;
+    }
+    __asm__ volatile ("sfence" ::: "memory");
+    g_lfb_gen++;   // копия экрана в devfs.c (/dev/fb0) теперь устарела
+}
+
 // frame указывает на 20 слотов (160 байт), которые syscall_isr_stub сохранил на стеке:
 // frame[0..13]  = r15,r14,r13,r12,r11,r10,r9,r8,rdi,rsi,rdx,rcx,rbx,rax
 // frame[14]     = rbp вызывающего
@@ -110,20 +276,23 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
 
     switch (num) {
         case 0: // exit(code)
-            kputs("\n>>> [KERNEL 64] Syscall 0 (exit) received! Code: ", 0x55FF55);
-            char ebuf[16];
-            itoa((int)arg1, ebuf);
-            kputs(ebuf, 0xFFFFFF);
-            flush_buffer();
-            // Настоящий процесс: становится ZOMBIE, будит родителя (wait) и не возвращается
+            // Печатаем в консоль только если НЕ включен графический режим
+            tty_t* cur_tty = (caller && caller->tty_id >= 0) ? tty_get(caller->tty_id) : NULL;
+            if (cur_tty && !cur_tty->gfx_mode) {
+                kputs("\n>>> [KERNEL 64] Syscall 0 (exit) received! Code: ", 0x55FF55);
+                char ebuf[16];
+                itoa((int)arg1, ebuf);
+                kputs(ebuf, 0xFFFFFF);
+                kputs("\n", 0x55FF55);
+                flush_buffer();
+            }
             if (caller && caller->is_process) sched_exit_current((int)arg1);
-            // Старый путь (run_in_user_mode): возврат в оболочку через saved_kernel_rsp
-            kernel_exit_code = arg1; // Сохраняем код выхода в глобальную переменную
+            kernel_exit_code = arg1;
             return arg1;
 
         case 1: // print(str, color)
             kputs((const char*)arg1, (uint32_t)(arg2 ? arg2 : 0x00FFFFFF));
-            flush_buffer();
+            flush_dirty();
             return 0;
 
         case 2: // put_pixel(x, y, color)
@@ -134,9 +303,12 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
             flush_buffer();
             return 0;
 
-        case 4: // sleep(ms)
+        case 4: { // sleep(ms)
+            __asm__ volatile("sti");
             sleep_ms((uint32_t)arg1);
+            __asm__ volatile("cli");
             return 0;
+        }
 
         case 5: // clear(color)
             clear_screen((uint32_t)arg1);
@@ -215,6 +387,35 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
             ut->year = y;
             return 1;
         }
+        case 9: { // sys_get_kernel_info(kernel_info_t* out)
+            if (!arg1) return (uint64_t)-1;
+
+            typedef struct {
+                char name[32];
+                char arch[16];
+                char version[32];
+            } __attribute__((packed)) kinfo_t;
+
+            kinfo_t* k = (kinfo_t*)arg1;
+
+            // Копируем данные из src/kernel/config.h
+            const char* s_name = OS_NAME;
+            int i = 0;
+            while (s_name[i] && i < 31) { k->name[i] = s_name[i]; i++; }
+            k->name[i] = '\0';
+
+            const char* s_arch = OS_ARCH;
+            i = 0;
+            while (s_arch[i] && i < 15) { k->arch[i] = s_arch[i]; i++; }
+            k->arch[i] = '\0';
+
+            const char* s_ver = OS_VERSION " devbuild";
+            i = 0;
+            while (s_ver[i] && i < 31) { k->version[i] = s_ver[i]; i++; }
+            k->version[i] = '\0';
+
+            return 0;
+        }
 
         case 10: { // sys_open(const char* path, uint32_t flags)
             return (uint64_t)(int64_t)vfs_sys_open((const char*)arg1, (uint32_t)arg2);
@@ -271,6 +472,15 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
         case 15: { // sys_ioctl(int fd, uint64_t req, uint64_t arg)
             return (uint64_t)(int64_t)vfs_sys_ioctl((int)arg1, arg2, arg3);
         }
+        case 16: { // sys_get_dir_files(path, buf, max_files)
+            const char* path = (const char*)arg1;
+            void* buf = (void*)arg2;
+            int max_files = (int)arg3;
+            fs_lock();
+            int count = fs_get_dir_files(path, (fs_file_info_t*)buf, max_files);
+            fs_unlock();
+            return (uint64_t)count;
+        }
 
         case 20: // sys_set_palette
             if (arg1) {
@@ -302,34 +512,17 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
                 }
             }
 
+            g_fb_write_tty = caller->tty_id;          // этот TTY сейчас занят игрой:
+            g_fb_last_write_tick = timer_ticks;       // Ctrl+C не убивает её, курсор консоли не рисуется
+
+#if BLIT_DIRECT_TO_LFB
+            (void)my_tty;
+            blit_320x200_to_lfb(user_fb);   // TTY программы сейчас активен: рисуем сразу на экран
+#else
             uint32_t* dst_buf = my_tty->buffer;   // буфер TTY, в котором запущена программа
-            uint32_t step_x = ((uint32_t)320 << 16) / screen_width;
-            uint32_t step_y = ((uint32_t)200 << 16) / screen_height;
-            uint32_t src_y_fp = 0, prev_sy = 0xFFFFFFFFu;
-            uint32_t* prev_row = 0;
-
-            for (uint32_t dst_y = 0; dst_y < screen_height; dst_y++) {
-                uint32_t src_y = src_y_fp >> 16;
-                if (src_y >= 200) src_y = 199;
-                uint32_t* dst_row = &dst_buf[dst_y * screen_width];
-
-                if (src_y == prev_sy) {   // та же исходная строка: копируем уже готовую
-                    uint32_t* d = dst_row; const uint32_t* sp = prev_row; uint64_t n = screen_width;
-                    __asm__ volatile ("rep movsl" : "+D"(d), "+S"(sp), "+c"(n) :: "memory");
-                } else {
-                    const uint32_t* src_row = user_fb + (src_y * 320);
-                    uint32_t src_x_fp = 0;
-                    for (uint32_t dst_x = 0; dst_x < screen_width; dst_x++) {
-                       dst_row[dst_x] = src_row[src_x_fp >> 16];
-                       src_x_fp += step_x;
-                    }
-                }
-                prev_sy = src_y;
-                prev_row = dst_row;
-                src_y_fp += step_y;
-            }
-
+            blit_320x200_scaled(user_fb, dst_buf);
             flush_buffer();   // TTY программы сейчас активен
+#endif
             return paused;
         }
         case 22: return g_tsc_per_ms;
@@ -340,12 +533,15 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
             int* u_dy = (int*)arg2;       // вместо regs->rcx
             uint8_t* u_btn = (uint8_t*)arg3; // вместо regs->rdx
     
-            update_mouse_state();
+            // Фоновая программа мышь не трогает (и не съедает накопленное движение)
+            int k_dx = 0, k_dy = 0;
+            uint8_t k_btn = 0;
+            if (visible) {
+                extern void get_mouse_delta(int* dx, int* dy, uint8_t* buttons);   // mouse.c
+                update_mouse_state();
+                get_mouse_delta(&k_dx, &k_dy, &k_btn);   // движение с прошлого вызова + кнопки
+            }
 
-            int k_dx, k_dy;
-            uint8_t k_btn;
-            //get_mouse_delta(&k_dx, &k_dy, &k_btn);
-    
             if (u_dx) *u_dx = k_dx;
             if (u_dy) *u_dy = k_dy;
             if (u_btn) *u_btn = k_btn;
@@ -444,60 +640,49 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
             // 8. Добавляем ребёнка в планировщик
             sched_enqueue_task(child);
 
-            kputs("[fork] new child PID=", 0x55FFFF);
+            /* kputs("[fork] new child PID=", 0x55FFFF);
             char fbuf[16]; itoa((int)child->pid, fbuf);
             kputs(fbuf, 0xFFFFFF); kputs(", parent PID=", 0x55FFFF);
             itoa((int)parent->pid, fbuf); kputs(fbuf, 0xFFFFFF); kputs("\n", 0x55FFFF);
-            sched_dump_tasks();
+            sched_dump_tasks(); */
 
             // Родителю возвращаем PID ребёнка
             return child->pid;
         }
 
-        case 32: { // sys_waitpid(pid, int* out_status) -> 1 если дождались и собрали, 0 иначе
-            // out_status — указатель В АДРЕСНОМ ПРОСТРАНСТВЕ ВЫЗЫВАЮЩЕГО. CR3 на время
-            // сисколла не меняется (higher-half и так общий), поэтому писать в него отсюда
-            // безопасно — ровно как в случаях 2/11 (put_pixel/sys_read).
+        case 32: { // sys_waitpid(int pid, int* status, int options)
+            int target_pid = (int)arg1;
             int* out_status = (int*)arg2;
+            (void)arg3; // WNOHANG
+
             int code = 0;
-            int ok = sched_wait_pid((uint64_t)arg1, &code);
-
-            char wbuf[16];
-            kputs("[waitpid] pid=", 0x55FFFF);
-            itoa((int)arg1, wbuf); kputs(wbuf, 0xFFFFFF);
-            if (ok) {
+            int reaped = sched_reap_zombie(caller, target_pid, &code);
+            if (reaped > 0) {
                 if (out_status) *out_status = code;
-                kputs(": reaped, exit_code=", 0x55FFFF);
-                itoa(code, wbuf); kputs(wbuf, 0xFFFFFF); kputs("\n", 0x55FFFF);
-            } else {
-                kputs(": FAILED (not our child or already reaped)\n", 0x55FFFF);
+                return (uint64_t)reaped;
             }
-            sched_dump_tasks();
-            return (uint64_t)ok;
-        }
+            return 0;
+        }   
 
-        case 33: { // sys_kill(pid, sig)
-            uint64_t target_pid = arg1;
+        case 33: { // sys_kill(int pid, int sig)
+            uint64_t target_pid = (uint64_t)arg1;
             int sig = (int)arg2;
-            if (caller && target_pid == caller->pid) {
-                // Самоубийство: обычный путь выхода, с отрицательным кодом (как Unix WIFSIGNALED)
-                flush_buffer();
-                sched_exit_current(-sig);   // не возвращается
-            }
-            int kr = sched_send_signal(target_pid, sig);
-            kputs("[kill] pid=", 0x55FFFF);
-            char kbuf[16]; itoa((int)target_pid, kbuf); kputs(kbuf, 0xFFFFFF);
-            kputs(" sig=", 0x55FFFF); itoa(sig, kbuf); kputs(kbuf, 0xFFFFFF);
-            kputs(kr == 0 ? ": delivered\n" : ": FAILED (no such pid, or it's you)\n", 0x55FFFF);
-            sched_dump_tasks();
-            return (uint64_t)(int64_t)kr;
+            if (target_pid <= 2) return (uint64_t)-1; // Не трогать kernel (0), tty1 (1), desktop (2)
+
+            return (uint64_t)sched_send_signal(target_pid, sig ? sig : SIGKILL);
         }
 
-        case 31: { // sys_execve(const char* filename, const char* args) — args пока не используется
-            const char* filename = (const char*)arg1;
+        case 31: { // sys_execve(const char* filename, const char* args)
+            const char* ufn = (const char*)arg1;
+            if (!ufn) return (uint64_t)-1;
+            char kname[64];
+            int ki = 0;
+            while (ufn[ki] && ki < 63) { kname[ki] = ufn[ki]; ki++; }
+            kname[ki] = '\0';
+            const char* filename = kname;
             if (!filename) return (uint64_t)-1;
 
-            extern uint8_t kernel_temp_buf[];      // общий с prog_loader.c/sys_loader.c — под fs_lock
+            extern uint8_t kernel_temp_buf[];
             fs_lock();
             int bytes = fs_read_file(filename, kernel_temp_buf, 1024 * 1024 * 4);
             fs_unlock();
@@ -562,18 +747,21 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
 
             current->heap_start = load_base + (uint64_t)num_image_pages * 4096;
             current->heap_end   = current->heap_start;
+            current->mem_size   = ((uint64_t)num_image_pages + (uint64_t)num_stack_pages) * 4096 + 4096 + PROC_KSTACK_SIZE;
 
             // 6. Обновляем имя процесса в task_t для sched_dump_tasks
-            const char* base_name = filename;
-            for (int p = 0; filename[p]; p++) {
-                if (filename[p] == '/') base_name = &filename[p + 1];
+            const char* bname = filename;
+            for (int i = 0; filename[i]; i++) {
+                if (filename[i] == '/') bname = &filename[i + 1];
             }
-            int ni = 0;
-            while (base_name[ni] && ni < 15) {
-                current->name[ni] = base_name[ni];
-                ni++;
+            int np = 0;
+            while (bname[np] && np < 15) {
+                char c = bname[np];
+                if (c >= 'a' && c <= 'z') c -= 32;
+                caller->name[np] = c;
+                np++;
             }
-            current->name[ni] = '\0';
+            caller->name[np] = '\0';
 
             // 7. UNIX-WAY VFS: очистка дескрипторов старого образа
             // Дескрипторы 0, 1, 2 (stdin, stdout, stderr) сохраняются для нового бинарника.
@@ -599,6 +787,184 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
 
             return 0;
         }
+        case 40: { // sys_create_window(const win_desc_t* desc) -> int win_id
+            const win_desc_t* desc = (const win_desc_t*)arg1;
+            task_t* caller = sched_get_current_task();
+
+            // 1. ПРОВЕРКА ЗАГОЛОВКА: обязательное поле!
+            if (!desc || !desc->title || desc->title[0] == '\0') {
+                kputs("\n[!] ОШИБКА WM: Заголовок приложения не найден!\n", 0x00FF5555);
+                flush_buffer();
+                return (uint64_t)-1;
+            }
+
+            if (g_window_count >= MAX_SYS_WINDOWS) {
+                kputs("[!] Ошибка WM: Превышен лимит окон!\n", 0x00FF5555);
+                return (uint64_t)-1;
+            }
+
+            // 2. РАЗМЕР ОКНА: если не задан, делаем стандартный квадрат 320x320
+            int ww = (desc->w > 0) ? desc->w : DEFAULT_WIN_SIZE;
+            int wh = (desc->h > 0) ? desc->h : DEFAULT_WIN_SIZE;
+            if (ww > 1920 || wh > 1080) return (uint64_t)-1;
+
+            // Поверхность окна (клиентская область, 32 bpp): в неё клиент делает sys_win_present
+            uint32_t spages = (uint32_t)(((uint64_t)ww * (uint64_t)wh * 4 + 4095) / 4096);
+            void* sphys = pmm_alloc_pages(spages);
+            if (!sphys) {
+                kputs("[!] Ошибка WM: нет памяти под поверхность окна!\n", 0x00FF5555);
+                return (uint64_t)-1;
+            }
+
+            int widx = g_window_count++;
+            kernel_window_t* win = &g_windows[widx];
+            win->id = g_next_win_id++;
+            win->pid = caller ? (int)caller->pid : 0;
+            win->is_minimized = 0;
+            win->is_active = 1;
+
+            // Каскадная начальная позиция окна
+            win->x = 80 + (win->id * 25);
+            win->y = 60 + (win->id * 20);
+            win->w = ww;
+            win->h = wh;
+
+            win_priv_t* pv = &g_wpriv[widx];
+            pv->surf_phys  = (uint64_t)sphys;
+            pv->surf       = (uint8_t*)PHYS_TO_VIRT(sphys);
+            pv->surf_pages = spages;
+            pv->seq        = 0;
+            pv->ev_head = pv->ev_tail = 0;
+            wm_zero(pv->surf, (uint64_t)spages * 4096);
+
+            // Копируем заголовок
+            int p = 0;
+            while (desc->title[p] && p < 63) {
+                win->title[p] = desc->title[p];
+                p++;
+            }
+            win->title[p] = '\0';
+
+            // 3. ИКОНКА ОКНА: если передана — копируем, иначе выставляем плейсхолдер
+            if (desc->icon) {
+                win->has_icon = 1;
+                for (int i = 0; i < 16; i++) {
+                    win->icon[i] = desc->icon[i];
+                }
+            } else {
+                win->has_icon = 0; // Плейсхолдер
+            }
+
+            return (uint64_t)win->id;
+        }
+
+        case 41: { // sys_get_windows(kernel_window_t* out, int max_cnt) -> count
+            kernel_window_t* out = (kernel_window_t*)arg1;
+            int max_cnt = (int)arg2;
+            if (!out || max_cnt <= 0) return 0;
+
+            // Выбрасываем окна завершённых (ZOMBIE/DEAD) и уже несуществующих процессов,
+            // иначе записи копятся, и после 16 запусков окна перестают создаваться.
+            // pid == 0 — окно, принадлежащее ядру, оно всегда считается живым.
+            int n = 0;
+            for (int i = 0; i < g_window_count; i++) {
+                if (g_windows[i].pid == 0 || sched_pid_alive((uint64_t)g_windows[i].pid)) {
+                    if (n != i) {
+                        wm_copy(&g_windows[n], &g_windows[i], sizeof(kernel_window_t));
+                        wm_copy(&g_wpriv[n],   &g_wpriv[i],   sizeof(win_priv_t));
+                    }
+                    n++;
+                } else {
+                    wm_free_priv(i);   // процесс умер — освобождаем поверхность окна
+                }
+            }
+            g_window_count = n;
+
+            int count = g_window_count < max_cnt ? g_window_count : max_cnt;
+            wm_copy(out, g_windows, (uint64_t)count * sizeof(kernel_window_t));
+            return (uint64_t)count;
+        }
+
+        case 42: { // sys_update_window(int id, int x, int y, int is_minimized)
+            int id = (int)arg1;
+            int x  = (int)arg2;
+            int y  = (int)arg3;
+            int is_min = (int)frame[0]; // r15 / 4-й аргумент
+
+            for (int i = 0; i < g_window_count; i++) {
+                if (g_windows[i].id == id) {
+                    g_windows[i].x = x;
+                    g_windows[i].y = y;
+                    g_windows[i].is_minimized = is_min;
+                    return 0;
+                }
+            }
+            return (uint64_t)-1;
+        }
+
+        case 43: { // sys_win_present(id, pixels) — только владелец окна
+            int wi = wm_index_by_id((int)arg1);
+            if (wi < 0 || !arg2 || arg2 >= 0x0000800000000000ULL) return (uint64_t)-1;
+            if (!caller || g_windows[wi].pid != (int)caller->pid) return (uint64_t)-1;
+            uint64_t nbytes = (uint64_t)g_windows[wi].w * (uint64_t)g_windows[wi].h * 4;
+            wm_copy(g_wpriv[wi].surf, (const void*)arg2, nbytes);
+            g_wpriv[wi].seq++;
+            return 0;
+        }
+
+        case 44: { // sys_win_read(id, dst, uint32_t* seq) -> 1 = кадр обновлён, 0 = без изменений
+            int wi = wm_index_by_id((int)arg1);
+            uint32_t* seqp = (uint32_t*)arg3;
+            if (wi < 0 || !arg2 || !seqp) return (uint64_t)-1;
+            if (arg2 >= 0x0000800000000000ULL || arg3 >= 0x0000800000000000ULL) return (uint64_t)-1;
+            if (*seqp == g_wpriv[wi].seq) return 0;
+            uint64_t nbytes = (uint64_t)g_windows[wi].w * (uint64_t)g_windows[wi].h * 4;
+            wm_copy((void*)arg2, g_wpriv[wi].surf, nbytes);
+            *seqp = g_wpriv[wi].seq;
+            return 1;
+        }
+
+        case 45: { // sys_win_poll_event(id, ev) -> 1 = событие получено — только владелец окна
+            int wi = wm_index_by_id((int)arg1);
+            if (wi < 0 || !arg2 || arg2 >= 0x0000800000000000ULL) return (uint64_t)-1;
+            if (!caller || g_windows[wi].pid != (int)caller->pid) return (uint64_t)-1;
+            win_priv_t* pv = &g_wpriv[wi];
+            if (pv->ev_head == pv->ev_tail) return 0;
+            wm_copy((void*)arg2, &pv->ev[pv->ev_tail % WIN_EV_QUEUE], sizeof(win_event_t));
+            pv->ev_tail++;
+            return 1;
+        }
+
+        case 46: { // sys_win_push_event(id, ev) — событие от desktop окну-клиенту
+            int wi = wm_index_by_id((int)arg1);
+            if (wi < 0 || !arg2 || arg2 >= 0x0000800000000000ULL) return (uint64_t)-1;
+            win_priv_t* pv = &g_wpriv[wi];
+            if (pv->ev_head - pv->ev_tail >= WIN_EV_QUEUE) return (uint64_t)-1;   // очередь полна
+            wm_copy(&pv->ev[pv->ev_head % WIN_EV_QUEUE], (const void*)arg2, sizeof(win_event_t));
+            pv->ev_head++;
+            return 0;
+        }
+        case 50: { // sys_reboot()
+            extern void sys_reboot(void);
+            sys_reboot();
+            return 0;
+        }
+
+        case 51: { // sys_shutdown()
+            extern void acpi_power_off(void);
+            acpi_power_off();
+            return 0;
+        }
+
+        case 60: { // sys_get_net_info(sys_net_info_t* info)
+            if (!arg1) return (uint64_t)-1;
+            __asm__ volatile ("sti");
+            extern int net_get_status_info(void* out_buf);
+            int res = net_get_status_info((void*)arg1);
+            __asm__ volatile ("cli");
+            return (uint64_t)res;
+        }
+
         default:
             return 0;
     }

@@ -2,7 +2,7 @@
 #include <stddef.h>
 #include "../drivers/acpi.h"
 #include "../drivers/pci.h"
-#include "../drivers/usb/ehci-msc.h"
+#include "../drivers/ethernet.h"
 #include "../fs/fs.h"
 #include "sys_loader.h"
 #include "prog_loader.h"
@@ -25,16 +25,13 @@ extern void clear_screen(uint32_t color);
 extern void flush_buffer(void);
 extern void sys_reboot(void);
 extern void print_prompt(void);
-extern int strcmp(const char* s1, const char* s2);
+extern int  strcmp(const char* s1, const char* s2);
 
 // Программы и визуальные режимы ядра
 extern void enter_render_mode(void);
-extern void kernel_panic(const char* reason);
 extern void cmd_fastfetch(void);
-extern void cmd_fastfetch_audio(void);
 extern void acpi_power_off(void);
 extern void cmd_ehci_log(void);
-extern void run_nano_editor(void);
 extern void intel_set_backlight(int level, int silent);
 
 // Текущий путь в файловой системе (корень "/")
@@ -189,9 +186,11 @@ void execute_command(void) {
         kputs("================Command List================\n", 0x55FFFF);
         kputs("help                ", 0xFFFF55); kputs("- Show this help message\n", 0xFFFFFF);
         kputs("clear               ", 0xFFFF55); kputs("- Clear the screen\n", 0xFFFFFF);
-        kputs("ver                 ", 0xFFFF55); kputs("- Display OS version\n", 0xFFFFFF);
+        kputs("ver                 ", 0xFFFF55); kputs("- Display Kernel version\n", 0xFFFFFF);
+        kputs("ping <ip>           ", 0xFFFF55); kputs("- Ping IP-Address\n", 0xFFFFFF);
+        kputs("pong                ", 0xFFFF55); kputs("- Get IP-Ping from another PC/Device\n", 0xFFFFFF);
         kputs("rus                 ", 0xFFFF55); kputs("- Turning Russian lang if ALT is broken\n", 0xFFFFFF);
-        kputs("англ                ", 0xFFFF55); kputs("- Turning English lang if ALT is broken\n", 0xFFFFFF);
+        kputs("1972                ", 0xFFFF55); kputs("- Turning English lang if ALT is broken\n", 0xFFFFFF);
 
         kputs("\n--- Applications & GUI ---\n", 0x55FF55);
         kputs("render              ", 0xFFFF55); kputs("- Enter 3D rendering mode demo\n", 0xFFFFFF);
@@ -205,13 +204,13 @@ void execute_command(void) {
         kputs("touch <file>        ", 0xFFFF55); kputs("- Create an empty file\n", 0xFFFFFF);
         kputs("mkdir <dir>         ", 0xFFFF55); kputs("- Create a directory\n", 0xFFFFFF);
         kputs("rm <file/dir>       ", 0xFFFF55); kputs("- Delete file or directory\n", 0xFFFFFF);
-        kputs("insmod <file.sys>   ", 0xFFFF55); kputs("- Load Ring 0 module explicitly\n", 0xFFFFFF);
 
         kputs("\n--- Hardware & Diagnostics ---\n", 0x55FF55);
         kputs("fastfetch           ", 0xFFFF55); kputs("- Display system information\n", 0xFFFFFF);
-        kputs("fastfetch -a        ", 0xFFFF55); kputs("- System info with audio controllers\n", 0xFFFFFF);
+        kputs("fastfetch -a        ", 0xFFFF55); kputs("- Pci scaner all pc (USB, Audio, Net)\n", 0xFFFFFF);
         kputs("brightness <0-100>  ", 0xFFFF55); kputs("- Set screen backlight brightness\n", 0xFFFFFF);
         kputs("ehci-log            ", 0xFFFF55); kputs("- Display EHCI host controller debug log\n", 0xFFFFFF);
+        kputs("netinfo             ", 0xFFFF55); kputs("- Network info\n", 0xFFFFFF);
         kputs("taskmgr / ps        ", 0xFFFF55); kputs("- Task Manager\n", 0xFFFFFF);
         kputs("pkill <pid> [sig]   ", 0xFFFF55); kputs("- Send a signal to PID (default SIGKILL=9)\n", 0xFFFFFF);
 
@@ -232,6 +231,12 @@ void execute_command(void) {
         cmd_ehci_log();
     } else if (strcmp(cmd, "taskmgr") == 0 || strcmp(cmd, "ps") == 0) {
         sched_dump_tasks();
+    } else if (strncmp(cmd, "ping", 4) == 0) {
+        char* arg = cmd + 4;
+        while (*arg == ' ') arg++;
+        cmd_ping(arg);
+    } else if (strcmp(cmd, "pong") == 0 || strcmp(cmd, "pingd") == 0) {
+        cmd_pong();
 
     } else if (strncmp(cmd, "pkill ", 6) == 0) {
         char* arg = cmd + 6;

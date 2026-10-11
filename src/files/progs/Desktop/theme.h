@@ -1,0 +1,24 @@
+#ifndef THEME_H
+#define THEME_H
+
+#include <stdint.h>
+
+#define COLOR_DESKTOP_BG    0x1B1E20
+#define COLOR_PANEL_BG      0x232629
+#define COLOR_PANEL_BORDER  0x31363B
+#define COLOR_DOCK_ITEM_BG  0x2A2E32
+#define COLOR_DOCK_HOVER    0x353B42
+#define COLOR_WIN_BG        0x232629
+#define COLOR_WIN_TITLE_ACT 0x3DAEE9
+#define COLOR_WIN_TITLE_IN  0x31363B
+#define COLOR_WIN_BORDER    0x141618
+#define COLOR_CLOSE_BTN     0xDA4453
+#define COLOR_TEXT_MAIN     0xFCFCFC
+#define COLOR_TEXT_MUTED    0x8F98A0
+#define COLOR_ACCENT_BLUE   0x3DAEE9
+#define COLOR_WARN_RED      0xED1515
+
+#define TITLE_BAR_HEIGHT    26
+#define TASKBAR_HEIGHT      44
+
+#endif

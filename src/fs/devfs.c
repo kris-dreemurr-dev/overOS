@@ -2,13 +2,23 @@
 #include "../kernel/tty.h"
 #include "../kernel/sched.h"
 #include "../drivers/display.h"
+#include "../memory/pmm.h"
+
+// 1 = писать в LFB только изменившиеся участки кадра (сравнение с копией экрана в RAM).
+// Если картинка вдруг "залипает" (ghost-курсор и т.п.) — поставь 0, останется простая полная запись.
+#define FB_DIFF_WRITE 1
 
 extern void     kputc(char c, uint32_t color);
 extern void     flush_buffer(void);
+extern void     flush_dirty(void);
 extern uint16_t screen_width;
 extern uint16_t screen_height;
 extern uint16_t screen_pitch;
 extern volatile uint32_t* lfb;
+extern uint32_t timer_ticks;
+extern volatile uint32_t g_lfb_gen;
+extern volatile uint32_t g_fb_last_write_tick;
+extern volatile int      g_fb_write_tty;
 
 static const char scancode_ascii[128] = {
     0,  27, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b',
@@ -50,7 +60,7 @@ static int64_t dev_tty_write(vfs_node_t* node, uint64_t offset, uint64_t size, c
     for (uint64_t i = 0; i < size; i++) {
         kputc((char)buffer[i], 0x00FFFFFF);
     }
-    if (visible) flush_buffer();
+    if (visible) flush_dirty();
     return (int64_t)size;
 }
 
@@ -65,8 +75,20 @@ static vfs_ops_t g_tty_ops = {
 // ----------------- /dev/fb0 -----------------
 // Функция получения текущего процесса и активного TTY
 
+// Копия того, что сейчас лежит в LFB (в обычной кэшируемой RAM). Читать сам LFB нельзя —
+// это write-combining память, чтение из неё очень медленное.
+static uint32_t* g_fb_shadow = 0;
+static uint64_t  g_fb_shadow_bytes = 0;
+static int       g_fb_shadow_ok = 0;      // копия совпадает с LFB
+static uint32_t  g_fb_shadow_gen = 0;     // значение g_lfb_gen на момент нашей последней записи
+
+static inline void fb_copy_q(void* d, const void* s, uint64_t qwords) {
+    __asm__ volatile ("rep movsq" : "+D"(d), "+S"(s), "+c"(qwords) : : "memory");
+}
+
 static int64_t dev_fb_write(vfs_node_t* node, uint64_t offset, uint64_t size, const uint8_t* buffer) {
-    (void)offset;
+    (void)node;
+    (void)offset;   // /dev/fb0 — всегда "кадр с начала экрана": VFS двигает позицию после каждого write
     if (!lfb || !buffer) return -1;
 
     // ЗАЩИТА: Если процесс запущен на фоновом TTY — НЕ трогаем физический экран!
@@ -75,35 +97,75 @@ static int64_t dev_fb_write(vfs_node_t* node, uint64_t offset, uint64_t size, co
         return (int64_t)size;
     }
 
-    uint64_t max_bytes = (uint64_t)screen_width * screen_height * 4;
-    uint64_t to_copy = size > max_bytes ? max_bytes : size;
+    // Говорим ядру: экран сейчас рисует программа, курсор консоли поверх не рисовать
+    g_fb_write_tty = (curr && curr->tty_id >= 0) ? curr->tty_id : tty_get_active_id();
+    g_fb_last_write_tick = timer_ticks;
 
-    uint64_t* dst = (uint64_t*)lfb;
-    const uint64_t* src = (const uint64_t*)buffer;
-    uint64_t qwords = to_copy / 8;
+    uint64_t row   = (uint64_t)screen_width * 4;
+    uint64_t total = row * screen_height;
+    uint64_t len   = size < total ? size : total;
+    uint8_t* lfb8  = (uint8_t*)lfb;
 
-    // Быстрый 64-битный перенос по шине
-    __asm__ volatile (
-        "rep movsq"
-        : "+D"(dst), "+S"(src), "+c"(qwords)
-        :
-        : "memory"
-    );
-
-    // Докопируем остаток, если буфер не кратен 8 байтам
-    uint32_t rem = to_copy % 8;
-    if (rem) {
-        uint8_t* d8 = (uint8_t*)dst;
-        const uint8_t* s8 = (const uint8_t*)src;
-        for (uint32_t i = 0; i < rem; i++) {
-            d8[i] = s8[i];
-        }
+#if FB_DIFF_WRITE
+    if (!g_fb_shadow) {
+        uint64_t pages = (total + 4095) / 4096;
+        g_fb_shadow = (uint32_t*)pmm_alloc_pages((uint32_t)pages);
+        g_fb_shadow_bytes = g_fb_shadow ? total : 0;
+        g_fb_shadow_ok = 0;
     }
 
-    // Выталкиваем накопленные пиксели из кэш-очередей процессора прямо в PCIe
-    __asm__ volatile ("sfence" ::: "memory");
+    if (g_fb_shadow && g_fb_shadow_bytes == total && len == total && (row & 7) == 0) {
+        uint64_t q = row / 8;
+        uint8_t* sh8 = (uint8_t*)g_fb_shadow;
 
-    return (int64_t)to_copy;
+        if (g_fb_shadow_ok && g_fb_shadow_gen == g_lfb_gen) {
+            // Копия актуальна: пишем в LFB только участок строки, который реально изменился
+            for (uint64_t y = 0; y < screen_height; y++) {
+                const uint64_t* s  = (const uint64_t*)(buffer + y * row);
+                uint64_t*       sh = (uint64_t*)(sh8 + y * row);
+                uint64_t a = 0;
+                while (a < q && s[a] == sh[a]) a++;
+                if (a == q) continue;                       // строка не изменилась
+                uint64_t b = q;
+                while (b > a && s[b - 1] == sh[b - 1]) b--;
+                fb_copy_q(lfb8 + y * screen_pitch + a * 8, s + a, b - a);
+                fb_copy_q(sh + a, s + a, b - a);
+            }
+        } else {
+            // Первый кадр или экран трогал кто-то ещё (консоль, смена TTY): пишем всё и запоминаем
+            for (uint64_t y = 0; y < screen_height; y++) {
+                fb_copy_q(lfb8 + y * screen_pitch, buffer + y * row, q);
+                fb_copy_q(sh8 + y * row, buffer + y * row, q);
+            }
+            g_fb_shadow_ok = 1;
+        }
+        __asm__ volatile ("sfence" ::: "memory");
+        g_fb_shadow_gen = g_lfb_gen;
+        return (int64_t)len;
+    }
+#endif
+
+    // Простой путь (частичная запись, нет памяти под копию, FB_DIFF_WRITE=0): строки с учётом pitch
+    g_fb_shadow_ok = 0;
+    uint64_t left = len, done = 0;
+    while (left) {
+        uint64_t y = done / row;
+        uint64_t x = done % row;
+        uint64_t n = (row - x < left) ? (row - x) : left;
+        void* d = lfb8 + y * screen_pitch + x;
+        const void* s = buffer + done;
+        uint64_t cnt = n;
+        if ((((uint64_t)d | (uint64_t)s | cnt) & 7) == 0) {
+            cnt >>= 3;
+            __asm__ volatile ("rep movsq" : "+D"(d), "+S"(s), "+c"(cnt) : : "memory");
+        } else {
+            __asm__ volatile ("rep movsb" : "+D"(d), "+S"(s), "+c"(cnt) : : "memory");
+        }
+        done += n;
+        left -= n;
+    }
+    __asm__ volatile ("sfence" ::: "memory");
+    return (int64_t)done;
 }
 
 static int dev_fb_ioctl(vfs_node_t* node, uint64_t request, uint64_t arg) {

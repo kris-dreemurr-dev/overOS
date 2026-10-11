@@ -1,6 +1,7 @@
 #include "loader_kernel.h"
 #include "../drivers/display.h"
 #include "../drivers/pci.h"
+#include "../drivers/ethernet.h"
 #include "../fs/fs.h"
 #include "../memory/pmm.h"
 #include "../memory/vmm.h"
@@ -60,6 +61,9 @@ void kernel_system_bootstrap(void) {
     log_status("Display Backlight & VBE Framebuffer LFB", 1);
 
     log_status("Kernel Scheduler & Virtual Terminals (TTY)", 1);
+
+    net_bootstrap();
+    log_status("Ethernet Network", 1);
 
     kputs("\n:: System has been started\n\n", 0x55FF55);
     flush_buffer();

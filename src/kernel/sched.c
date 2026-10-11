@@ -515,3 +515,98 @@ int sched_wait_child(task_t* child) {
     pmm_free_page(child);
     return code;
 }
+
+// Неблокирующий сбор завершившегося зомби из кольца планировщика
+int sched_reap_zombie(task_t* parent, int target_pid, int* out_code) {
+    uint64_t fl;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(fl) :: "memory");
+
+    task_t* found = NULL;
+    if (task_list_head) {
+        task_t* c = task_list_head;
+        do {
+            if (c->state == TASK_ZOMBIE) {
+                // Если запрошен конкретный PID (target_pid > 0)
+                if (target_pid > 0 && (int)c->pid != target_pid) {
+                    c = c->next;
+                    continue;
+                }
+                // Если передан parent — проверяем, что это его ребёнок
+                // (если parent == NULL — собираем любого зомби / сироту)
+                if (parent && c->parent != parent) {
+                    c = c->next;
+                    continue;
+                }
+                found = c;
+                break;
+            }
+            c = c->next;
+        } while (c != task_list_head);
+    }
+
+    if (!found) {
+        __asm__ volatile("pushq %0; popfq" :: "r"(fl) : "memory", "cc");
+        return 0; // Зомби не найдены
+    }
+
+    int reaped_pid = (int)found->pid;
+    int code = found->exit_code;
+    if (out_code) *out_code = code;
+
+    // Убираем задачу из кольцевого списка Round-Robin
+    task_t* c = task_list_head;
+    do {
+        if (c->next == found) {
+            c->next = found->next;
+            if (task_list_head == found) {
+                task_list_head = (found->next == found) ? NULL : c;
+            }
+            break;
+        }
+        c = c->next;
+    } while (c != task_list_head);
+
+    __asm__ volatile("pushq %0; popfq" :: "r"(fl) : "memory", "cc");
+
+    // Освобождаем файловые дескрипторы VFS
+    for (int i = 0; i < MAX_FD; i++) {
+        if (found->fd_table[i]) {
+            vfs_release_fd(found->fd_table[i]);
+            found->fd_table[i] = NULL;
+        }
+    }
+
+    // Освобождаем виртуальное адресное пространство процесса (CR3)
+    uint64_t cur_cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cur_cr3));
+    if (found->cr3 && found->cr3 != cur_cr3) {
+        vmm_destroy_address_space((uint64_t*)found->cr3);
+    }
+
+    // Освобождаем ядерный стек процесса
+    if (found->is_process && found->kstack_bottom) {
+        uint64_t kst_phys = found->kstack_bottom - 0xFFFFFFFF80000000ULL;
+        for (uint32_t i = 0; i < PROC_KSTACK_SIZE / 4096; i++) {
+            pmm_free_page((void*)(kst_phys + (uint64_t)i * 4096));
+        }
+    }
+
+    if (current_task && current_task->is_process) set_tss_rsp0(current_task->kstack_top);
+    else reset_tss_to_default();
+    pmm_free_page(found);
+
+    return reaped_pid;
+}
+
+int sched_pid_alive(uint64_t pid) {
+    uint64_t fl;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(fl) :: "memory");
+    int alive = 0;
+    task_t* c = task_list_head;
+    if (c) do {
+        if (c->pid == pid) { alive = (c->state != TASK_ZOMBIE && c->state != TASK_DEAD); break; }
+        c = c->next;
+    } while (c != task_list_head);
+    __asm__ volatile("pushq %0; popfq" :: "r"(fl) : "memory", "cc");
+    return alive;
+}

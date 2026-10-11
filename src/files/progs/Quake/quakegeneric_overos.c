@@ -122,9 +122,53 @@ static const unsigned char scancode_to_quake[128] = {
     [0x58] = 146   // F12
 };
 
+// --- Мышь ---
+// Чувствительность умножителем (дальше крутится cvar sensitivity в самой игре)
+#define QG_MOUSE_SCALE    2
+// 1 = инвертировать вертикаль (если взгляд идёт вниз при движении мыши вверх)
+#define QG_MOUSE_INVERT_Y 0
+
+// Кнопки мыши PS/2: бит0 ЛКМ, бит1 ПКМ, бит2 СКМ -> K_MOUSE1..3 (200..202) в Quake
+static uint8_t g_mouse_btn_now  = 0;   // обновляется в QG_GetMouseMove (раз в кадр)
+static uint8_t g_mouse_btn_sent = 0;   // что уже отправлено движку как key-события
+
 // Буферы для конвертации графики
 static uint32_t local_palette[256];
 static uint32_t rgb_frame_buffer[320 * 200];
+
+// --- Стартовый конфиг вместо autoexec.cfg ---
+// Cbuf_AddText из самого Quake (cmd.c): кладёт текст в очередь консольных команд.
+extern void Cbuf_AddText(char *text);
+
+static void qg_apply_default_config(void) {
+    static int done = 0;
+    if (done) return;
+    done = 1;
+
+    // Дописывается В КОНЕЦ очереди, поэтому выполняется после default.cfg и переопределяет его бинды
+    static char cfg[] =
+        "sensitivity 3\n"
+        "lookspring 0\n"
+        "+mlook\n"                 // обзор мышью (иначе мышь вверх/вниз ходит вперёд/назад)
+
+        // WASD
+        "bind w +forward\n"
+        "bind s +back\n"
+        "bind a +moveleft\n"       // стрейф влево
+        "bind d +moveright\n"      // стрейф вправо
+        "bind space +jump\n"
+        "bind shift +speed\n"      // бег
+        "bind c +movedown\n"       // вниз (вода)
+
+        // Мышь
+        "bind mouse1 +attack\n"
+        "bind mouse2 +jump\n"      // по умолчанию ПКМ = вперёд, для WASD это не нужно
+
+        // Стрелки и Ctrl оставляем как запасные
+        "bind ctrl +attack\n";
+
+    Cbuf_AddText(cfg);
+}
 
 void QG_Init(void) {
     // Здесь можно настроить TSC таймер, как это сделано в DG_Init
@@ -143,6 +187,8 @@ void QG_SetPalette(unsigned char palette[768]) {
 }
 
 void QG_DrawFrame(void *pixels) {
+    qg_apply_default_config();   // один раз, на первом кадре: к этому моменту консоль Quake уже работает
+
     uint8_t *p8 = (uint8_t *)pixels;
     
     // Конвертируем 8-битный буфер в 32-битный, как в DG_DrawFrame
@@ -156,6 +202,19 @@ void QG_DrawFrame(void *pixels) {
 
 int QG_GetKey(int *down, int *key) {
     uint8_t sc;
+
+    // Сначала события кнопок мыши (по одному за вызов)
+    uint8_t changed = g_mouse_btn_now ^ g_mouse_btn_sent;
+    if (changed) {
+        for (int i = 0; i < 3; i++) {
+            if (changed & (1u << i)) {
+                g_mouse_btn_sent ^= (1u << i);
+                *down = (g_mouse_btn_now >> i) & 1;
+                *key  = 200 + i;   // K_MOUSE1 + i
+                return 1;
+            }
+        }
+    }
 
     // Считываем сканкод, отсекая префикс 0xE0 для стрелок клавиатуры
     do {
@@ -178,12 +237,17 @@ int QG_GetKey(int *down, int *key) {
 void QG_GetMouseMove(int *x, int *y) {
     int dx = 0, dy = 0;
     uint8_t buttons = 0;
-    
-    sys_get_mouse(&dx, &dy, &buttons);
 
-    // В Quake чувствительность можно масштабировать
-    *x = dx * 2;
-    *y = -dy * 2; // Инвертируем Y, если при движении мыши вверх прицел уходит вниз
+    // Ядро возвращает движение, накопленное с прошлого вызова (вправо +, вниз +) и кнопки
+    sys_get_mouse(&dx, &dy, &buttons);
+    g_mouse_btn_now = buttons & 7;
+
+    *x = dx * QG_MOUSE_SCALE;
+#if QG_MOUSE_INVERT_Y
+    *y = -dy * QG_MOUSE_SCALE;
+#else
+    *y = dy * QG_MOUSE_SCALE;
+#endif
 }
 
 void QG_GetJoyAxes(float *axes) {

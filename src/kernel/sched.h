@@ -107,4 +107,9 @@ void sched_set_current_task(task_t* t);
 void sched_set_foreground_task(task_t* t);
 task_t* sched_get_foreground_task(void);
 
+// Неблокирующий сбор завершившегося потомка (для sys_waitpid и очистки зомби)
+int sched_reap_zombie(task_t* parent, int target_pid, int* out_code);
+
+int sched_pid_alive(uint64_t pid);
+
 #endif

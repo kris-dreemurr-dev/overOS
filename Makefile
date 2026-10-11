@@ -12,7 +12,7 @@ NASM  := nasm
 
 # Флаги компиляции 64-битного ядра и программ overOS
 CFLAGS       := -m64 -std=c99 -ffreestanding -fno-pic -fno-pie -fno-stack-protector \
-                -mno-red-zone -mcmodel=kernel -U_FORTIFY_SOURCE -O2 -Wall -Wextra
+                -mno-red-zone -mcmodel=kernel -U_FORTIFY_SOURCE -O2 -fno-strict-aliasing -Wall -Wextra
 # Модули перемещаемые (PIE): грузятся по любому адресу, без -mcmodel=kernel
 CFLAGS_MOD   := -m64 -std=c99 -ffreestanding -fPIE -fvisibility=hidden -fno-plt \
                 -fno-stack-protector -mno-red-zone -U_FORTIFY_SOURCE -O2 -Wall -Wextra \
@@ -62,11 +62,14 @@ DESKTOP_DIR := $(SRC_DIR)/files/progs/Desktop
 DESKTOP_PRG := $(DESKTOP_DIR)/desktop.prg
 WITH_DESKTOP ?= 1
 
+OVERFILES_DIR := $(SRC_DIR)/files/progs/overFiles
+OVERFILES_PRG := $(OVERFILES_DIR)/ovfiles.prg
+
 # ==============================================================================
 # ИСХОДНЫЕ ФАЙЛЫ ЯДРА
 # ==============================================================================
 C_SRC   := $(SRC_DIR)/kernel/kernel.c \
-		   $(SRC_DIR)/kernel/loader_kernel.c \
+           $(SRC_DIR)/kernel/loader_kernel.c \
            $(SRC_DIR)/kernel/main.c \
            $(SRC_DIR)/kernel/tty.c \
            $(SRC_DIR)/kernel/sched.c \
@@ -81,13 +84,14 @@ C_SRC   := $(SRC_DIR)/kernel/kernel.c \
            $(SRC_DIR)/drivers/acpi.c \
            $(SRC_DIR)/drivers/display.c \
            $(SRC_DIR)/drivers/pci.c \
+           $(SRC_DIR)/drivers/ethernet.c \
            $(SRC_DIR)/drivers/mouse.c \
            $(SRC_DIR)/drivers/usb/ehci.c \
            $(SRC_DIR)/drivers/usb/ehci-msc.c \
            $(SRC_DIR)/fs/fat16.c \
            $(SRC_DIR)/fs/fat32.c \
-		   $(SRC_DIR)/fs/vfs.c \
-		   $(SRC_DIR)/fs/devfs.c \
+           $(SRC_DIR)/fs/vfs.c \
+           $(SRC_DIR)/fs/devfs.c \
            $(SRC_DIR)/fs/fs.c
 
 OBJS    := $(BUILD_DIR)/entry_kernel.o \
@@ -117,8 +121,6 @@ $(BUILD_DIR)/boot_stage1.bin: $(SRC_DIR)/boot/boot_stage1.asm
 	$(NASM) -f bin $< -o $@
 
 # --- Stage 2 = asm-часть (вход, FAT32-загрузчик ядра) + C-часть (меню VBE) в одном образе на 32 сектора ---
-# C-часть компилируется в 16-битный код (gcc -m16: 32-битные инструкции с префиксами 0x66/0x67),
-# линкуется на 0x2000 и вшивается в boot_stage2.bin через incbin (см. boot_stage2.asm).
 CFLAGS_BOOT16 := -m16 -march=i386 -std=gnu11 -ffreestanding -fno-builtin -fno-pic -fno-pie \
                  -fno-stack-protector -fno-asynchronous-unwind-tables -fcf-protection=none \
                  -fomit-frame-pointer -mno-sse -mno-mmx -fno-tree-loop-distribute-patterns \
@@ -134,11 +136,8 @@ $(BUILD_DIR)/boot_menu.bin: $(BUILD_DIR)/boot_menu.o $(SRC_DIR)/boot/stage2_menu
 $(BUILD_DIR)/boot_stage2.bin: $(SRC_DIR)/boot/boot_stage2.asm $(SRC_DIR)/boot/boot_fat32.asm $(BUILD_DIR)/boot_menu.bin
 	@mkdir -p $(BUILD_DIR)
 	$(NASM) -f bin -I $(SRC_DIR)/boot/ -I $(BUILD_DIR)/ $< -o $@
-	@# Stage 2 = ровно 32 сектора (16 384 байт, LBA 1..32). boot_stage2.asm сам добивает файл до 16 КиБ
-	@# директивой times, и NASM падает с ошибкой, если код не влезает; truncate оставлен как страховка.
 	@truncate -s 16384 $@
 
-# --- проверка логики меню на хосте (обычный gcc, без QEMU и BIOS): make test-menu ---
 test-menu: tools/test_menu.c $(SRC_DIR)/boot/vbe_menu.c $(SRC_DIR)/boot/bios.h
 	@mkdir -p $(BUILD_DIR)
 	gcc -DHOST_TEST -std=gnu11 -Wall -Wextra -o $(BUILD_DIR)/test_menu tools/test_menu.c
@@ -252,10 +251,15 @@ $(DESKTOP_PRG):
 		$(MAKE) -C $(DESKTOP_DIR); \
 	fi
 
+$(OVERFILES_PRG):
+	@if [ -d "$(OVERFILES_DIR)" ]; then \
+		$(MAKE) -C $(OVERFILES_DIR); \
+	fi
+
 # -----------------------------------------------------------------------------
 # Создание раздела FAT32 и упаковка софта
 # -----------------------------------------------------------------------------
-$(PART_IMG): $(BUILD_DIR)/kernel.bin $(BUILD_DIR)/boot_stage1.bin $(MODULE_BINS) $(PROG_BINS) $(DOOM_PRG) $(QUAKE_PRG) $(DESKTOP_PRG)
+$(PART_IMG): $(BUILD_DIR)/kernel.bin $(BUILD_DIR)/boot_stage1.bin $(MODULE_BINS) $(PROG_BINS) $(DOOM_PRG) $(QUAKE_PRG) $(DESKTOP_PRG) $(OVERFILES_PRG)
 	@mkdir -p $(BUILD_DIR)
 	@echo ">>> Создаем раздел FAT32 на $(PART_SIZE_MB) МБ..."
 	@rm -f $@
@@ -267,10 +271,17 @@ $(PART_IMG): $(BUILD_DIR)/kernel.bin $(BUILD_DIR)/boot_stage1.bin $(MODULE_BINS)
 	    mmd -i $@ ::programs 2>/dev/null || true; \
 	    mmd -i $@ ::programs/DOOM 2>/dev/null || true; \
 	    mmd -i $@ ::programs/Quake 2>/dev/null || true; \
-	    mmd -i $@ ::Code 2>/dev/null || true; \
+	    mmd -i $@ ::configs 2>/dev/null || true; \
+	    mmd -i $@ ::desprogs 2>/dev/null || true; \
+	    mmd -i $@ ::autostart 2>/dev/null || true; \
 	    mcopy -i $@ $(BUILD_DIR)/kernel.bin ::sys/KERNEL.BIN; \
 	    if [ -f "$(SRC_DIR)/files/image/logo.bmp" ]; then \
 	        mcopy -i $@ $(SRC_DIR)/files/image/logo.bmp ::sys/logo.bmp; \
+	    fi; \
+	    if [ -f "$(SRC_DIR)/files/image/wallpaper.bmp" ]; then \
+	        mcopy -i $@ $(SRC_DIR)/files/image/wallpaper.bmp ::sys/wallpaper.bmp; \
+	    elif [ -f "wallpaper.bmp" ]; then \
+	        mcopy -i $@ wallpaper.bmp ::sys/wallpaper.bmp; \
 	    fi; \
 	    for mod in $(INSTALL_MODULES); do \
 	        if [ -f "$(BUILD_DIR)/$$mod.sys" ]; then \
@@ -294,9 +305,14 @@ $(PART_IMG): $(BUILD_DIR)/kernel.bin $(BUILD_DIR)/boot_stage1.bin $(MODULE_BINS)
 	            mcopy -i $@ $(QUAKE_PAK) ::programs/Quake/pak0.pak; \
 	        fi; \
 	    fi; \
-		if [ "$(WITH_DESKTOP)" = "1" ] && [ -f "$(DESKTOP_PRG)" ]; then \
-	        mcopy -i $@ $(DESKTOP_PRG) ::programs/desktop.prg; \
+	    if [ "$(WITH_DESKTOP)" = "1" ] && [ -f "$(DESKTOP_PRG)" ]; then \
+	        mcopy -i $@ $(DESKTOP_PRG) ::autostart/desktop.prg; \
 	    fi; \
+	    if [ -f "$(OVERFILES_PRG)" ]; then \
+	        mcopy -i $@ $(OVERFILES_PRG) ::desprogs/ovfiles.prg; \
+	    fi; \
+	    printf '{\n  "timezone": 3,\n  "langlayout": 1,\n  "brightness": 100,\n  "wallpaper": "/sys/wallpaper.bmp"\n}\n' > $(BUILD_DIR)/desktop.json; \
+	    mcopy -i $@ $(BUILD_DIR)/desktop.json ::configs/desktop.json; \
 	fi
 
 # ------------------------------------------------------------------------------
@@ -311,15 +327,13 @@ $(DISK_IMG): $(BUILD_DIR)/boot_stage1.bin $(BUILD_DIR)/boot_stage2.bin $(BUILD_D
 	@truncate -s 1M $@
 	@# 3. Записываем Stage 2 на LBA 1 (занимает ровно 32 сектора: 1..32)
 	@dd if=$(BUILD_DIR)/boot_stage2.bin of=$@ bs=512 seek=1 conv=notrunc status=none
-	@# 4. Ядро в загрузочную область БОЛЬШЕ НЕ пишется: Stage 2 читает его как ФАЙЛ /sys/KERNEL.BIN
-	@#    из раздела FAT32 (копируется в $(PART_IMG) ниже, "boot from file"). Размер ядра до 14 МиБ.
-	@# 5. Прописываем стандартную таблицу MBR (Partition 1: Boot RAW, Partition 2: FAT32 с LBA 2048)
+	@# 4. Прописываем стандартную таблицу MBR (Partition 1: Boot RAW, Partition 2: FAT32 с LBA 2048)
 	@python3 -c "import struct; f=open('$@','r+b'); \
 	    f.seek(446); \
 	    p1 = struct.pack('<BBBBBBBBII', 0x80, 0x00, 0x02, 0x00, 0x7F, 0x20, 0x20, 0x00, 1, 2047); \
 	    p2 = struct.pack('<BBBBBBBBII', 0x00, 0x20, 0x21, 0x00, 0x0C, 0xFE, 0xFF, 0xFF, 2048, $(PART_SIZE_MB)*2048); \
 	    f.write(p1 + p2 + b'\x00'*32 + b'\x55\xAA')"
-	@# 6. Дописываем раздел FAT32 (начиная ровно с 1 МБ / LBA 2048)
+	@# 5. Дописываем раздел FAT32 (начиная ровно с 1 МБ / LBA 2048)
 	@cat $(PART_IMG) >> $@
 	@echo ">>> Готово: $(DISK_IMG) (overOS Two-Stage FAT32) успешно собран."
 
@@ -329,6 +343,23 @@ $(DISK_IMG): $(BUILD_DIR)/boot_stage1.bin $(BUILD_DIR)/boot_stage2.bin $(BUILD_D
 run: all
 	GDK_BACKEND=x11 qemu-system-x86_64 \
 		-m 1G \
+		-machine accel=kvm:tcg \
+		-cpu max \
+		-serial stdio \
+		-d cpu_reset,guest_errors \
+		-D qemu_error.log \
+		-no-reboot \
+		-no-shutdown \
+		-device usb-ehci,id=ehci \
+		-drive if=none,id=usb_drive,file=$(DISK_IMG),format=raw \
+		-device usb-storage,bus=ehci.0,drive=usb_drive \
+		-device intel-hda -device hda-duplex \
+		-vga std -global VGA.vgamem_mb=16
+
+run-debug: all
+	GDK_BACKEND=x11 qemu-system-x86_64 \
+		-m 1G \
+		-accel tcg \
 		-cpu max \
 		-serial stdio \
 		-d int,cpu_reset,guest_errors \
@@ -371,8 +402,13 @@ install-modules: $(MODULE_BINS) $(PROG_BINS)
 	@if [ -f "DOOM1.WAD" ]; then \
 	    sudo mcopy -o -i $(DEV)2 DOOM1.WAD ::DOOM1.WAD; \
 	fi
+	@if [ -f "$(SRC_DIR)/files/image/wallpaper.bmp" ]; then \
+	    sudo mcopy -o -i $(DEV)2 $(SRC_DIR)/files/image/wallpaper.bmp ::sys/wallpaper.bmp; \
+	elif [ -f "wallpaper.bmp" ]; then \
+	    sudo mcopy -o -i $(DEV)2 wallpaper.bmp ::sys/wallpaper.bmp; \
+	fi
 	sync
-	@echo ">>> Все модули и программы успешно обновлены на $(DEV)2"
+	@echo ">>> Все модули, программы и обои успешно обновлены на $(DEV)2"
 
 # ------------------------------------------------------------------------------
 # Центр управления сборкой и установкой overOS
@@ -398,4 +434,4 @@ clean:
 	rm -rf $(BUILD_DIR)
 	@if [ -d "$(DESKTOP_DIR)" ]; then $(MAKE) -C $(DESKTOP_DIR) clean; fi
 
-.PHONY: all modules progs run install install-modules clean run-usb test-menu _write_disk
+.PHONY: all modules progs run run-debug install install-modules clean run-usb test-menu _write_disk

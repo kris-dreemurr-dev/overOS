@@ -12,6 +12,9 @@ extern void draw_cursor(uint32_t color);
 extern void print_prompt(void);
 extern void mouse_feed_byte(uint8_t byte);
 extern int  sched_send_signal(uint64_t pid, int sig);
+extern uint32_t timer_ticks;
+extern volatile uint32_t g_fb_last_write_tick;   // последний кадр игры/desktop (blit или /dev/fb0)
+extern volatile int      g_fb_write_tty;
 
 extern int cursor_x;
 extern int cursor_y;
@@ -83,16 +86,26 @@ void ps2_hw_service(void) {
 
         if (tty_check_hotkey(sc)) continue;   // Alt+F1/F2 — поглощается здесь, глобально
 
-        if (sc == 0x1D) { g_ps2_ctrl_pressed = 1; continue; }    // Ctrl нажат
-        if (sc == 0x9D) { g_ps2_ctrl_pressed = 0; continue; }    // Ctrl отпущен
+        // Ctrl запоминаем, но НЕ поглощаем: играм (Doom/Quake: Ctrl = огонь) он нужен в очереди TTY.
+        // Оболочка его игнорирует (в scancode_ascii[0x1D] = 0).
+        if (sc == 0x1D) g_ps2_ctrl_pressed = 1;                  // Ctrl нажат
+        if (sc == 0x9D) g_ps2_ctrl_pressed = 0;                  // Ctrl отпущен
 
         // Ctrl+C -> SIGINT процессу-владельцу АКТИВНОГО TTY (tty->fg_pid).
         // SIGINT не перехватывается (обработчиков сигналов пока нет), поэтому
         // сейчас это всегда немедленное завершение — "минимум: kill, Ctrl+C" из плана.
-        if (g_ps2_ctrl_pressed && sc == 0x2E && !(sc & 0x80)) {   // 'C' (make-код)
-            tty_t* at = tty_get(tty_get_active_id());
-            if (at && at->fg_pid > 0) sched_send_signal((uint64_t)at->fg_pid, SIGINT);
-            continue;
+        // Исключение: если программа сейчас выводит кадры (игра, desktop), Ctrl+C ей НЕ убийца —
+        // в Quake Ctrl=огонь, C=вниз, и случайное сочетание не должно закрывать игру.
+        // Зависшая программа перестаёт выводить кадры, и через секунду Ctrl+C снова работает.
+        if (g_ps2_ctrl_pressed && sc == 0x2E) {                  // 'C' (make-код)
+            int act = tty_get_active_id();
+            int game_running = (g_fb_write_tty == act) && ((timer_ticks - g_fb_last_write_tick) < 1000);
+            if (!game_running) {
+                tty_t* at = tty_get(act);
+                if (at && at->fg_pid > 0) sched_send_signal((uint64_t)at->fg_pid, SIGINT);
+                continue;
+            }
+            // иначе — 'C' уходит игре обычной клавишей (ниже)
         }
 
         tty_kbd_push(tty_get_active_id(), sc);   // остальное — в очередь активного TTY
