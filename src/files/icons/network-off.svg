@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!-- Сети нет: разрыв -->
+  <rect x="3.5" y="5" width="8" height="6" rx="1" fill="none" stroke="currentColor" stroke-width="1.6"/>
+  <rect x="12.5" y="14.5" width="7" height="5" rx="1" fill="none" stroke="currentColor" stroke-width="1.6"/>
+  <path d="M9 13 L15 19 M15 13 L9 19" fill="none" stroke="#ED1515" stroke-width="1.8"/>
+</svg>

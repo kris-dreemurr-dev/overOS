@@ -1,19 +1,23 @@
+#include "tty.h"
 #include <stdint.h>
 #include <stddef.h>
 #include "../drivers/acpi.h"
 #include "../drivers/pci.h"
 #include "../drivers/ethernet.h"
 #include "../drivers/hda.h"
+#include "../drivers/usb/xhci.h"
+#include "../drivers/usb/usb.h"
+#include "../drivers/blk.h"
+#include "../fs/mount.h"
 #include "../fs/fs.h"
 #include "sys_loader.h"
 #include "prog_loader.h"
 #include "sched.h"
 #include "config.h"
+#include "users.h"
+#include "login.h"
 
 #define MAX_INPUT 256
-extern char input_buffer[MAX_INPUT];
-extern int input_len;
-extern int kbd_layout;
 
 extern void kputs(const char* str, uint32_t color);
 extern void kputc(char c, uint32_t color);
@@ -35,7 +39,6 @@ extern void acpi_power_off(void);
 extern void intel_set_backlight(int level, int silent);
 
 // Текущий путь в файловой системе (корень "/")
-extern char current_path[128];
 
 static uint8_t file_buf[1024 * 1024] __attribute__((aligned(4096)));
 static uint8_t mbr_tmp[512] __attribute__((aligned(64)));
@@ -62,6 +65,11 @@ static char* strcat(char* dest, const char* src) {
     }
     *ptr = '\0';
     return dest;
+}
+
+static int strchr_slash(const char* s) {
+    while (*s) if (*s++ == '/') return 1;
+    return 0;
 }
 
 static int is_sys_command(const char* cmd) {
@@ -156,30 +164,112 @@ void cmd_timer_test(void) {
     flush_buffer();
 }
 
-void execute_command(void) {
-    kputc('\n', 0xFFFFFF);
+static int s_no_newline = 0;   // повторный вход в execute_command для sudo: без лишней пустой строки
 
-    if (input_len <= 0) {
-        input_len = 0;
-        input_buffer[0] = '\0';
+void execute_command(void);
+int  shell_kernel_builtin(const char* cmd_in);
+
+// sudo <команда>: пароль принят — исполняем её от root, затем права возвращаются
+static int run_pending_sudo(void) {
+    tty_t* con = tty_console();
+    char cmd_copy[MAX_INPUT];
+    if (!login_take_sudo_cmd(cmd_copy, sizeof(cmd_copy))) return 0;
+    int i = 0;
+    while (cmd_copy[i] && i < (int)sizeof(con->input_buf) - 1) { con->input_buf[i] = cmd_copy[i]; i++; }
+    con->input_buf[i] = '\0';
+    con->input_len = i;
+    s_no_newline = 1;
+    execute_command();          // в конце вызовет login_after_command и напечатает приглашение
+    return 1;
+}
+
+void execute_command(void) {
+    tty_t* con = tty_console();
+    if (!con) return;
+    if (s_no_newline) s_no_newline = 0;
+    else kputc('\n', 0xFFFFFF);
+
+    // До входа в систему (и при вводе пароля) строку забирает login, а не оболочка
+    if (login_wants_line()) {
+        if (con->input_len >= (int)sizeof(con->input_buf)) con->input_len = (int)sizeof(con->input_buf) - 1;
+        con->input_buf[con->input_len] = '\0';
+        login_handle_line(con->input_buf);
+        con->input_len = 0;
+        con->input_buf[0] = '\0';
+        if (run_pending_sudo()) return;
         print_prompt();
         return;
     }
 
-    if (input_len >= MAX_INPUT) input_len = MAX_INPUT - 1;
-    input_buffer[input_len] = '\0';
+    if (con->input_len <= 0) {
+        con->input_len = 0;
+        con->input_buf[0] = '\0';
+        print_prompt();
+        return;
+    }
 
-    char* cmd = input_buffer;
+    if (con->input_len >= (int)sizeof(con->input_buf)) con->input_len = (int)sizeof(con->input_buf) - 1;
+    con->input_buf[con->input_len] = '\0';
+
+    char* cmd = con->input_buf;
     while (*cmd == ' ') cmd++;
 
     if (*cmd == '\0') {
-        input_len = 0;
-        input_buffer[0] = '\0';
+        con->input_len = 0;
+        con->input_buf[0] = '\0';
         print_prompt();
         return;
     }
 
-    // --- Обработка встроенных команд ---
+    // --- Команды сеанса: whoami, id, su, exit, logout, passwd, useradd, chmod, chown, stat ---
+    if (login_builtin(cmd)) {
+        con->input_len = 0;
+        con->input_buf[0] = '\0';
+        if (run_pending_sudo()) return;   // root вызвал sudo <команда> — без пароля
+        login_after_command();
+        print_prompt();
+        return;
+    }
+
+    // Сервисные команды ядра (taskmgr, модули, сеть, звук, запуск .prg)
+    shell_kernel_builtin(cmd);
+
+    con->input_len = 0;
+    con->input_buf[0] = '\0';
+
+    login_after_command();   // команда через sudo закончилась — права пользователя обратно
+    print_prompt();
+}
+
+// Экспортируемая функция исполнения команд шелла из оконных модулей
+void sys_exec_cmd(const char* cmd_str) {
+    if (!cmd_str || cmd_str[0] == '\0') return;
+    tty_t* con = tty_console();
+    if (!con) return;
+    int i = 0;
+    while (cmd_str[i] && i < (int)sizeof(con->input_buf) - 1) {
+        con->input_buf[i] = cmd_str[i];
+        i++;
+    }
+    con->input_buf[i] = '\0';
+    con->input_len = i;
+    execute_command();
+}
+// ============================================================================
+// Сервисные команды ядра: диспетчер задач, модули .sys, сеть, звук, демо, запуск
+// программ. Оболочка пользователя уже живёт в Ring 3 (sh.prg) и зовёт это через
+// sys_kcmd(118) для того, что ещё не переехало в userspace.
+// Возвращает 1, если команда распознана.
+// ============================================================================
+int shell_kernel_builtin(const char* cmd_in) {
+    char cmd_storage[256];
+    int ci = 0;
+    while (cmd_in[ci] && ci < (int)sizeof(cmd_storage) - 1) { cmd_storage[ci] = cmd_in[ci]; ci++; }
+    cmd_storage[ci] = '\0';
+    char* cmd = cmd_storage;
+    while (*cmd == ' ') cmd++;
+    if (*cmd == '\0') return 1;
+
     if (strcmp(cmd, "clear") == 0) {
         clear_screen(0x000000);
     } else if (strcmp(cmd, "help") == 0) {
@@ -211,6 +301,7 @@ void execute_command(void) {
         kputs("fastfetch -a        ", 0xFFFF55); kputs("- Pci scaner all pc (USB, Audio, Net)\n", 0xFFFFFF);
         kputs("brightness <0-100>  ", 0xFFFF55); kputs("- Set screen backlight brightness\n", 0xFFFFFF);
         kputs("netinfo             ", 0xFFFF55); kputs("- Network info\n", 0xFFFFFF);
+        kputs("lspci / pci         ", 0xFFFF55); kputs("- List PCI devices (id, class, subsystem)\n", 0xFFFFFF);
         kputs("taskmgr / ps        ", 0xFFFF55); kputs("- Task Manager\n", 0xFFFFFF);
         kputs("pkill <pid> [sig]   ", 0xFFFF55); kputs("- Send a signal to PID (default SIGKILL=9)\n", 0xFFFFFF);
 
@@ -229,12 +320,72 @@ void execute_command(void) {
         cmd_fastfetch();
     } else if (strcmp(cmd, "taskmgr") == 0 || strcmp(cmd, "ps") == 0) {
         sched_dump_tasks();
+    } else if (strcmp(cmd, "crash") == 0) {
+        // Намеренное падение ядра для проверки BSOD (как Alt+SysRq+C в Linux).
+        // Иначе синий экран нечем проверить, кроме настоящей ошибки.
+        if (cred_uid() != UID_ROOT) {
+            kputs("crash: нужны права root\n", 0xFF5555);
+        } else {
+            kputs("crash: роняем ядро по запросу...\n", 0xFFFF55);
+            flush_buffer();
+            volatile uint64_t* bad = (volatile uint64_t*)0xFFFFFF0000DEAD00ULL;
+            *bad = 0x1234;
+        }
     } else if (strncmp(cmd, "ping", 4) == 0) {
         char* arg = cmd + 4;
         while (*arg == ' ') arg++;
         cmd_ping(arg);
     } else if (strcmp(cmd, "pong") == 0 || strcmp(cmd, "pingd") == 0) {
         cmd_pong();
+    } else if (strcmp(cmd, "usb") == 0 || strcmp(cmd, "lsusb") == 0) {
+        // Какой контроллер ведёт шину и что на портах. Нужно и мне при отладке,
+        // и пользователю: загрузочный экран теперь краток, как у systemd.
+        int drv = usb_active_driver();
+        kputs("Драйвер USB: ", 0xAAAAAA);
+        kputs(drv == USB_DRV_XHCI ? "xHCI (USB 3.0)\n" : drv == USB_DRV_EHCI ? "EHCI (USB 2.0)\n" : "нет\n", 0xFFFFFF);
+        char b[16];
+        if (xhci_present()) {
+            kputs("xHCI: портов ", 0xAAAAAA); itoa(xhci_port_count(), b); kputs(b, 0xFFFFFF);
+            kputs(", занято ", 0xAAAAAA); itoa(xhci_ports_connected(), b); kputs(b, 0xFFFFFF);
+            kputs("\n", 0xFFFFFF);
+        }
+        {
+            extern void usb_hid_counts(int* kbds, int* mice);
+            int nk = 0, nm = 0;
+            usb_hid_counts(&nk, &nm);
+            kputs("USB-клавиатур: ", 0xAAAAAA); itoa(nk, b); kputs(b, 0xFFFFFF);
+            kputs(", USB-мышей: ", 0xAAAAAA); itoa(nm, b); kputs(b, 0xFFFFFF);
+            kputs("\n", 0xFFFFFF);
+        }
+        // Диски из реестра и куда они подключены
+        mount_info_t mi[8];
+        int nm = mount_list(mi, 8);
+        for (int i = 0; i < BLK_MAX; i++) {
+            blk_dev_t* d = blk_get(i);
+            if (!d) continue;
+            char nm_dev[40];
+            blk_name(i, nm_dev, sizeof(nm_dev));
+            kputs("диск ", 0xAAAAAA); itoa(i, b); kputs(b, 0xFFFFFF); kputs(": ", 0xAAAAAA);
+            kputs(nm_dev, 0xFFFFFF);
+            kputs(d->bus == BLK_BUS_XHCI ? " (xHCI), " : " (EHCI), ", 0xAAAAAA);
+            itoa((int)blk_size_mb(i), b); kputs(b, 0xFFFFFF); kputs(" МБ", 0xAAAAAA);
+            if (d->gone) kputs(", пропал", 0xFF5555);
+            kputs("\n", 0);
+        }
+        for (int i = 0; i < nm; i++) {
+            kputs("  ", 0); kputs(mi[i].path, 0x55FF55);
+            if (mi[i].label[0]) { kputs("  [", 0xAAAAAA); kputs(mi[i].label, 0xFFFFFF); kputs("]", 0xAAAAAA); }
+            kputs("\n", 0);
+        }
+    } else if (strcmp(cmd, "lspci") == 0 || strcmp(cmd, "pci") == 0) {
+        cmd_lspci();
+    } else if (strcmp(cmd, "usb-debug") == 0) {
+        static int on = 0;
+        on = !on;
+        usb_set_verbose(on);
+        kputs(on ? "Подробный вывод USB включён\n" : "Подробный вывод USB выключен\n", 0xFFFF55);
+    } else if (strcmp(cmd, "hda-dump") == 0) {
+        hda_dump_state();
     } else if (strcmp(cmd, "play sound") == 0 || strcmp(cmd, "play-sound") == 0 || strcmp(cmd, "playsound") == 0) {
         // 1. Проверяем инициализацию HDA
         if (hda_get_status() == HDA_STATUS_NOT_FOUND) {
@@ -243,7 +394,7 @@ void execute_command(void) {
             if (hda_init() != 0) {
                 kputs("[HDA] Ошибка: Intel HDA контроллер не найден на шине PCI!\n", 0xFF5555);
                 flush_buffer();
-                return;
+                return 1;
             }
         }
 
@@ -251,7 +402,7 @@ void execute_command(void) {
         kputs("[HDA] Запуск тестового тона (100 Гц, безопасная громкость)\n", 0x55FFFF);
         kputs("[HDA] Воспроизведение на 10 секунд: ", 0xAAAAAA);
         flush_buffer();
-
+        
         hda_play_test_tone();
 
         // 3. Обратный отсчёт на 10 секунд с шагом в 1 секунду
@@ -297,6 +448,8 @@ void execute_command(void) {
             kputs("Usage: pkill <pid> [signal]   (signal defaults to 9 = SIGKILL)\n", 0xFF5555);
         } else if (pid == 0) {
             kputs("pkill: refusing to signal PID 0 (kernel_main)\n", 0xFF5555);
+        } else if (cred_uid() != UID_ROOT && sched_pid_uid((uint64_t)pid) != cred_uid()) {
+            kputs("pkill: Operation not permitted (not your process)\n", 0xFF5555);
         } else {
             int r = sched_send_signal((uint64_t)pid, sig);
             char nb[16];
@@ -334,7 +487,7 @@ void execute_command(void) {
         kputs(buf, 0xFFFF55);
         kputs("%\n", 0x55FF55);
     } else if (strcmp(cmd, "dir") == 0 || strcmp(cmd, "ls") == 0) {
-        fs_dir();
+        if (login_may(".", PERM_R | PERM_X)) fs_dir();
 } else if (strncmp(cmd, "cd ", 3) == 0) {
         char* target = cmd + 3;
         while (*target == ' ') target++;
@@ -346,38 +499,26 @@ void execute_command(void) {
         }
 
         if (strcmp(target, "..") == 0) {
-            if (fs_change_dir("..")) {
-                int len = strlen(current_path);
-                while (len > 1 && current_path[len - 1] != '/') {
-                    current_path[len - 1] = '\0';
-                    len--;
-                }
-                if (len > 1 && current_path[len - 1] == '/') {
-                    current_path[len - 1] = '\0';
-                }
-            } else {
-                kputs("[-] Already at root!\n", 0xFF5555);
-            }
+            if (!fs_change_dir("..")) kputs("[-] Already at root!\n", 0xFF5555);
         } else if (strcmp(target, "/") == 0) {
             fs_go_root();
-            current_path[0] = '/';
-            current_path[1] = '\0';
+        } else if (!login_may(target, PERM_X)) {
+            // нет права входа в каталог
+        } else if (target[0] == '/' || strchr_slash(target)) {
+            // Путь с '/' (абсолютный или a/b): разбираем целиком от корня
+            char abs_path[128];
+            perm_normalize(target, tty_cwd(), abs_path, sizeof(abs_path));
+            if (!login_chdir_abs(abs_path)) kputs("[-] Directory not found!\n", 0xFF5555);
         } else {
-            if (fs_change_dir(target)) {
-                if (strcmp(current_path, "/") != 0) {
-                    strcat(current_path, "/");
-                }
-                const char* real_name = fs_get_last_dir_name();
-                strcat(current_path, (real_name && real_name[0]) ? real_name : target);
-            } else {
-                kputs("[-] Directory not found!\n", 0xFF5555);
-            }
+            if (!fs_change_dir(target)) kputs("[-] Directory not found!\n", 0xFF5555);
         }
     } else if (strncmp(cmd, "cat ", 4) == 0) {
         char* target = cmd + 4;
         while (*target == ' ') target++;
-        int bytes = fs_read_file(target, file_buf, sizeof(file_buf) - 1);
-        if (bytes > 0) {
+        int bytes = login_may(target, PERM_R) ? fs_read_file(target, file_buf, sizeof(file_buf) - 1) : -2;
+        if (bytes == -2) {
+            // отказ уже напечатан
+        } else if (bytes > 0) {
             file_buf[bytes] = '\0';
             kputs((char*)file_buf, 0xFFFFFF);
             kputc('\n', 0xFFFFFF);
@@ -387,7 +528,10 @@ void execute_command(void) {
     } else if (strncmp(cmd, "touch ", 6) == 0) {
         char* target = cmd + 6;
         while (*target == ' ') target++;
-        if (fs_touch(target)) {
+        if (!login_may_parent(target, PERM_W)) {
+            // отказ уже напечатан
+        } else if (fs_touch(target)) {
+            perm_on_create(cred_uid(), cred_gid(), target, tty_cwd(), 0);
             kputs("[+] File created successfully.\n", 0x55FF55);
         } else {
             kputs("[-] Failed to create file (already exists or disk full).\n", 0xFF5555);
@@ -395,7 +539,10 @@ void execute_command(void) {
     } else if (strncmp(cmd, "mkdir ", 6) == 0) {
         char* target = cmd + 6;
         while (*target == ' ') target++;
-        if (fs_make_folder(target)) {
+        if (!login_may_parent(target, PERM_W)) {
+            // отказ уже напечатан
+        } else if (fs_make_folder(target)) {
+            perm_on_create(cred_uid(), cred_gid(), target, tty_cwd(), 1);
             kputs("[+] Directory created successfully.\n", 0x55FF55);
         } else {
             kputs("[-] Failed to create directory (already exists or disk full).\n", 0xFF5555);
@@ -403,7 +550,10 @@ void execute_command(void) {
     } else if (strncmp(cmd, "rm ", 3) == 0) {
         char* target = cmd + 3;
         while (*target == ' ') target++;
-        if (fs_remove_file(target)) {
+        if (!login_may_parent(target, PERM_W)) {
+            // отказ уже напечатан
+        } else if (fs_remove_file(target)) {
+            perm_on_remove(target, tty_cwd());
             kputs("[+] File deleted successfully.\n", 0x55FF55);
         } else {
             kputs("[-] File not found or error deleting.\n", 0xFF5555);
@@ -412,12 +562,6 @@ void execute_command(void) {
     // --- Управление системой и питанием ---
     } else if (strcmp(cmd, "ver") == 0) {
         kputs(OS_NAME " " OS_ARCH " (process patch) 1.0\n", 0xFFFF55);
-    } else if (strcmp(cmd, "rus") == 0) {
-        kputs("lang turned to russian\n", 0xFFFF55);
-        kbd_layout = 1;
-    } else if (strcmp(cmd, "англ") == 0 || strcmp(cmd, "1972") == 0)  {
-        kputs("lang turned to english\n", 0xFFFF55);
-        kbd_layout = 0;
     } else if (strcmp(cmd, "reboot") == 0 || strcmp(cmd, "r") == 0) {
         kputs("Rebooting system...\n", 0xFF5555);
         flush_buffer();
@@ -437,7 +581,10 @@ void execute_command(void) {
         while (*args == ' ') args++;
 
         int res = prog_load_module(prog_filename, args);
-        if (res < 0) {
+        if (res != PROG_ENOENT) {
+            // программа отработала (код выхода, в т.ч. отрицательный после сбоя/сигнала)
+            // или загрузчик уже объяснил отказ
+        } else {
             kputs("Unknown command: ", 0xFF5555);
             kputs(cmd, 0xFFFFFF);
             kputc('\n', 0xFFFFFF);
@@ -458,26 +605,8 @@ void execute_command(void) {
             kputc('\n', 0xFFFFFF);
         }
     } else {
-        kputs("Unknown command: ", 0xFF5555);
-        kputs(cmd, 0xFFFFFF);
-        kputc('\n', 0xFFFFFF);
+        return 0;          // команду не знаем — пусть решает вызывающая оболочка
     }
-
-    input_len = 0;
-    input_buffer[0] = '\0';
-
-    print_prompt();
+    return 1;
 }
 
-// Экспортируемая функция исполнения команд шелла из оконных модулей
-void sys_exec_cmd(const char* cmd_str) {
-    if (!cmd_str || cmd_str[0] == '\0') return;
-    int i = 0;
-    while (cmd_str[i] && i < MAX_INPUT - 1) {
-        input_buffer[i] = cmd_str[i];
-        i++;
-    }
-    input_buffer[i] = '\0';
-    input_len = i;
-    execute_command();
-}

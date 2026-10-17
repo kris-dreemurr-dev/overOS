@@ -1,38 +1,7 @@
 #include "quakegeneric/quakegeneric.h"
-#include <stdint.h>
+#include "ovos.h"   // общие обёртки сисколов (src/lib)
 #include <stddef.h>
 
-// --- Системные вызовы overOS из doomgeneric_overos.c ---
-static inline void sys_set_palette(const uint32_t* pal) {
-    __asm__ volatile ("int $0x80" : : "a"(20), "b"(pal) : "memory");
-}
-
-static inline uint32_t sys_blit_frame(const uint32_t* fb) {
-    uint32_t r;
-    __asm__ volatile ("int $0x80" : "=a"(r) : "0"(21), "b"(fb) : "memory");
-    return r;
-}
-
-static inline uint8_t sys_get_key(void) {
-    uint32_t ret;
-    __asm__ volatile ("int $0x80" : "=a"(ret) : "0"(6) : "memory");
-    return (uint8_t)ret;
-}
-
-static inline uint32_t sys_tsc_per_ms(void) {
-    uint32_t r;
-    __asm__ volatile ("int $0x80" : "=a"(r) : "0"(22) : "memory");
-    return r;
-}
-
-static inline void sys_get_mouse(int* dx, int* dy, uint8_t* buttons) {
-    __asm__ volatile (
-        "int $0x80"
-        :
-        : "a"(23), "b"(dx), "c"(dy), "d"(buttons)
-        : "memory"
-    );
-}
 // --------------------------------------------------------
 
 static const unsigned char scancode_to_quake[128] = {
@@ -183,7 +152,7 @@ void QG_SetPalette(unsigned char palette[768]) {
         local_palette[i] = (r << 16) | (g << 8) | b;
     }
     // Отправляем палитру ядру
-    sys_set_palette(local_palette);
+    ov_set_palette(local_palette);
 }
 
 void QG_DrawFrame(void *pixels) {
@@ -197,7 +166,7 @@ void QG_DrawFrame(void *pixels) {
     }
     
     // Отрисовываем через сисколл
-    sys_blit_frame(rgb_frame_buffer);
+    ov_blit_frame(rgb_frame_buffer);
 }
 
 int QG_GetKey(int *down, int *key) {
@@ -218,7 +187,7 @@ int QG_GetKey(int *down, int *key) {
 
     // Считываем сканкод, отсекая префикс 0xE0 для стрелок клавиатуры
     do {
-        sc = sys_get_key();
+        sc = ov_get_key();
         if (sc == 0) return 0;
     } while (sc == 0xE0);
 
@@ -239,7 +208,7 @@ void QG_GetMouseMove(int *x, int *y) {
     uint8_t buttons = 0;
 
     // Ядро возвращает движение, накопленное с прошлого вызова (вправо +, вниз +) и кнопки
-    sys_get_mouse(&dx, &dy, &buttons);
+    ov_get_mouse_rel(&dx, &dy, &buttons);
     g_mouse_btn_now = buttons & 7;
 
     *x = dx * QG_MOUSE_SCALE;

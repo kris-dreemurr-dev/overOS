@@ -29,39 +29,10 @@ typedef struct {
     char version[32];
 } __attribute__((packed)) kernel_info_t;
 
-// -----------------------------------------------------------------------------
-// Протокол оконного сервера (Window Manager ABI)
-// -----------------------------------------------------------------------------
-#define MAX_SYS_WINDOWS  16
-#define DEFAULT_WIN_SIZE 320
-
-#define WEV_MOUSE_DOWN 1
-#define WEV_MOUSE_UP   2
-#define WEV_KEY        3
-
 #define NET_STATE_DISCONNECTED 0
 #define NET_STATE_LOCAL_ONLY   1
 #define NET_STATE_ONLINE       2
 
-
-typedef struct {
-    const char*     title;
-    int             w;
-    int             h;
-    const uint16_t* icon;
-} __attribute__((packed)) win_desc_t;
-
-typedef struct {
-    int      id;
-    int      pid;
-    char     title[64];
-    int      x, y;
-    int      w, h;
-    int      has_icon;
-    uint16_t icon[16];
-    int      is_minimized;
-    int      is_active;
-} __attribute__((packed)) kernel_window_t;
 
 typedef struct {
     char     name[32];      // Имя файла
@@ -70,13 +41,6 @@ typedef struct {
     uint32_t cluster;       // Стартовый кластер
     char     clean_name[64];
 } __attribute__((packed)) sys_file_info_t;
-
-typedef struct {
-    int type;        // WEV_*
-    int x, y;        // координаты внутри клиентской области окна
-    int buttons;
-    int key;         // скан-код для WEV_KEY
-} win_event_t;
 
 typedef struct {
     uint32_t state;       // NET_STATE_*
@@ -111,6 +75,13 @@ static inline int sys_get_mouse(user_mouse_t* ms) {
     int ret;
     __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(7), "b"(ms) : "memory");
     return ret;
+}
+
+// Смещение мыши с прошлого вызова, без упора в край экрана (для захвата мыши)
+static inline void sys_get_mouse_delta(int* dx, int* dy, uint8_t* buttons) {
+    uint64_t r;
+    __asm__ volatile ("int $0x80" : "=a"(r) : "a"(23), "b"(dx), "c"(dy), "d"(buttons) : "memory");
+    (void)r;
 }
 
 static inline int sys_get_time(rtc_time_t* t) {
@@ -148,6 +119,13 @@ static inline int sys_write(int fd, const void* buf, uint32_t sz) {
     return ret;
 }
 
+// Позиция дескриптора (сисколл 19): нужна для частичного вывода кадра в /dev/fb0
+static inline int64_t sys_lseek(int fd, int64_t off, int whence) {
+    int64_t ret;
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(19), "b"(fd), "c"(off), "d"(whence) : "memory");
+    return ret;
+}
+
 static inline void* sys_sbrk(int64_t inc) {
     uint64_t cur = 0;
     __asm__ volatile ("int $0x80" : "=a"(cur) : "a"(14), "b"(0) : "memory");
@@ -170,38 +148,6 @@ static inline int sys_get_dir_files(const char* path, sys_file_info_t* buf, int 
     return ret;
 }
 
-static inline int sys_fork(void) {
-    int ret;
-    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(30) : "memory");
-    return ret;
-}
-
-static inline int sys_execve(const char* fn, const char* args) {
-    int ret;
-    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(31), "b"(fn), "c"(args) : "memory");
-    return ret;
-}
-
-static inline int sys_create_window(const win_desc_t* desc) {
-    int ret;
-    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(40), "b"(desc) : "memory");
-    return ret;
-}
-
-static inline int sys_get_windows(kernel_window_t* out, int max_cnt) {
-    int ret;
-    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(41), "b"(out), "c"(max_cnt) : "memory");
-    return ret;
-}
-
-// Ядро берёт 4-й аргумент из R15 (frame[0]), поэтому кладём его туда явно.
-static inline int sys_update_window(int id, int x, int y, int is_minimized) {
-    uint64_t ret = 42;
-    register uint64_t r15v __asm__("r15") = (uint64_t)is_minimized;
-    __asm__ volatile ("int $0x80" : "+a"(ret) : "b"(id), "c"(x), "d"(y), "r"(r15v) : "memory");
-    return (int)ret;
-}
-
 static inline int sys_kill(int pid, int sig) {
     int ret;
     __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(33), "b"(pid), "c"(sig) : "memory");
@@ -211,27 +157,6 @@ static inline int sys_kill(int pid, int sig) {
 static inline int sys_waitpid(int pid, int* status, int options) {
     int ret;
     __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(32), "b"(pid), "c"(status), "d"(options) : "memory");
-    return ret;
-}
-
-static inline int sys_win_present(int id, const void* px) {
-    int ret;
-    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(43), "b"(id), "c"(px) : "memory");
-    return ret;
-}
-static inline int sys_win_read(int id, void* dst, uint32_t* seq) {
-    int ret;
-    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(44), "b"(id), "c"(dst), "d"(seq) : "memory");
-    return ret;
-}
-static inline int sys_win_poll_event(int id, win_event_t* ev) {
-    int ret;
-    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(45), "b"(id), "c"(ev) : "memory");
-    return ret;
-}
-static inline int sys_win_push_event(int id, const win_event_t* ev) {
-    int ret;
-    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(46), "b"(id), "c"(ev) : "memory");
     return ret;
 }
 
@@ -312,9 +237,225 @@ static inline void sys_audio_stop(void) {
     __asm__ volatile ("int $0x80" : "+a"(r) : "b"(5) : "memory");
 }
 
+// Куда звук реально уходит: 0 никуда, 1 аналоговый выход, 2 HDMI
+static inline int sys_audio_get_target(void) {
+    int ret;
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(70), "b"(17) : "memory");
+    return ret;
+}
+
 static inline int sys_audio_jack_poll(void) {
     int ret;
     __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(70), "b"(6) : "memory");
+    return ret;
+}
+
+// Громкость и mute драйвера HDA (программная, 0..100) — те же подкоманды сисколла 70, что использует плеер
+static inline void sys_audio_set_volume(int pct) {
+    uint64_t r = 70;
+    __asm__ volatile ("int $0x80" : "+a"(r) : "b"(14), "c"((uint64_t)(uint32_t)pct) : "memory");
+}
+
+static inline int sys_audio_get_volume(void) {
+    int ret;
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(70), "b"(15) : "memory");
+    return ret;
+}
+
+static inline void sys_audio_set_mute(int m) {
+    uint64_t r = 70;
+    __asm__ volatile ("int $0x80" : "+a"(r) : "b"(16), "c"((uint64_t)(uint32_t)m) : "memory");
+}
+
+// Сколько тактов TSC в миллисекунде (калибровка ядра, 0 = нет). Нужно, чтобы мерить время в Ring 3 через rdtsc.
+static inline uint64_t sys_get_tsc_per_ms(void) {
+    uint64_t ret;
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(22) : "memory");
+    return ret;
+}
+
+static inline int sys_get_arg(char* out, int max_len) {
+    int ret;
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(49), "b"(out), "c"(max_len) : "memory");
+    return ret;
+}
+
+// -----------------------------------------------------------------------------
+// Колесо мыши: щелчки с прошлого вызова (+ вниз, - вверх)
+static inline int sys_get_wheel(void) {
+    int ret;
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(24) : "memory");
+    return ret;
+}
+
+// Пользователи и права (UNIX DAC)
+// -----------------------------------------------------------------------------
+typedef struct {
+    char name[32];
+    int  uid;
+    int  gid;
+    char home[64];
+} user_info_t;
+
+static inline int sys_getuid(void) {
+    int ret;
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(80) : "memory");
+    return ret;
+}
+
+static inline int sys_getgid(void) {
+    int ret;
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(81) : "memory");
+    return ret;
+}
+
+static inline int sys_setuid(int uid) {
+    int ret;
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(82), "b"(uid) : "memory");
+    return ret;
+}
+
+static inline int sys_setgid(int gid) {
+    int ret;
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(83), "b"(gid) : "memory");
+    return ret;
+}
+
+// Проверка пароля ядром: uid или -1 (после неудачи ядро держит паузу ~1 с)
+static inline int sys_auth(const char* name, const char* pass) {
+    int ret;
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(84), "b"(name), "c"(pass) : "memory");
+    return ret;
+}
+
+static inline int sys_getpwuid(int uid, user_info_t* out) {
+    int ret;
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(85), "b"(uid), "c"(out) : "memory");
+    return ret;
+}
+
+// Первоначальная настройка (OOBE)
+// admin = 1: пользователь в группе wheel (может sudo / окно пароля администратора)
+static inline int sys_useradd(const char* name, const char* pass, int admin) {
+    int ret;
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(90), "b"(name), "c"(pass), "d"(admin) : "memory");
+    return ret;
+}
+
+// Повышение прав процесса до root паролем ТЕКУЩЕГО пользователя (он должен быть в wheel)
+static inline int sys_sudo(const char* pass) {
+    int ret;
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(93), "b"(pass) : "memory");
+    return ret;
+}
+
+static inline int sys_is_admin(int uid) {
+    int ret;
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(94), "b"(uid) : "memory");
+    return ret;
+}
+
+#define SYS_LANG_RU 0
+#define SYS_LANG_EN 1
+
+typedef struct {
+    int lang;        // SYS_LANG_*
+    int tz_index;    // индекс в списке поясов ядра, -1 — UTC
+    int tz_offset;   // часы от UTC
+    int layout2;     // 1 — вторая раскладка (RU) включена
+} sys_settings_t;
+
+static inline int sys_get_system(sys_settings_t* out) {
+    int ret;
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(95), "b"(out) : "memory");
+    return ret;
+}
+
+// -1 — не менять параметр. Только root.
+static inline int sys_set_system(int lang, int tz_index, int layout2) {
+    int ret;
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(96), "b"(lang), "c"(tz_index), "d"(layout2) : "memory");
+    return ret;
+}
+
+typedef struct {
+    char name[32];   // "Europe/Moscow"
+    char city[64];   // "Москва"
+    int  offset;
+} tz_info_t;
+
+// Возвращает число поясов; out заполняется, если index в списке
+static inline int sys_tz_info(int index, tz_info_t* out) {
+    int ret;
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(97), "b"(index), "c"(out) : "memory");
+    return ret;
+}
+
+static inline int sys_lock_user(const char* name) {
+    int ret;
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(98), "b"(name) : "memory");
+    return ret;
+}
+
+static inline int sys_oobe_state(void) {
+    int ret;
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(91) : "memory");
+    return ret;
+}
+
+static inline int sys_oobe_finish(void) {
+    int ret;
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(92) : "memory");
+    return ret;
+}
+
+// Смена пароля: root может без старого (old = "")
+static inline int sys_passwd(const char* name, const char* new_pass, const char* old_pass) {
+    int ret;
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(89), "b"(name), "c"(new_pass), "d"(old_pass) : "memory");
+    return ret;
+}
+
+// Пользователь сеанса (greeter.c): программы desktop запускаются от его имени
+extern int g_session_uid;
+extern int g_session_gid;
+
+// Запуск программы от имени пользователя сеанса (sys_spawn, без fork). <0 — код ошибки.
+static inline int sys_spawn_as_session(const char* path, const char* arg) {
+    int ret;
+    uint64_t ug = ((uint64_t)(uint32_t)g_session_uid << 32) | (uint32_t)g_session_gid;
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(109), "b"(path), "c"(arg ? arg : ""), "d"(ug) : "memory");
+    return ret;
+}
+
+// Запуск программы с передачей пути к файлу как аргумента
+static inline int sys_open_file(const char* app, const char* filepath) {
+    return sys_spawn_as_session(app, filepath);
+}
+
+
+static inline int sys_mkdir(const char* path) {
+    int ret;
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(17), "b"(path) : "memory");
+    return ret;
+}
+
+// Владелец и права файла (нужно для конфигов в домашнем каталоге: desktop — root)
+static inline int sys_chown(const char* path, int uid, int gid) {
+    int ret;
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(87), "b"(path), "c"(uid), "d"(gid) : "memory");
+    return ret;
+}
+
+static inline int sys_chmod(const char* path, int mode) {
+    int ret;
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(86), "b"(path), "c"(mode) : "memory");
+    return ret;
+}
+
+static inline int sys_create_file(const char* path) {
+    int ret;
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(18), "b"(path) : "memory");
     return ret;
 }
 

@@ -58,6 +58,8 @@ int     vfs_sys_open(const char* path, uint32_t flags);
 int64_t vfs_sys_read(int fd_num, void* buf, uint64_t count);
 int64_t vfs_sys_write(int fd_num, const void* buf, uint64_t count);
 int     vfs_sys_close(int fd_num);
+// Сдвиг позиции чтения: whence 0 SEEK_SET, 1 SEEK_CUR, 2 SEEK_END
+int64_t vfs_sys_lseek(int fd_num, int64_t off, int whence);
 int     vfs_sys_ioctl(int fd_num, uint64_t req, uint64_t arg);
 
 #endif

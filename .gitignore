@@ -21,3 +21,8 @@ __pycache__/
 .DS_Store
 .vscode/
 .idea/
+# Подсказки редактору (генерируется: make compile-commands)
+compile_commands.json
+
+# архив исходников FFmpeg (качается скриптом tools/build_ffmpeg.sh)
+src/libs/ffmpeg/dist/*.tar.xz

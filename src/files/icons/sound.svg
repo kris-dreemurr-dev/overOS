@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!-- Звук: динамик с волнами -->
+  <path d="M4 9.5 H7.5 L12 5.5 V18.5 L7.5 14.5 H4 Z" fill="currentColor"/>
+  <path d="M15 9 C16.6 10.4 16.6 13.6 15 15" fill="none" stroke="currentColor" stroke-width="1.6"/>
+  <path d="M17.6 6.6 C20.4 9 20.4 15 17.6 17.4" fill="none" stroke="currentColor" stroke-width="1.6"/>
+</svg>

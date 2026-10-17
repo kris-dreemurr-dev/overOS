@@ -1,7 +1,13 @@
 #include "user_mode.h"
+#include "../fs/mount.h"
+#include "notify.h"
+#include "../drivers/blk.h"
 #include "../fs/fs.h"
 #include "sched.h"
+#include "smp.h"
+_Static_assert(SMP_MAX * SMP_AP_STACK == 262144, "syscall_isr_stub: диапазон стеков рабочих ядер");
 #include "../drivers/mouse.h"
+#include "cpu.h"
 #include "../drivers/ethernet.h"
 #include "../drivers/hda.h"
 #include "../memory/vmm.h"
@@ -10,39 +16,15 @@
 #include "tty.h"
 #include "../fs/vfs.h"
 #include "../fs/devfs.h"
-#include "win_proto.h"
 #include "config.h"
+#include "users.h"
+#include "ipc.h"
+#include "sys_loader.h"
+#include "lib_loader.h"
+extern const char* fs_caller_cwd(void);
+   // каталог вызывающего: процесс или оболочка TTY
+extern int shell_kernel_builtin(const char* cmd);   // сервисные команды ядра (main.c)
 
-// Реестр окон ядра
-static kernel_window_t g_windows[MAX_SYS_WINDOWS];
-static int             g_window_count = 0;
-static int             g_next_win_id = 1;
-
-// --- Поверхности окон и очереди событий (оконный сервер) ---
-#ifndef WEV_MOUSE_DOWN
-typedef struct {
-    int type;        // WEV_*
-    int x, y;        // координаты внутри клиентской области окна
-    int buttons;
-    int key;         // скан-код для WEV_KEY
-} win_event_t;
-#define WEV_MOUSE_DOWN 1
-#define WEV_MOUSE_UP   2
-#define WEV_KEY        3
-#endif
-
-#define WIN_EV_QUEUE 32
-
-typedef struct {
-    uint8_t*    surf;        // виртуальный адрес поверхности (w*h*4 байт)
-    uint64_t    surf_phys;   // физический адрес (для освобождения)
-    uint32_t    surf_pages;
-    uint32_t    seq;         // растёт при каждом sys_win_present
-    win_event_t ev[WIN_EV_QUEUE];
-    uint32_t    ev_head, ev_tail;
-} win_priv_t;
-
-static win_priv_t g_wpriv[MAX_SYS_WINDOWS];   // индекс совпадает с g_windows[]
 
 // В ядре нет libc: при -ffreestanding GCC всё равно превращает циклы копирования/зануления
 // и копии крупных структур в вызовы memcpy/memset, которых при линковке нет
@@ -52,19 +34,6 @@ static inline void wm_copy(void* dst, const void* src, uint64_t bytes) {
 }
 static inline void wm_zero(void* dst, uint64_t bytes) {
     __asm__ volatile ("rep stosb" : "+D"(dst), "+c"(bytes) : "a"(0) : "memory");
-}
-
-static int wm_index_by_id(int id) {
-    for (int i = 0; i < g_window_count; i++)
-        if (g_windows[i].id == id) return i;
-    return -1;
-}
-
-static void wm_free_priv(int i) {
-    for (uint32_t k = 0; k < g_wpriv[i].surf_pages; k++)
-        pmm_free_page((void*)(g_wpriv[i].surf_phys + (uint64_t)k * 4096));
-    g_wpriv[i].surf_pages = 0;
-    g_wpriv[i].surf = 0;
 }
 
 
@@ -95,38 +64,15 @@ extern uint32_t back_buffer[];
 extern uint64_t g_tsc_per_ms;
 extern uint32_t timer_ticks;
 
-// Чтение исполняемого файла с поддержкой полных путей (например "/desprogs/overfiles.prg")
-static int kernel_read_file_by_path(const char* path, uint8_t* buf, uint32_t max_size) {
-
+int kernel_create_fs_entry(const char* path, int is_dir) {
     if (!path || !path[0]) return -1;
 
-    fs_go_root();
-
-    const char* p = path;
-    if (p[0] == '/') p++;
-
-    // Ищем последний слэш
-    const char* last_slash = 0;
-    for (const char* s = p; *s; s++) {
-        if (*s == '/') last_slash = s;
-    }
-
-    if (last_slash) {
-        char dir_name[64];
-        int dlen = (int)(last_slash - p);
-        if (dlen >= (int)sizeof(dir_name)) dlen = sizeof(dir_name) - 1;
-        for (int i = 0; i < dlen; i++) dir_name[i] = p[i];
-        dir_name[dlen] = '\0';
-
-        fs_change_dir(dir_name);
-        int bytes = fs_read_file(last_slash + 1, buf, max_size);
-        fs_go_root();
-        return bytes;
-    } else {
-        int bytes = fs_read_file(p, buf, max_size);
-        fs_go_root();
-        return bytes;
-    }
+    // Путь с каталогами разбирает сама ФС (fs_create_entry): ядру больше не нужно
+    // ходить по компонентам и возвращать драйвер обратно в каталог оболочки.
+    fs_lock();
+    int res = is_dir ? fs_make_folder(path) : fs_touch(path);
+    fs_unlock();
+    return res;
 }
 
 static uint32_t now_ms(void) {
@@ -166,6 +112,7 @@ static uint32_t g_doom_palette[256];
 
 static int g_mouse_last_init = 0;
 static int g_mouse_last_x = 0, g_mouse_last_y = 0;
+
 
 static void str_to_fat83(const char* in, char* out83) {
     for (int i = 0; i < 11; i++) out83[i] = ' ';
@@ -264,6 +211,96 @@ static void blit_320x200_to_lfb(const uint32_t* user_fb) {
     g_lfb_gen++;   // копия экрана в devfs.c (/dev/fb0) теперь устарела
 }
 
+// =============================================================================
+// Проверка указателей из Ring 3. Без неё любая программа могла передать в сисколл
+// адрес ядра (верхняя половина) и прочитать/перезаписать его память — например, свой uid.
+// =============================================================================
+#define USER_SPACE_END 0x0000800000000000ULL
+// NULL каждый сисколл обрабатывает сам; иначе — весь буфер отображён и доступен Ring 3
+static int uptr_ok(uint64_t p, uint64_t len) {
+    if (p == 0) return 1;
+    return vmm_user_range_ok(p, len);
+}
+
+// Строку проверяем постранично до нулевого байта (не дальше, чем ядро из неё прочитает)
+#define USTR_MAX 256
+static int ustr_ok(uint64_t p) {
+    if (p == 0) return 1;
+    return vmm_user_str_ok(p, USTR_MAX);
+}
+
+static int user_args_ok(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3) {
+    switch (num) {
+        case 1: case 10: case 17: case 18: case 86: case 87: case 93: case 98: case 102: case 103:
+            return ustr_ok(a1);
+        case SYS_SMP_INFO: return a1 == 0 || uptr_ok(a1, sizeof(ov_smp_info_t));
+        case SYS_WAIT_U32: return (a1 & 3) == 0 && uptr_ok(a1, 4);
+        case 100: return a3 <= IPC_MSG_MAX && uptr_ok(a2, a3);
+        case 101: return uptr_ok(a1, sizeof(ipc_msg_t));
+        case 109: return ustr_ok(a1) && ustr_ok(a2);
+        case 7:  return uptr_ok(a1, 17);                 // user_mouse_t (packed)
+        case 8:  return uptr_ok(a1, 6);                  // rtc_time_t
+        case 9:  return uptr_ok(a1, 80);                 // kernel_info_t
+        case 60: return uptr_ok(a1, 14);                 // sys_net_info_t
+        case 20: return uptr_ok(a1, 256 * 4);            // палитра
+        case 11: case 13:
+            return uptr_ok(a2, a3);
+        case 15:
+            // FBIOGET_VSCREENINFO пишет fb_var_info_t; у остальных запросов arg — число (яркость)
+            return a2 == 0x4600 ? uptr_ok(a3, sizeof(fb_var_info_t)) : 1;
+        case 16:
+            return ustr_ok(a1) && a3 < 4096 && uptr_ok(a2, a3 * sizeof(fs_file_info_t));
+        case 21:
+            return uptr_ok(a1, 320 * 200 * 4);
+        case 23:
+            return uptr_ok(a1, 4) && uptr_ok(a2, 4) && uptr_ok(a3, 1);
+        case 31: case 84: case 90:
+            return ustr_ok(a1) && ustr_ok(a2);
+        case 32:
+            return uptr_ok(a2, 4);
+        case 49:
+            return uptr_ok(a1, a2);
+        case 70:
+            if (a1 == 1) return uptr_ok(a2, sizeof(hda_outputs_t));
+            if (a1 == 8) return uptr_ok(a2, a3);
+            return 1;
+        case 85: return uptr_ok(a2, sizeof(user_info_t));
+        case 88: return ustr_ok(a1) && uptr_ok(a2, sizeof(perm_info_t));
+        case 89: return ustr_ok(a1) && ustr_ok(a2) && ustr_ok(a3);
+        case 95: return uptr_ok(a1, 16);
+        case 113: return a2 < 256 && uptr_ok(a1, a2 * sizeof(sched_proc_info_t));
+        case 114: case 118: case 119: return ustr_ok(a1);
+        case 120: return ustr_ok(a2);
+        case 115: return uptr_ok(a1, a2);
+        case 124: return uptr_ok(a2, a3);
+        case 128: return uptr_ok(a1, 16);
+        case 131: return uptr_ok(a1, 32);
+        case 133: return uptr_ok(a1, sizeof(knotify_t));
+        case 134: return a2 <= 16 && uptr_ok(a1, a2 * sizeof(mount_info_t));
+        case 135: return ustr_ok(a1);
+        case 136: return a3 > 0 && a3 <= 256 && uptr_ok(a2, a3);
+        case 130: return uptr_ok(a1, 128);
+        case 143: return uptr_ok(a1, 24);
+        case 129: return a2 == 0 || uptr_ok(a2, a3);
+        case 116: case 117: return ustr_ok(a1) && ustr_ok(a2);
+        case 97: return uptr_ok(a2, 100);
+        default:
+            return 1;
+    }
+}
+
+// Кэш размера раздела для sys_diskinfo (см. ниже): пересчитывается не чаще
+// раза в десять секунд, потому что считается проходом по таблице FAT.
+extern uint32_t timer_ticks;
+static uint32_t disk_stat_used = 0, disk_stat_total = 0, disk_stat_tick = 0;
+
+// Копия строки пользователя в ядро (после user_args_ok)
+static void ucopy_str(char* dst, const char* src, int max) {
+    int i = 0;
+    if (src) while (src[i] && i < max - 1) { dst[i] = src[i]; i++; }
+    dst[i] = '\0';
+}
+
 // frame указывает на 20 слотов (160 байт), которые syscall_isr_stub сохранил на стеке:
 // frame[0..13]  = r15,r14,r13,r12,r11,r10,r9,r8,rdi,rsi,rdx,rcx,rbx,rax
 // frame[14]     = rbp вызывающего
@@ -271,9 +308,27 @@ static void blit_320x200_to_lfb(const uint32_t* user_fb) {
 // Нужен только sys_fork: остальные сисколлы его не трогают.
 uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t* frame) {
     task_t* caller = sched_get_current_task();
-    int visible = (!caller || caller->tty_id < 0 || caller->tty_id == tty_get_active_id());
+    // Псевдотерминал на экран не выводится вообще: его картинку забирает окно,
+    // поэтому вывод из него нельзя глушить как "фоновый".
+    tty_t* caller_tty = (caller && caller->tty_id >= 0) ? tty_get(caller->tty_id) : NULL;
+    int visible = (!caller || caller->tty_id < 0 || caller->tty_id == tty_get_active_id() ||
+                   (caller_tty && caller_tty->is_pty));
     // Фоновая программа (её TTY не на экране) не рисует в чужой экран
     if (!visible && (num == 1 || num == 2 || num == 3 || num == 5)) return 0;
+
+    // Вызов из Ring 3 (CS.RPL == 3): указатели обязаны лежать в пользовательской половине
+    if (frame && (frame[16] & 3) == 3 && !user_args_ok(num, arg1, arg2, arg3)) return (uint64_t)-1;
+
+    int c_uid = caller ? caller->uid : 0;
+    int c_gid = caller ? caller->gid : 0;
+
+    // Сырые клавиатура/мышь — только процессу на переднем плане TTY (остальные получают ввод
+    // событиями от desktop): иначе фоновый процесс прошлого сеанса читал бы чужие пароли
+    if ((num == 6 || num == 7 || num == 23 || num == 24) && !tty_is_foreground(caller)) return 0;
+
+    // Рабочие ядра: запуск потоков-вычислителей, ожидание и пробуждение (smp.c)
+    if (num >= SYS_SMP_INFO && num <= SYS_WORKER_ID)
+        return smp_bsp_syscall(num, arg1, arg2, arg3, caller ? (int)caller->pid : 0, caller ? caller->cr3 : 0);
 
     switch (num) {
         case 0: // exit(code)
@@ -291,10 +346,11 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
             kernel_exit_code = arg1;
             return arg1;
 
-        case 1: // print(str, color)
+        case 1: { // print(str, color)
             kputs((const char*)arg1, (uint32_t)(arg2 ? arg2 : 0x00FFFFFF));
             flush_dirty();
             return 0;
+        }
 
         case 2: // put_pixel(x, y, color)
             put_pixel((int)arg1, (int)arg2, (uint32_t)arg3);
@@ -304,10 +360,8 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
             flush_buffer();
             return 0;
 
-        case 4: { // sleep(ms)
-            __asm__ volatile("sti");
-            sleep_ms((uint32_t)arg1);
-            __asm__ volatile("cli");
+        case 4: { // sleep(ms): задача спит в планировщике и не занимает процессор
+            sched_sleep_ms((uint32_t)arg1);
             return 0;
         }
 
@@ -433,6 +487,10 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
         case 13: { // sys_write(int fd, const void* buf, size_t count)
             return (uint64_t)vfs_sys_write((int)arg1, (const void*)arg2, arg3);
         }
+        case 19: { // sys_lseek(int fd, int64_t off, int whence) -> новая позиция или -1
+            return (uint64_t)vfs_sys_lseek((int)arg1, (int64_t)arg2, (int)arg3);
+        }
+
         case 14: { // sys_brk(new_brk) -> uint64_t
             task_t* curr = sched_get_current_task();   // куча принадлежит задаче, а не «главному» процессу
             if (!curr) return (uint64_t)-1;
@@ -444,14 +502,24 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
                 return curr->heap_end;
             }
 
-            // Нельзя опускать кучу ниже начального адреса
-            if (new_brk < curr->heap_start) {
+            // Нельзя опускать кучу ниже начального адреса и поднимать в область стека
+            if (new_brk < curr->heap_start || new_brk > SHM_BASE) {   // выше — область разделяемой памяти
                 return (uint64_t)-1;
             }
 
             // Выделяем и мапим новые страницы для кучи процесса
             uint64_t cur_page = (curr->heap_end + 4095) & ~0xFFFULL;
             uint64_t req_page = (new_brk + 4095) & ~0xFFFULL;
+
+            // Куча сжалась — отдаём страницы обратно в PMM (раньше память не возвращалась)
+            while (cur_page > req_page) {
+                cur_page -= 4096;
+                uint64_t phys = vmm_unmap_page_take((uint64_t*)curr->cr3, cur_page);
+                if (phys) {
+                    pmm_free_page((void*)phys);
+                    if (curr->mem_size >= 4096) curr->mem_size -= 4096;
+                }
+            }
 
             while (cur_page < req_page) {
                 void* phys = pmm_alloc_page();
@@ -477,10 +545,36 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
             const char* path = (const char*)arg1;
             void* buf = (void*)arg2;
             int max_files = (int)arg3;
+            if (path && !perm_check(c_uid, c_gid, path, fs_caller_cwd(), PERM_R | PERM_X)) return (uint64_t)-1;
             fs_lock();
             int count = fs_get_dir_files(path, (fs_file_info_t*)buf, max_files);
             fs_unlock();
             return (uint64_t)count;
+        }
+        case 17: { // sys_mkdir(const char* path) -> int
+            const char* upath = (const char*)arg1;
+            if (!upath) return (uint64_t)-1;
+            char kpath[128];
+            int i = 0;
+            while (upath[i] && i < 127) { kpath[i] = upath[i]; i++; }
+            kpath[i] = '\0';
+            if (!perm_check_parent(c_uid, c_gid, kpath, fs_caller_cwd(), PERM_W)) return (uint64_t)-1;
+            int res = kernel_create_fs_entry(kpath, 1);
+            if (res > 0) perm_on_create(c_uid, c_gid, kpath, fs_caller_cwd(), 1);
+            return (uint64_t)res;
+        }
+
+        case 18: { // sys_create_file(const char* path) -> int
+            const char* upath = (const char*)arg1;
+            if (!upath) return (uint64_t)-1;
+            char kpath[128];
+            int i = 0;
+            while (upath[i] && i < 127) { kpath[i] = upath[i]; i++; }
+            kpath[i] = '\0';
+            if (!perm_check_parent(c_uid, c_gid, kpath, fs_caller_cwd(), PERM_W)) return (uint64_t)-1;
+            int res = kernel_create_fs_entry(kpath, 0);
+            if (res > 0) perm_on_create(c_uid, c_gid, kpath, fs_caller_cwd(), 0);
+            return (uint64_t)res;
         }
 
         case 20: // sys_set_palette
@@ -548,6 +642,12 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
             if (u_btn) *u_btn = k_btn;
             break;
         }
+        case 24: { // sys_get_wheel() -> щелчки колеса мыши с прошлого вызова (+ вниз, - вверх)
+            if (!visible) return 0;
+            update_mouse_state();
+            return (uint64_t)(int64_t)get_mouse_wheel_delta();
+        }
+
         case 30: { // sys_fork()
             task_t* parent = sched_get_current_task();
             if (!parent) return (uint64_t)-1;
@@ -557,6 +657,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
             if (!child) return (uint64_t)-1;
 
             // 2. Копируем базовые поля процесса и сбрасываем состояние задач
+            sched_task_fpu_capture(child);   // состояние FPU/SSE наследуется, как и регистры
             child->pid = sched_alloc_pid();
             child->state = TASK_READY;
             child->parent = parent;
@@ -567,6 +668,12 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
             child->heap_end   = parent->heap_end;
             child->user_entry = 0;
             child->user_stack_top = 0;
+            child->uid = parent->uid;
+            child->gid = parent->gid;
+            child->wake_tick = 0;
+            child->wait_flags = 0;
+            child->ipc_pending = 0;
+            for (int ai = 0; ai < (int)sizeof(child->arg); ai++) child->arg[ai] = parent->arg[ai];
 
             // Очищаем таблицу дескрипторов перед аллокациями памяти
             for (int fd = 0; fd < MAX_FD; fd++) {
@@ -580,6 +687,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
                 i++; 
             }
             child->name[i] = '\0';
+            for (i = 0; i < (int)sizeof(child->exe); i++) child->exe[i] = parent->exe[i];
 
             // Наследуем текущую рабочую директорию (CWD)
             int c = 0;
@@ -608,6 +716,9 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
             child->kstack_bottom = (uint64_t)kstack;
             child->kstack_top    = (uint64_t)(kstack + PROC_KSTACK_SIZE);
             child->mem_size = 4096 + PROC_KSTACK_SIZE;
+
+            // 4b. Открытые .ll достались ребёнку вместе с памятью — отмечаем это
+            lib_fork(parent->pid, child->pid);
 
             // 5. UNIX-WAY: Клонирование таблицы файловых дескрипторов
             // Выполняется строго после всех аллокаций, чтобы при OOM не повреждать ref_count
@@ -668,89 +779,105 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
         case 33: { // sys_kill(int pid, int sig)
             uint64_t target_pid = (uint64_t)arg1;
             int sig = (int)arg2;
-            if (target_pid <= 2) return (uint64_t)-1; // Не трогать kernel (0), tty1 (1), desktop (2)
+            // Потоки ядра (оболочки TTY) не убиваются; процессы — только свои (root — любые).
+            // Раньше было "pid <= 2" в расчёте, что desktop — это PID 2, а это не гарантировано.
+            // Сигнал 0 — только проверка, жив ли процесс (POSIX kill(pid, 0))
+            if (sig == 0) return sched_pid_is_process(target_pid) ? 0 : (uint64_t)-1;
+            int t_uid = sched_pid_uid(target_pid);
+            if (t_uid < 0 || !sched_pid_is_process(target_pid)) return (uint64_t)-1;
+            if (c_uid != UID_ROOT && t_uid != c_uid) return (uint64_t)-1;
 
-            return (uint64_t)sched_send_signal(target_pid, sig ? sig : SIGKILL);
+            return (uint64_t)sched_send_signal(target_pid, sig);
         }
 
-        case 31: { // sys_execve(const char* filename, const char* args)
+case 31: { // sys_execve(const char* filename, const char* args)
             const char* ufn = (const char*)arg1;
             if (!ufn) return (uint64_t)-1;
+
             char kname[64];
             int ki = 0;
             while (ufn[ki] && ki < 63) { kname[ki] = ufn[ki]; ki++; }
             kname[ki] = '\0';
             const char* filename = kname;
-            if (!filename) return (uint64_t)-1;
+            if (!filename || filename[0] == '\0') return (uint64_t)-1;
 
+            // 1. ЗАЩИТА ОТ ДУРАКА: запрещаем запуск desktop.prg внутри существующей сессии
+            const char* b_check = filename;
+            for (int i = 0; filename[i]; i++) {
+                if (filename[i] == '/') b_check = &filename[i + 1];
+            }
+            const char* dt = "desktop.prg";
+            int is_dt = 1;
+            for (int i = 0; dt[i] || b_check[i]; i++) {
+                char c1 = b_check[i], c2 = dt[i];
+                if (c1 >= 'A' && c1 <= 'Z') c1 += 32;
+                if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
+                if (c1 != c2) { is_dt = 0; break; }
+            }
+            if (is_dt) {
+                return (uint64_t)-1;
+            }
+
+            // 2. СОХРАНЯЕМ АРГУМЕНТ (arg2): путь к файлу для notepad, overimages и т.д.
+            // Аргумент хранится в самой задаче (раньше — одна глобальная переменная на всех:
+            // два быстро открытых файла могли достаться не тем программам)
+            char new_arg[128];
+            ucopy_str(new_arg, (const char*)arg2, sizeof(new_arg));
+
+            // 3. Право на исполнение
+            if (!perm_check(c_uid, c_gid, filename, fs_caller_cwd(), PERM_X)) return (uint64_t)-1;
+
+            // 4. Читаем бинарник с диска. fs_lock держим, пока образ не скопирован:
+            // kernel_temp_buf общий с prog_load_module
             extern uint8_t kernel_temp_buf[];
             fs_lock();
             int bytes = fs_read_file(filename, kernel_temp_buf, 1024 * 1024 * 4);
-            fs_unlock();
-            if (bytes <= 0) return (uint64_t)-1;
+            if (bytes <= 0) { fs_unlock(); return (uint64_t)-1; }
 
             task_t* current = sched_get_current_task();
-            if (!current) return (uint64_t)-1;
+            if (!current) { fs_unlock(); return (uint64_t)-1; }
 
-            // 1. Разбор формата: нативный DPRG или плоский бинарник
-            devos_prg_header_t* hdr = (devos_prg_header_t*)kernel_temp_buf;
-            uint64_t load_base = PROG_LOAD_BASE;
-            uint64_t entry_vaddr = PROG_LOAD_BASE;
-            uint64_t payload_offset = 0;
-            uint64_t payload_bytes = (uint64_t)bytes;
-            uint64_t total_image_bytes = payload_bytes;
-            uint32_t stack_size = 512 * 1024;
+            // 5. Разбор и проверка заголовка (недоверенные данные из файла)
+            prg_image_t img;
+            if (prg_parse_image(kernel_temp_buf, bytes, &img) != 0) { fs_unlock(); return (uint64_t)-1; }
 
-            if (hdr->magic[0] == 'D' && hdr->magic[1] == 'P' && hdr->magic[2] == 'R' && hdr->magic[3] == 'G') {
-                load_base = hdr->load_vaddr ? hdr->load_vaddr : PROG_LOAD_BASE;
-                entry_vaddr = hdr->entry_point ? hdr->entry_point : load_base;
-                payload_offset = sizeof(devos_prg_header_t);
-                payload_bytes = hdr->code_size;
-                total_image_bytes = hdr->code_size + hdr->bss_size;
-                if (hdr->stack_size) stack_size = (uint32_t)hdr->stack_size;
-            }
-
-            // 2. Новое адресное пространство создаём раньше уничтожения старого
+            // 6. Новое адресное пространство создаём раньше уничтожения старого
             uint64_t* new_pml4 = vmm_create_address_space();
-            if (!new_pml4) return (uint64_t)-1;
-
-            uint32_t num_image_pages = (total_image_bytes + 4095) / 4096;
-            if (num_image_pages == 0) num_image_pages = 1;
-            for (uint32_t pg = 0; pg < num_image_pages; pg++) {
-                uint64_t v_addr = load_base + (uint64_t)pg * 4096;
-                void* p_addr = pmm_alloc_page();
-                if (!p_addr) { vmm_destroy_address_space(new_pml4); return (uint64_t)-1; }
-                vmm_map_page(new_pml4, v_addr, (uint64_t)p_addr, VMM_FLAG_USER | VMM_FLAG_WRITABLE);
+            if (!new_pml4) { fs_unlock(); return (uint64_t)-1; }
+            if (prg_map_image(new_pml4, &img) != 0) {
+                vmm_destroy_address_space(new_pml4);
+                fs_unlock();
+                return (uint64_t)-1;
             }
 
-            // 3. Выделяем стек под новый образ
-            uint32_t num_stack_pages = (stack_size + 4095) / 4096;
-            uint64_t stack_top = 0x00007FFFFFFF0000ULL;
-            uint64_t stack_base = stack_top - (uint64_t)num_stack_pages * 4096;
-            for (uint32_t pg = 0; pg < num_stack_pages; pg++) {
-                void* p_addr = pmm_alloc_page();
-                if (p_addr) vmm_map_page(new_pml4, stack_base + (uint64_t)pg * 4096,
-                                         (uint64_t)p_addr, VMM_FLAG_USER | VMM_FLAG_WRITABLE);
-            }
-
-            // 4. Копируем тело и зануляем .bss
+            // 7. Копируем тело и зануляем .bss
             vmm_switch_directory(new_pml4);
 
-            uint8_t* target = (uint8_t*)load_base;
-            uint8_t* src = kernel_temp_buf + payload_offset;
-            for (uint64_t i = 0; i < payload_bytes; i++) target[i] = src[i];
-            for (uint64_t i = payload_bytes; i < (uint64_t)num_image_pages * 4096; i++) target[i] = 0;
+            uint8_t* target = (uint8_t*)img.load_base;
+            uint8_t* src = kernel_temp_buf + img.payload_offset;
+            for (uint64_t i = 0; i < img.payload_bytes; i++) target[i] = src[i];
+            for (uint64_t i = img.payload_bytes; i < (uint64_t)img.image_pages * 4096; i++) target[i] = 0;
+            fs_unlock();
 
-            // 5. Старое пространство заменяем новым и освобождаем его
+            for (int ai = 0; ai < (int)sizeof(current->arg); ai++) current->arg[ai] = new_arg[ai];
+
+            uint64_t entry_vaddr = img.entry;
+            uint64_t stack_top = img.stack_top;
+            uint32_t num_image_pages = img.image_pages;
+            uint32_t num_stack_pages = img.stack_pages;
+            uint64_t load_base = img.load_base;
+
+            // 8. Старое пространство заменяем новым и освобождаем его
             uint64_t old_cr3 = current->cr3;
             current->cr3 = (uint64_t)new_pml4;
             vmm_destroy_address_space((uint64_t*)old_cr3);
+            lib_release_pid(current->pid);     // образы .ll ушли вместе со старым пространством
 
             current->heap_start = load_base + (uint64_t)num_image_pages * 4096;
             current->heap_end   = current->heap_start;
             current->mem_size   = ((uint64_t)num_image_pages + (uint64_t)num_stack_pages) * 4096 + 4096 + PROC_KSTACK_SIZE;
 
-            // 6. Обновляем имя процесса в task_t для sched_dump_tasks
+            // 9. Обновляем имя процесса в task_t для sched_dump_tasks
             const char* bname = filename;
             for (int i = 0; filename[i]; i++) {
                 if (filename[i] == '/') bname = &filename[i + 1];
@@ -763,10 +890,9 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
                 np++;
             }
             caller->name[np] = '\0';
+            sched_set_exe(caller, filename, caller->cwd);
 
-            // 7. UNIX-WAY VFS: очистка дескрипторов старого образа
-            // Дескрипторы 0, 1, 2 (stdin, stdout, stderr) сохраняются для нового бинарника.
-            // Пользовательские файлы (FD >= 3), открытые старой программой, закрываются.
+            // 10. Очистка дескрипторов старого процесса (0, 1, 2 сохраняются)
             for (int fd = 3; fd < MAX_FD; fd++) {
                 if (current->fd_table[fd]) {
                     vfs_release_fd(current->fd_table[fd]);
@@ -774,7 +900,6 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
                 }
             }
 
-            // Гарантируем привязку стандартных потоков (0, 1, 2), если они были утеряны
             vfs_node_t* tty_node = devfs_get_node("tty");
             if (tty_node) {
                 if (!current->fd_table[0]) current->fd_table[0] = vfs_allocate_fd(tty_node, O_RDONLY);
@@ -782,169 +907,29 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
                 if (!current->fd_table[2]) current->fd_table[2] = vfs_allocate_fd(tty_node, O_WRONLY);
             }
 
-            // 8. Подменяем RIP/RSP в кадре прерывания для перехода в новую программу
+            // 11. Подменяем RIP/RSP в кадре прерывания для перехода в новую программу
             frame[15] = entry_vaddr;   // RIP
             frame[18] = stack_top;     // RSP
 
             return 0;
         }
-        case 40: { // sys_create_window(const win_desc_t* desc) -> int win_id
-            const win_desc_t* desc = (const win_desc_t*)arg1;
-            task_t* caller = sched_get_current_task();
+        // 40..48 — бывший оконный сервер ядра и почтовый ящик ошибок: окна теперь живут
+        // в desktop (оконный протокол поверх IPC и разделяемой памяти, src/libs/common/wproto.h)
 
-            // 1. ПРОВЕРКА ЗАГОЛОВКА: обязательное поле!
-            if (!desc || !desc->title || desc->title[0] == '\0') {
-                kputs("\n[!] ОШИБКА WM: Заголовок приложения не найден!\n", 0x00FF5555);
-                flush_buffer();
-                return (uint64_t)-1;
+        case 49: { // sys_get_arg(char* out, int max_len) -> len
+            char* u_out = (char*)arg1;
+            int max_l = (int)arg2;
+            if (!u_out || max_l <= 0) return 0;
+            if (!caller) return 0;
+            int i = 0;
+            while (caller->arg[i] && i < max_l - 1) {
+                u_out[i] = caller->arg[i];
+                i++;
             }
-
-            if (g_window_count >= MAX_SYS_WINDOWS) {
-                kputs("[!] Ошибка WM: Превышен лимит окон!\n", 0x00FF5555);
-                return (uint64_t)-1;
-            }
-
-            // 2. РАЗМЕР ОКНА: если не задан, делаем стандартный квадрат 320x320
-            int ww = (desc->w > 0) ? desc->w : DEFAULT_WIN_SIZE;
-            int wh = (desc->h > 0) ? desc->h : DEFAULT_WIN_SIZE;
-            if (ww > 1920 || wh > 1080) return (uint64_t)-1;
-
-            // Поверхность окна (клиентская область, 32 bpp): в неё клиент делает sys_win_present
-            uint32_t spages = (uint32_t)(((uint64_t)ww * (uint64_t)wh * 4 + 4095) / 4096);
-            void* sphys = pmm_alloc_pages(spages);
-            if (!sphys) {
-                kputs("[!] Ошибка WM: нет памяти под поверхность окна!\n", 0x00FF5555);
-                return (uint64_t)-1;
-            }
-
-            int widx = g_window_count++;
-            kernel_window_t* win = &g_windows[widx];
-            win->id = g_next_win_id++;
-            win->pid = caller ? (int)caller->pid : 0;
-            win->is_minimized = 0;
-            win->is_active = 1;
-
-            // Каскадная начальная позиция окна
-            win->x = 80 + (win->id * 25);
-            win->y = 60 + (win->id * 20);
-            win->w = ww;
-            win->h = wh;
-
-            win_priv_t* pv = &g_wpriv[widx];
-            pv->surf_phys  = (uint64_t)sphys;
-            pv->surf       = (uint8_t*)PHYS_TO_VIRT(sphys);
-            pv->surf_pages = spages;
-            pv->seq        = 0;
-            pv->ev_head = pv->ev_tail = 0;
-            wm_zero(pv->surf, (uint64_t)spages * 4096);
-
-            // Копируем заголовок
-            int p = 0;
-            while (desc->title[p] && p < 63) {
-                win->title[p] = desc->title[p];
-                p++;
-            }
-            win->title[p] = '\0';
-
-            // 3. ИКОНКА ОКНА: если передана — копируем, иначе выставляем плейсхолдер
-            if (desc->icon) {
-                win->has_icon = 1;
-                for (int i = 0; i < 16; i++) {
-                    win->icon[i] = desc->icon[i];
-                }
-            } else {
-                win->has_icon = 0; // Плейсхолдер
-            }
-
-            return (uint64_t)win->id;
+            u_out[i] = '\0';
+            return (uint64_t)i;
         }
 
-        case 41: { // sys_get_windows(kernel_window_t* out, int max_cnt) -> count
-            kernel_window_t* out = (kernel_window_t*)arg1;
-            int max_cnt = (int)arg2;
-            if (!out || max_cnt <= 0) return 0;
-
-            // Выбрасываем окна завершённых (ZOMBIE/DEAD) и уже несуществующих процессов,
-            // иначе записи копятся, и после 16 запусков окна перестают создаваться.
-            // pid == 0 — окно, принадлежащее ядру, оно всегда считается живым.
-            int n = 0;
-            for (int i = 0; i < g_window_count; i++) {
-                if (g_windows[i].pid == 0 || sched_pid_alive((uint64_t)g_windows[i].pid)) {
-                    if (n != i) {
-                        wm_copy(&g_windows[n], &g_windows[i], sizeof(kernel_window_t));
-                        wm_copy(&g_wpriv[n],   &g_wpriv[i],   sizeof(win_priv_t));
-                    }
-                    n++;
-                } else {
-                    wm_free_priv(i);   // процесс умер — освобождаем поверхность окна
-                }
-            }
-            g_window_count = n;
-
-            int count = g_window_count < max_cnt ? g_window_count : max_cnt;
-            wm_copy(out, g_windows, (uint64_t)count * sizeof(kernel_window_t));
-            return (uint64_t)count;
-        }
-
-        case 42: { // sys_update_window(int id, int x, int y, int is_minimized)
-            int id = (int)arg1;
-            int x  = (int)arg2;
-            int y  = (int)arg3;
-            int is_min = (int)frame[0]; // r15 / 4-й аргумент
-
-            for (int i = 0; i < g_window_count; i++) {
-                if (g_windows[i].id == id) {
-                    g_windows[i].x = x;
-                    g_windows[i].y = y;
-                    g_windows[i].is_minimized = is_min;
-                    return 0;
-                }
-            }
-            return (uint64_t)-1;
-        }
-
-        case 43: { // sys_win_present(id, pixels) — только владелец окна
-            int wi = wm_index_by_id((int)arg1);
-            if (wi < 0 || !arg2 || arg2 >= 0x0000800000000000ULL) return (uint64_t)-1;
-            if (!caller || g_windows[wi].pid != (int)caller->pid) return (uint64_t)-1;
-            uint64_t nbytes = (uint64_t)g_windows[wi].w * (uint64_t)g_windows[wi].h * 4;
-            wm_copy(g_wpriv[wi].surf, (const void*)arg2, nbytes);
-            g_wpriv[wi].seq++;
-            return 0;
-        }
-
-        case 44: { // sys_win_read(id, dst, uint32_t* seq) -> 1 = кадр обновлён, 0 = без изменений
-            int wi = wm_index_by_id((int)arg1);
-            uint32_t* seqp = (uint32_t*)arg3;
-            if (wi < 0 || !arg2 || !seqp) return (uint64_t)-1;
-            if (arg2 >= 0x0000800000000000ULL || arg3 >= 0x0000800000000000ULL) return (uint64_t)-1;
-            if (*seqp == g_wpriv[wi].seq) return 0;
-            uint64_t nbytes = (uint64_t)g_windows[wi].w * (uint64_t)g_windows[wi].h * 4;
-            wm_copy((void*)arg2, g_wpriv[wi].surf, nbytes);
-            *seqp = g_wpriv[wi].seq;
-            return 1;
-        }
-
-        case 45: { // sys_win_poll_event(id, ev) -> 1 = событие получено — только владелец окна
-            int wi = wm_index_by_id((int)arg1);
-            if (wi < 0 || !arg2 || arg2 >= 0x0000800000000000ULL) return (uint64_t)-1;
-            if (!caller || g_windows[wi].pid != (int)caller->pid) return (uint64_t)-1;
-            win_priv_t* pv = &g_wpriv[wi];
-            if (pv->ev_head == pv->ev_tail) return 0;
-            wm_copy((void*)arg2, &pv->ev[pv->ev_tail % WIN_EV_QUEUE], sizeof(win_event_t));
-            pv->ev_tail++;
-            return 1;
-        }
-
-        case 46: { // sys_win_push_event(id, ev) — событие от desktop окну-клиенту
-            int wi = wm_index_by_id((int)arg1);
-            if (wi < 0 || !arg2 || arg2 >= 0x0000800000000000ULL) return (uint64_t)-1;
-            win_priv_t* pv = &g_wpriv[wi];
-            if (pv->ev_head - pv->ev_tail >= WIN_EV_QUEUE) return (uint64_t)-1;   // очередь полна
-            wm_copy(&pv->ev[pv->ev_head % WIN_EV_QUEUE], (const void*)arg2, sizeof(win_event_t));
-            pv->ev_head++;
-            return 0;
-        }
         case 50: { // sys_reboot()
             extern void sys_reboot(void);
             sys_reboot();
@@ -965,6 +950,459 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
             __asm__ volatile ("cli");
             return (uint64_t)res;
         }
+        // ---------------- Пользователи и права (UNIX DAC) ----------------
+        case 80: return (uint64_t)(int64_t)c_uid;          // sys_getuid()
+        case 81: return (uint64_t)(int64_t)c_gid;          // sys_getgid()
+
+        case 82: { // sys_setuid(uid) — только root (так greeter/login отдают сессию пользователю)
+            if (!caller || c_uid != UID_ROOT) return (uint64_t)-1;
+            caller->uid = (int)arg1;
+            return 0;
+        }
+        case 83: { // sys_setgid(gid) — только root
+            if (!caller || c_uid != UID_ROOT) return (uint64_t)-1;
+            caller->gid = (int)arg1;
+            return 0;
+        }
+
+        case 84: { // sys_auth(name, pass) -> uid или -1
+            char kname[USER_NAME_MAX], kpass[128];
+            ucopy_str(kname, (const char*)arg1, sizeof(kname));
+            ucopy_str(kpass, (const char*)arg2, sizeof(kpass));
+            int uid = users_auth(kname, kpass);
+            for (int i = 0; i < (int)sizeof(kpass); i++) kpass[i] = 0;
+            if (uid < 0) {
+                // задержка после неудачи, как pam_faildelay: перебор становится дорогим
+                uint32_t t0 = now_ms();
+                while (now_ms() - t0 < 1000) sched_yield();
+            }
+            return (uint64_t)(int64_t)uid;
+        }
+
+        case 85: { // sys_getpwuid(uid, user_info_t* out) -> 1 / 0
+            user_info_t info;
+            if (!arg2 || !users_find_by_uid((int)arg1, &info)) return 0;
+            wm_copy((void*)arg2, &info, sizeof(info));
+            return 1;
+        }
+
+        case 86: { // sys_chmod(path, mode) — владелец или root
+            char kpath[PERM_PATH_MAX], npath[PERM_PATH_MAX];
+            ucopy_str(kpath, (const char*)arg1, sizeof(kpath));
+            perm_normalize(kpath, fs_caller_cwd(), npath, sizeof(npath));
+            perm_info_t pi;
+            perm_get(npath, &pi);
+            if (c_uid != UID_ROOT && c_uid != pi.uid) return (uint64_t)-1;
+            return perm_set(npath, "/", pi.uid, pi.gid, (int)arg2) ? 0 : (uint64_t)-1;
+        }
+
+        case 87: { // sys_chown(path, uid, gid) — только root
+            if (c_uid != UID_ROOT) return (uint64_t)-1;
+            char kpath[PERM_PATH_MAX], npath[PERM_PATH_MAX];
+            ucopy_str(kpath, (const char*)arg1, sizeof(kpath));
+            perm_normalize(kpath, fs_caller_cwd(), npath, sizeof(npath));
+            perm_info_t pi;
+            perm_get(npath, &pi);
+            return perm_set(npath, "/", (int)arg2, (int)arg3, pi.mode) ? 0 : (uint64_t)-1;
+        }
+
+        case 88: { // sys_stat_perm(path, perm_info_t* out)
+            if (!arg2) return (uint64_t)-1;
+            char kpath[PERM_PATH_MAX], npath[PERM_PATH_MAX];
+            ucopy_str(kpath, (const char*)arg1, sizeof(kpath));
+            perm_normalize(kpath, fs_caller_cwd(), npath, sizeof(npath));
+            perm_info_t pi;
+            perm_get(npath, &pi);
+            wm_copy((void*)arg2, &pi, sizeof(pi));
+            return 0;
+        }
+
+        case 89: { // sys_passwd(name, new_pass, old_pass) — root меняет любой, остальные свой со старым
+            char kname[USER_NAME_MAX], kpass[128], kold[128];
+            ucopy_str(kname, (const char*)arg1, sizeof(kname));
+            ucopy_str(kpass, (const char*)arg2, sizeof(kpass));
+            ucopy_str(kold,  (const char*)arg3, sizeof(kold));
+            user_info_t info;
+            int ok = users_find_by_name(kname, &info);
+            if (ok && c_uid != UID_ROOT) ok = (c_uid == info.uid) && users_auth(kname, kold) == info.uid;
+            if (ok) ok = users_set_password(kname, kpass);
+            for (int i = 0; i < (int)sizeof(kpass); i++) { kpass[i] = 0; kold[i] = 0; }
+            return ok ? 0 : (uint64_t)-1;
+        }
+
+        case 90: { // sys_useradd(name, pass) -> uid или -1 — только root (OOBE, админка)
+            if (c_uid != UID_ROOT) return (uint64_t)-1;
+            char kname[USER_NAME_MAX], kpass[128];
+            ucopy_str(kname, (const char*)arg1, sizeof(kname));
+            ucopy_str(kpass, (const char*)arg2, sizeof(kpass));
+            int uid = users_add(kname, kpass, (int)arg3);   // arg3 = 1: администратор (wheel)
+            for (int i = 0; i < (int)sizeof(kpass); i++) kpass[i] = 0;
+            return (uint64_t)(int64_t)uid;
+        }
+
+        case 93: { // sys_sudo(pass) — администратор (wheel) со СВОИМ паролем становится root (polkit/sudo)
+            if (!caller) return (uint64_t)-1;
+            if (c_uid == UID_ROOT) return 0;
+            char kpass[128];
+            ucopy_str(kpass, (const char*)arg1, sizeof(kpass));
+            user_info_t me;
+            int ok = users_is_admin(c_uid) && users_find_by_uid(c_uid, &me) && users_auth(me.name, kpass) == c_uid;
+            for (int i = 0; i < (int)sizeof(kpass); i++) kpass[i] = 0;
+            if (!ok) {
+                uint32_t t0 = now_ms();
+                while (now_ms() - t0 < 1000) sched_yield();
+                return (uint64_t)-1;
+            }
+            caller->uid = UID_ROOT;
+            caller->gid = 0;
+            return 0;
+        }
+
+        case 94: // sys_is_admin(uid) -> 1, если может sudo
+            return (uint64_t)users_is_admin((int)arg1);
+
+        case 95: { // sys_get_system(sys_settings_t* out): язык, пояс, смещение, вторая раскладка
+            if (!arg1) return (uint64_t)-1;
+            int v[4] = { users_sys_lang(), users_sys_tz_index(), users_sys_tz_offset(), users_sys_layout2() };
+            wm_copy((void*)arg1, v, sizeof(v));
+            return 0;
+        }
+
+        case 96: // sys_set_system(lang, tz_index, layout2) — только root; -1 = не менять
+            if (c_uid != UID_ROOT) return (uint64_t)-1;
+            users_set_system((int)arg1, (int)arg2, (int)arg3);
+            return 0;
+
+        case 97: { // sys_tz_info(index, tz_info_t* out) -> число поясов (out заполняется, если index в списке)
+            int idx = (int)arg1;
+            if (arg2 && idx >= 0 && idx < g_timezone_count) {
+                struct { char name[32]; char city[64]; int offset; } info;
+                ucopy_str(info.name, g_timezones[idx].name, sizeof(info.name));
+                ucopy_str(info.city, g_timezones[idx].city_ru, sizeof(info.city));
+                info.offset = g_timezones[idx].offset;
+                wm_copy((void*)arg2, &info, sizeof(info));
+            }
+            return (uint64_t)g_timezone_count;
+        }
+
+        case 98: { // sys_lock_user(name) — только root: запрет входа по паролю (root после OOBE)
+            if (c_uid != UID_ROOT) return (uint64_t)-1;
+            char kname[USER_NAME_MAX];
+            ucopy_str(kname, (const char*)arg1, sizeof(kname));
+            return users_lock(kname) ? 0 : (uint64_t)-1;
+        }
+
+        case 129: { // sys_tty_history(idx, buf, max): idx < 0 -- только количество
+            if (!caller || caller->tty_id < 0) return 0;
+            int tid = caller->tty_id;
+            int n = tty_hist_count(tid);
+            if ((int64_t)arg1 < 0 || !arg2) return (uint64_t)n;
+            const char* line = tty_hist_get(tid, (int)arg1);
+            if (!line) return 0;
+            int len = 0;
+            while (line[len]) len++;
+            if ((uint64_t)len + 1 > arg3) len = (int)arg3 - 1;
+            if (len < 0) return 0;
+            wm_copy((void*)arg2, line, (uint64_t)len);
+            ((char*)arg2)[len] = '\0';
+            return (uint64_t)tty_hist_number(tid, (int)arg1);
+        }
+
+        case 143: { // sys_cpu_sensors(out): температура и измеренная частота (overMark, overTask)
+            if (!arg1) return (uint64_t)-1;
+            int pkg, core, tj;
+            int ok = cpu_temperature(&pkg, &core, &tj);
+            int32_t o[6] = { ok, pkg, core, tj, cpu_current_mhz(), cpu_get()->base_mhz };
+            uint8_t* d = (uint8_t*)arg1;
+            for (int i = 0; i < 24; i++) d[i] = ((uint8_t*)o)[i];
+            return (uint64_t)ok;
+        }
+        case 130: { // sys_cpuinfo(out): модель, ядра, частоты, режим управления
+            if (!arg1) return (uint64_t)-1;
+            const cpu_info_t* ci = cpu_get();
+            struct {
+                char brand[52];
+                int32_t cores, threads;
+                int32_t base_mhz, max_mhz, cur_mhz;
+                int32_t turbo_on, governor;
+            } out;
+            ucopy_str(out.brand, ci->brand[0] ? ci->brand : ci->vendor, sizeof(out.brand));
+            out.cores    = ci->cores;
+            out.threads  = ci->threads;
+            out.base_mhz = ci->base_mhz;
+            out.max_mhz  = ci->max_mhz;
+            out.cur_mhz  = ci->cur_mhz;
+            out.turbo_on = ci->turbo_on;
+            out.governor = ci->governor;
+            wm_copy((void*)arg1, &out, sizeof(out));
+            return 0;
+        }
+
+        case 128: { // sys_meminfo(uint64_t out[2]): всего и занято байт физпамяти
+            if (!arg1) return (uint64_t)-1;
+            uint64_t v[2] = { pmm_get_total_blocks() * (uint64_t)PAGE_SIZE,
+                              pmm_get_used_blocks()  * (uint64_t)PAGE_SIZE };
+            wm_copy((void*)arg1, v, sizeof(v));
+            return 0;
+        }
+
+        case 132: // sys_storage_state(): 0 -- флешка с системой на месте, 1 -- выдернута,
+                  // 2 -- вместо неё вставили другую. Рабочий стол опрашивает раз в
+                  // секунду и показывает уведомление; на шину вызов не ходит.
+            return (uint64_t)mount_root_state();
+
+        case 133: { // sys_notify_poll(knotify_t*): следующее уведомление системы (только root --
+                    // это рабочий стол, демон уведомлений). 1 -- есть, 0 -- очередь пуста.
+            if (!caller || caller->uid != 0 || !arg1) return (uint64_t)-1;
+            knotify_t n;
+            if (!knotify_pop(&n)) return 0;
+            wm_copy((void*)arg1, &n, sizeof(n));
+            return 1;
+        }
+
+        case 134: { // sys_mounts(mount_info_t* out, max): подключённые тома, корень первым
+            int max = (int)arg2;
+            if (max <= 0 || !arg1) return 0;
+            mount_info_t tmp[16];
+            int n = mount_list(tmp, max > 16 ? 16 : max);
+            wm_copy((void*)arg1, tmp, (uint64_t)n * sizeof(mount_info_t));
+            return (uint64_t)n;
+        }
+
+        case 136: { // sys_proc_exe(pid, buf, len): путь к исполняемому файлу процесса
+            char kb[96];
+            if (sched_proc_exe(arg1, kb, sizeof(kb)) != 0) return (uint64_t)-1;
+            int n = 0;
+            while (kb[n] && n < (int)arg3 - 1) n++;
+            kb[n] = '\0';
+            wm_copy((void*)arg2, kb, (uint64_t)n + 1);
+            return 0;
+        }
+
+        case 135: { // sys_eject(name): безопасно извлечь накопитель (как "Отключить" в Dolphin).
+                    // Разрешено любому вошедшему: флешку и так можно просто выдернуть.
+            char kn[32];
+            ucopy_str(kn, (const char*)arg1, sizeof(kn));
+            return (uint64_t)(int64_t)mount_eject(kn);
+        }
+
+        case 131: { // sys_diskinfo(ov_diskinfo_t*): размер раздела и обмен с флешкой
+            if (!arg1) return (uint64_t)-1;
+            // Занятое место считается проходом по всей таблице FAT, то есть
+            // сотнями секторов с накопителя. Диспетчер задач спрашивает раз в
+            // секунду, и на настоящей флешке это была бы заметная нагрузка
+            // (она же показалась бы в собственном счётчике обмена), поэтому
+            // держим ответ десять секунд.
+            if (!disk_stat_total || (uint32_t)(timer_ticks - disk_stat_tick) > 10000) {
+                fs_get_stats(&disk_stat_used, &disk_stat_total);
+                disk_stat_tick = timer_ticks;
+            }
+            uint32_t used_mb = disk_stat_used, total_mb = disk_stat_total;
+            // Сектор флешки — 512 байт, отдаём сразу в килобайтах
+            uint64_t v[4] = { (uint64_t)total_mb, (uint64_t)used_mb,
+                              g_blk_rd_sectors / 2, g_blk_wr_sectors / 2 };
+            wm_copy((void*)arg1, v, sizeof(v));
+            return 0;
+        }
+
+        // ---------------- Псевдотерминалы для графического эмулятора ----------------
+        case 123: { // sys_pty_open(w_px, h_px) -> id псевдотерминала или -1
+            if (!caller) return (uint64_t)-1;
+            return (uint64_t)pty_open((int)arg1, (int)arg2, caller->uid, caller->gid, caller->pid);
+        }
+
+        case 124: { // sys_pty_read(id, dst, max_bytes) -> скопировано байт картинки
+            tty_t* pt = tty_get((int)arg1);
+            if (!pt || !pt->is_pty || pt->owner_pid != caller->pid) return (uint64_t)-1;
+            return (uint64_t)pty_snapshot((int)arg1, (uint32_t*)arg2, arg3);
+        }
+
+        case 125: { // sys_pty_key(id, scancode)
+            tty_t* pt = tty_get((int)arg1);
+            if (!pt || !pt->is_pty || pt->owner_pid != caller->pid) return (uint64_t)-1;
+            tty_kbd_push((int)arg1, (uint8_t)arg2);
+            return 0;
+        }
+
+        case 126: { // sys_pty_close(id)
+            tty_t* pt = tty_get((int)arg1);
+            if (!pt || !pt->is_pty || pt->owner_pid != caller->pid) return (uint64_t)-1;
+            pty_close((int)arg1);
+            return 0;
+        }
+
+        case 127: { // sys_pty_alive(id) -> 1, пока оболочка жива
+            tty_t* pt = tty_get((int)arg1);
+            if (!pt || !pt->is_pty || pt->owner_pid != caller->pid) return 0;
+            return (uint64_t)pty_alive((int)arg1);
+        }
+
+        case 122: { // sys_mouse(cmd, speed, accel): 0 = прочитать, 1 = задать
+            if (arg1 == 0) {
+                // упакованно: скорость в младших 16 битах, ускорение в 16-м
+                return (uint64_t)((uint32_t)mouse_get_speed() | ((uint32_t)mouse_get_accel() << 16));
+            }
+            if (arg1 == 1) {
+                // Менять скорость указателя может администратор: файл общий для системы
+                if (c_uid != UID_ROOT && !users_is_admin(c_uid)) return (uint64_t)-1;
+                users_set_mouse((int)arg2, (int)arg3);
+                return 0;
+            }
+            return (uint64_t)-1;
+        }
+
+        case 91: // sys_oobe_state() -> 1, если нужна первоначальная настройка
+            return (uint64_t)users_needs_oobe();
+
+        case 92: // sys_oobe_finish() — только root
+            if (c_uid != UID_ROOT) return (uint64_t)-1;
+            users_finish_oobe();
+            return 0;
+
+        // ---------------- IPC: сообщения, имена сервисов, разделяемая память ----------------
+        case 100: // sys_ipc_send(pid, buf, len) -> 0 / -1 нет процесса / -2 очередь полна
+            return (uint64_t)(int64_t)ipc_send(caller, (int)arg1, (const void*)arg2, (uint32_t)arg3);
+        case 101: { // sys_ipc_recv(ipc_msg_t* out, timeout_ms) -> 1 есть / 0 таймаут
+            ipc_msg_t m;
+            int r = ipc_recv(caller, &m, (uint32_t)arg2);
+            if (r == 1) wm_copy((void*)arg1, &m, sizeof(m));
+            return (uint64_t)r;
+        }
+        case 102: { // sys_ipc_register(name) — только root (системные сервисы)
+            char kname[IPC_NAME_MAX];
+            ucopy_str(kname, (const char*)arg1, sizeof(kname));
+            return (uint64_t)(int64_t)ipc_register(caller, kname);
+        }
+        case 103: { // sys_ipc_lookup(name) -> pid / -1
+            char kname[IPC_NAME_MAX];
+            ucopy_str(kname, (const char*)arg1, sizeof(kname));
+            return (uint64_t)(int64_t)ipc_lookup(kname);
+        }
+        case 104: return (uint64_t)(int64_t)shm_create(caller, arg1);          // sys_shm_create(size) -> id
+        case 105: return shm_map(caller, (int)arg1);                           // sys_shm_map(id) -> адрес / 0
+        case 106: return (uint64_t)(int64_t)shm_unmap(caller, (int)arg1);      // sys_shm_unmap(id)
+        case 107: return (uint64_t)(int64_t)shm_grant(caller, (int)arg1, (int)arg2);   // sys_shm_grant(id, pid)
+        case 108: return (uint64_t)(int64_t)shm_destroy(caller, (int)arg1);    // sys_shm_destroy(id)
+        case 111: return shm_size((int)arg1);                                  // sys_shm_size(id)
+
+        case 109: { // sys_spawn(path, arg, uidgid) -> pid: запуск без fork (не копирует память родителя)
+            // uidgid = (uid << 32) | gid — от чьего имени; задать чужого может только root (desktop)
+            char kpath[128], karg[128];
+            ucopy_str(kpath, (const char*)arg1, sizeof(kpath));
+            ucopy_str(karg, (const char*)arg2, sizeof(karg));
+            int uid = c_uid, gid = c_gid;
+            if (arg3 != (uint64_t)-1) {
+                if (c_uid != UID_ROOT) return (uint64_t)-1;
+                uid = (int)(arg3 >> 32);
+                gid = (int)(arg3 & 0xFFFFFFFF);
+            }
+            int err;
+            task_t* p = prog_spawn(kpath, karg, uid, gid, 1, &err);
+            if (p) sched_start_process(p);          // sys_spawn: передним планом не владеет
+            return p ? p->pid : (uint64_t)(int64_t)err;
+        }
+
+        case 112: { // sys_tty_setfg(pid) — отдать клавиатуру TTY процессу (как tcsetpgrp)
+            // Менять может только текущий владелец переднего плана или root: иначе
+            // фоновый процесс увёл бы себе ввод следующего пользователя
+            if (!caller || caller->tty_id < 0) return (uint64_t)-1;
+            tty_t* t = tty_get(caller->tty_id);
+            if (!t) return (uint64_t)-1;
+            // Забрать ввод можно, если он ничей, уже наш, прежний владелец умер
+            // (так оболочка получает клавиатуру обратно после программы) или мы root
+            if (c_uid != UID_ROOT && t->fg_pid > 0 && t->fg_pid != (int)caller->pid &&
+                sched_pid_is_process(t->fg_pid)) return (uint64_t)-1;
+            int target = (int)(int64_t)arg1;
+            if (target == 0) target = (int)caller->pid;           // забрать ввод себе
+            if (target > 0 && !sched_pid_is_process(target)) return (uint64_t)-1;
+            t->fg_pid = target;
+            // Оболочка забрала ввод обратно после программы: перерисовываем консоль,
+            // иначе на экране остаётся последний кадр игры поверх текста
+            if (target == (int)caller->pid) flush_buffer();
+            return 0;
+        }
+
+        case 113: { // sys_ps(sched_proc_info_t* out, max) -> сколько записей
+            int max = (int)arg2;
+            if (max <= 0) return 0;
+            return (uint64_t)(int64_t)sched_task_list((sched_proc_info_t*)arg1, max);
+        }
+
+        case 114: { // sys_chdir(path) -> 0 / -1: каталог процесса (у каждого свой)
+            char kp[128], abs[128];
+            ucopy_str(kp, (const char*)arg1, sizeof(kp));
+            if (!caller) return (uint64_t)-1;
+            perm_normalize(kp, caller->cwd, abs, sizeof(abs));
+            if (!perm_check(c_uid, c_gid, abs, caller->cwd, PERM_X)) return (uint64_t)-1;
+            fs_lock();
+            int ok = fs_dir_exists(abs);
+            fs_unlock();
+            if (!ok) return (uint64_t)-1;
+            int i = 0;
+            while (abs[i] && i < (int)sizeof(caller->cwd) - 1) { caller->cwd[i] = abs[i]; i++; }
+            caller->cwd[i] = '\0';
+            return 0;
+        }
+
+        case 115: { // sys_getcwd(buf, max) -> длина
+            if (!caller) return 0;
+            char* out = (char*)arg1;
+            int max = (int)arg2;
+            int i = 0;
+            while (caller->cwd[i] && i < max - 1) { out[i] = caller->cwd[i]; i++; }
+            if (max > 0) out[i] = '\0';
+            return (uint64_t)i;
+        }
+
+        case 116: { // sys_su(name, pass) -> 0: стать другим пользователем по ЕГО паролю
+            // root переключается без пароля (как su в UNIX), остальные — только зная пароль
+            char kname[32], kpass[64];
+            ucopy_str(kname, (const char*)arg1, sizeof(kname));
+            ucopy_str(kpass, (const char*)arg2, sizeof(kpass));
+            user_info_t info;
+            if (c_uid == UID_ROOT) {
+                if (!users_find_by_name(kname, &info)) return (uint64_t)-1;
+            } else {
+                int uid = users_auth(kname, kpass);
+                if (uid < 0 || !users_find_by_uid(uid, &info)) return (uint64_t)-1;
+            }
+            if (caller) { caller->uid = info.uid; caller->gid = info.gid; }
+            return 0;
+        }
+
+        case 117: { // sys_load_module(path, args) — только root (.sys работает в Ring 0)
+            if (c_uid != UID_ROOT) return (uint64_t)-1;
+            char kp[128], ka[128];
+            ucopy_str(kp, (const char*)arg1, sizeof(kp));
+            ucopy_str(ka, (const char*)arg2, sizeof(ka));
+            return sys_load_module(kp, ka) ? 0 : (uint64_t)-1;
+        }
+
+        case 118: { // sys_kcmd(line) -> 1, если команду знает встроенная часть ядра
+            // Мост на время переноса: сервисные команды ядра (taskmgr, hda-dump,
+            // ping, fastfetch, модули) ещё живут в main.c. Пользовательские
+            // команды и сеанс уже в Ring 3 (sh.prg), эти переедут следующими.
+            char kl[256];
+            ucopy_str(kl, (const char*)arg1, sizeof(kl));
+            return (uint64_t)(int64_t)shell_kernel_builtin(kl);
+        }
+
+        case 110: return caller ? caller->pid : 0;                              // sys_getpid()
+
+        // ---- разделяемые библиотеки .ll (linked library): dlopen/dlsym/dlclose ----
+        case 119: { // sys_lib_open(path) -> дескриптор >= 0 или LIB_E*
+            char lp[128];
+            ucopy_str(lp, (const char*)arg1, sizeof(lp));
+            return (uint64_t)(int64_t)lib_open(lp, c_uid, c_gid);
+        }
+        case 120: { // sys_lib_sym(handle, name) -> адрес в памяти процесса или 0
+            char nm[64];
+            ucopy_str(nm, (const char*)arg2, sizeof(nm));
+            return lib_sym((int)arg1, nm);
+        }
+        case 121: // sys_lib_close(handle)
+            return (uint64_t)(int64_t)lib_close((int)arg1);
+
         case 70: { // sys_audio(cmd, arg1, arg2)
             uint64_t cmd = arg1; // подкоманда из RBX
             switch (cmd) {
@@ -986,12 +1424,65 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
                     hda_play_test_tone();
                     return 0;
 
-                case 5: // stop
-                    hda_stop();
+                case 5: // stop -- гасим только тестовый тон, чужой звук не трогаем
+                    hda_stop_test_tone();
                     return 0;
 
                 case 6: // jack_poll
                     return (uint64_t)hda_jack_poll();
+
+                // ---- потоковый PCM для плееров и громкость ----
+                case 7: // pcm_open(arg2 = частота, arg3 = каналы | (бит на сэмпл << 8)) -> 0 или <0
+                    return (uint64_t)(int64_t)hda_pcm_open((uint32_t)arg2, (int)(arg3 & 0xFF), (int)((arg3 >> 8) & 0xFF),
+                                                           caller ? caller->pid : 0);
+
+                case 8: { // pcm_write(arg2 = указатель на PCM, arg3 = байт) -> сколько принято (0 = очередь полна)
+                    if (!arg2 || arg2 >= 0x0000800000000000ULL) return 0;
+                    if (arg3 > 0x100000) arg3 = 0x100000;
+                    return (uint64_t)(int64_t)hda_pcm_write((const void*)arg2, (uint32_t)arg3, caller ? caller->pid : 0);
+                }
+
+                case 9:  // pcm_close
+                    hda_pcm_close(caller ? caller->pid : 0);
+                    return 0;
+
+                case 10: // pcm_flush (перемотка/пауза: сбросить очередь и позицию)
+                    hda_pcm_flush(caller ? caller->pid : 0);
+                    return 0;
+
+                case 11: // pcm_position_ms
+                    return (uint64_t)hda_pcm_position_ms(caller ? caller->pid : 0);
+
+                case 12: // pcm_queued_ms
+                    return (uint64_t)hda_pcm_queued_ms(caller ? caller->pid : 0);
+
+                case 13: // pcm_drained -> 1, если всё записанное проиграно
+                    return (uint64_t)hda_pcm_drained(caller ? caller->pid : 0);
+
+                case 14: // set_volume (arg2 = 0..100)
+                    hda_set_volume((int)arg2);
+                    return 0;
+
+                case 15: // get_volume
+                    return (uint64_t)hda_get_volume();
+
+                case 16: // set_mute (arg2 = 0/1)
+                    hda_set_mute((int)arg2);
+                    return 0;
+
+                case 17: // get_target -> куда реально идёт звук: 0 никуда, 1 аналог, 2 HDMI
+                    return (uint64_t)hda_get_target();
+
+                case 18: { // get_caps -> маска: 1 динамики, 2 наушники/line-out, 4 HDMI
+                    hda_outputs_t o;
+                    if (check_audio_outputs(&o) < 0) return 0;
+                    return (uint64_t)((o.has_speakers ? 1 : 0) |
+                                      ((o.has_headphones || o.has_lineout) ? 2 : 0) |
+                                      (o.hdmi_playback ? 4 : 0));
+                }
+
+                case 19: // pcm_underruns
+                    return (uint64_t)hda_pcm_underruns(caller ? caller->pid : 0);
 
                 default:
                     return (uint64_t)-1;
@@ -1001,6 +1492,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t
         default:
             return 0;
     }
+    return 0;   // case 23 (мышь DOOM) выходит через break — без этого в RAX оставался мусор
 }
 
 // Первая "точка возврата" для ребёнка sys_fork: на стеке под ней уже лежит
@@ -1063,7 +1555,19 @@ __attribute__((naked)) static void syscall_isr_stub(void) {
         "mov %rcx, %rdx\n\t"
         "mov %r9,  %rcx\n\t"
 
+        // Вызов с рабочего ядра (стек в smp_ap_stacks) в ядро ОС не пускаем:
+        // оно однопроцессорное. Там свой маленький набор (smp.c).
+        "lea smp_ap_stacks(%rip), %r10\n\t"
+        "cmp %r10, %rsp\n\t"
+        "jb 2f\n\t"
+        "add $262144, %r10\n\t"            // SMP_MAX * SMP_AP_STACK (проверка ниже)
+        "cmp %r10, %rsp\n\t"
+        "jae 2f\n\t"
+        "call smp_ap_syscall\n\t"
+        "jmp 3f\n\t"
+        "2:\n\t"
         "call syscall_dispatcher\n\t"
+        "3:\n\t"
 
         "mov %rax, 104(%rsp)\n\t"
 
@@ -1190,7 +1694,7 @@ void init_user_mode(void) {
     __asm__ volatile ("outb %0, $0x21" : : "a"((uint8_t)0xFF));
     __asm__ volatile ("outb %0, $0xA1" : : "a"((uint8_t)0xFF));
 
-    // Очереди клавиатуры по TTY уже обнулены в tty_init_core/tty_spawn_second;
+    // Очереди клавиатуры по TTY уже обнулены в tty_init_core/tty_spawn;
     // состояние мыши — в mouse.c, туда отдельного сброса тоже не нужно.
 
     for (int i = 0; i < (int)sizeof(kernel_tss); i++) ((uint8_t*)&kernel_tss)[i] = 0;
@@ -1278,6 +1782,22 @@ void init_user_mode(void) {
     __asm__ volatile("lidt %0" : : "m"(idtr64));
 
     g_user_mode_active = 0;
+}
+
+// Рабочие ядра (smp.c) делят с основным один IDT
+void idt_load_this_cpu(void) {
+    __asm__ volatile("lidt %0" : : "m"(idtr64));
+}
+
+void idt_set_gate(int vec, void (*handler)(void), int dpl) {
+    uint64_t h = (uint64_t)handler;
+    idt64[vec].base_low    = h & 0xFFFF;
+    idt64[vec].selector    = 0x08;
+    idt64[vec].ist         = 0;
+    idt64[vec].type_attr   = (uint8_t)(0x8E | ((dpl & 3) << 5));
+    idt64[vec].base_middle = (h >> 16) & 0xFFFF;
+    idt64[vec].base_high   = (h >> 32) & 0xFFFFFFFF;
+    idt64[vec].reserved    = 0;
 }
 
 // Вершина стека ядра для входа из Ring 3: у каждой задачи свой (sched_yield переставляет при переключении)

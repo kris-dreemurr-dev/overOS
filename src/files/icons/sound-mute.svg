@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!-- Звук выключен: динамик и перечёркивание -->
+  <path d="M4 9.5 H7.5 L12 5.5 V18.5 L7.5 14.5 H4 Z" fill="currentColor"/>
+  <path d="M15 9.5 L20 14.5 M20 9.5 L15 14.5" fill="none" stroke="#ED1515" stroke-width="1.8"/>
+</svg>

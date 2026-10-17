@@ -1,7 +1,7 @@
 // psx.prg — заставка PS1 как обычная программа Ring 3 (замена psx_module.c / psx.sys).
 // Рисует кадр 320x200 в свой буфер и отдаёт его ядру через sys_blit_frame (сисколл 21).
 // Ядро само масштабирует кадр, рисует его в буфер ТВОЕГО TTY и не рисует, пока этот TTY скрыт.
-#include <stdint.h>
+#include "ovos.h"   // общие обёртки сисколов (src/lib)
 
 // Не даём GCC превращать циклы заливки в вызовы memset (libc в программе нет)
 #pragma GCC optimize ("no-tree-loop-distribute-patterns")
@@ -18,21 +18,12 @@
 #define FRAME_DELAY     15
 #define TRIANGLE_ALPHA  180
 
-static inline uint64_t syscall3(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3) {
-    uint64_t ret;
-    __asm__ volatile ("int $0x80"
-                      : "=a"(ret)
-                      : "a"(num), "b"(a1), "c"(a2), "d"(a3)
-                      : "memory");
-    return ret;
-}
-
 static void run_psx(void);
 
 // ТОЧКА ВХОДА ДОЛЖНА БЫТЬ ПЕРВОЙ В ФАЙЛЕ (как в test.c)
 int main(void) {
     run_psx();
-    syscall3(0, 0, 0, 0);   // exit(0)
+    ov_sc(0, 0, 0, 0);   // exit(0)
     while (1) { }
     return 0;
 }
@@ -57,13 +48,13 @@ static void sleep_ms(uint32_t ms) {
 // Ввод: сканкоды Set 1. Возвращает 1, если нажат ESC (make-код 0x01)
 static int check_esc(void) {
     uint8_t sc;
-    while ((sc = (uint8_t)syscall3(6, 0, 0, 0)) != 0) {
+    while ((sc = (uint8_t)ov_sc(6, 0, 0, 0)) != 0) {
         if (sc == 0x01) return 1;
     }
     return 0;
 }
 
-static void present(void) { syscall3(21, (uint64_t)fb, 0, 0); }
+static void present(void) { ov_sc(21, (uint64_t)fb, 0, 0); }
 
 static void clear_fb(uint32_t color) {
     for (int i = 0; i < FB_W * FB_H; i++) fb[i] = color;
@@ -175,17 +166,17 @@ static void draw_moving_triangle_blended(int x1, int y1, int x2, int y2, int x3,
 
 static void run_psx(void) {
     // Кадровый буфер берём из кучи процесса (sys_brk), чтобы не зависеть от .bss
-    uint64_t heap = syscall3(14, 0, 0, 0);
+    uint64_t heap = ov_sc(14, 0, 0, 0);
     if (heap == (uint64_t)-1) return;
-    if (syscall3(14, heap + FB_W * FB_H * 4, 0, 0) == (uint64_t)-1) return;
+    if (ov_sc(14, heap + FB_W * FB_H * 4, 0, 0) == (uint64_t)-1) return;
     fb = (uint32_t*)heap;
 
     // Частоту TSC измерило ядро при загрузке
-    uint32_t k = (uint32_t)syscall3(22, 0, 0, 0);
+    uint32_t k = (uint32_t)ov_sc(22, 0, 0, 0);
     if (k) tsc_per_ms = k;
 
     // Сбрасываем накопленные нажатия (Enter от запуска команды)
-    while ((uint8_t)syscall3(6, 0, 0, 0) != 0) { }
+    while ((uint8_t)ov_sc(6, 0, 0, 0) != 0) { }
 
     int cx = FB_W / 2;
     int cy = FB_H / 2 - 8;

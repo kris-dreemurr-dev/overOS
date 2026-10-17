@@ -1,6 +1,5 @@
 #include "fat32.h"
-#include "fat16.h"
-#include "../drivers/usb/ehci-msc.h"
+#include "../drivers/blk.h"
 
 extern void kputs(const char* str, uint32_t color);
 extern void kdebug(const char* str, uint32_t color);
@@ -8,66 +7,147 @@ extern void itoa(int n, char* str);
 extern int strcmp(const char* s1, const char* s2);
 extern void flush_buffer(void);
 
-static fat32_bpb_t g_bpb32;
-static uint32_t g_partition_lba = 2048;
-static uint32_t g_fat_lba = 0;
-static uint32_t g_data_lba = 0;
-static int      g_mounted32 = 0;
-static uint32_t g_current_cluster32 = 2; 
+// ---------------------------------------------------------------------------
+// Тома. Раньше всё состояние драйвера (BPB, начало раздела, текущий кластер,
+// кэш сектора FAT) было в глобальных переменных, и том мог быть ровно один --
+// корневой. Теперь это запись таблицы, а глобальные имена ниже -- макросы на
+// поля ВЫБРАННОГО тома (fat32_select). Сам код драйвера от этого не изменился:
+// он по-прежнему работает "с томом", просто том теперь любой. Выбирает том
+// fs.c перед каждой операцией, под fs_lock.
+// ---------------------------------------------------------------------------
+typedef struct {
+    int         disk;              // номер диска в drivers/blk.c, -1 -- диска нет
+    fat32_bpb_t bpb;
+    uint32_t    partition_lba;
+    uint32_t    fat_lba;
+    uint32_t    data_lba;
+    int         mounted;
+    uint32_t    current_cluster;
+    uint32_t    cached_fat_sec;
+    int         fsinfo_done;       // подсказка FSInfo уже помечена "неизвестно"
+    uint8_t     cached_fat_buf[512] __attribute__((aligned(64)));
+} fat32_vol_t;
+
+static fat32_vol_t  s_vols[FAT32_MAX_VOLS];
+static fat32_vol_t* V = &s_vols[0];
+
+#define g_bpb32              (V->bpb)
+#define g_partition_lba      (V->partition_lba)
+#define g_fat_lba            (V->fat_lba)
+#define g_data_lba           (V->data_lba)
+#define g_mounted32          (V->mounted)
+#define g_current_cluster32  (V->current_cluster)
+#define g_cached_fat_sec32   (V->cached_fat_sec)
+#define g_cached_fat_buf32   (V->cached_fat_buf)
+// Секторы читаются с диска выбранного тома
+#define usb_blk_read_sectors(lba, n, buf)  blk_read(V->disk, (lba), (n), (buf))
+#define usb_blk_write_sectors(lba, n, buf) blk_write(V->disk, (lba), (n), (buf))
+
 static int      fat32_find_entry_in_dir(uint32_t dir_cluster, const char* name, fat_dir_entry_t* out_entry);
 static uint32_t fat32_find_dir_cluster_by_path(const char* path);
 
 static uint8_t  sector_buf32[512] __attribute__((aligned(64)));
 
-// Кэш для ускорения чтения FAT-таблицы
-static uint32_t g_cached_fat_sec32 = 0xFFFFFFFF;
-static uint8_t  g_cached_fat_buf32[512] __attribute__((aligned(64)));
-
 // Буфер сборщика длинных имен (LFN)
 static char global_lfn_buf[260];
 
-int fat32_is_mounted(void) { return g_mounted32; }
+// Корневой том смонтирован (том 0): так спрашивают загрузчик и fs_is_mounted
+int fat32_is_mounted(void) { return s_vols[0].mounted; }
+
+void fat32_select(int vol) {
+    if (vol < 0 || vol >= FAT32_MAX_VOLS) vol = 0;
+    V = &s_vols[vol];
+}
+
+int fat32_vol_mounted(int vol) {
+    return vol >= 0 && vol < FAT32_MAX_VOLS && s_vols[vol].mounted;
+}
+
+int fat32_vol_disk(int vol) {
+    return (vol >= 0 && vol < FAT32_MAX_VOLS) ? s_vols[vol].disk : -1;
+}
 
 void fat32_go_root(void) {
     g_current_cluster32 = g_bpb32.root_cluster;
 }
 
-int fat32_mount(int root_mode) {
-    g_mounted32 = 0;
-    g_cached_fat_sec32 = 0xFFFFFFFF;
+// Смонтировать FAT32 с сектора lba диска disk как том vol (и выбрать его).
+// Раздел ищет вызывающий (fs/mount.c разбирает MBR и GPT).
+int fat32_mount_vol(int vol, int disk, uint32_t lba) {
+    fat32_select(vol);
+    V->mounted = 0;
+    V->disk = disk;
+    V->cached_fat_sec = 0xFFFFFFFF;
+    V->fsinfo_done = 0;
+    V->partition_lba = lba;
 
-    if (root_mode) {
-        g_partition_lba = 0;
-    } else {
-        if (!ehci_msc_read_sectors(0, 1, sector_buf32)) return 0;
-        uint16_t sig = sector_buf32[510] | (sector_buf32[511] << 8);
-        if (sig != 0xAA55) return 0;
+    if (!usb_blk_read_sectors(lba, 1, sector_buf32)) return 0;
+    for (int i = 0; i < (int)sizeof(fat32_bpb_t); i++) ((uint8_t*)&g_bpb32)[i] = sector_buf32[i];
+    if (g_bpb32.bytes_per_sector != 512 || !g_bpb32.sectors_per_cluster || !g_bpb32.fat_count ||
+        !g_bpb32.sectors_per_fat_32 || g_bpb32.root_cluster < 2) return 0;
 
-        uint32_t fat_lba = 0;
-        for (int i = 0; i < 4; i++) {
-            uint8_t type = sector_buf32[446 + (i * 16) + 4];
-            if (type == 0x0B || type == 0x0C) {
-                fat_lba = *(uint32_t*)&sector_buf32[446 + (i * 16) + 8];
+    g_fat_lba = lba + g_bpb32.reserved_sectors;
+    g_data_lba = g_fat_lba + (g_bpb32.fat_count * g_bpb32.sectors_per_fat_32);
+    g_current_cluster32 = g_bpb32.root_cluster;
+    V->mounted = 1;
+    return 1;
+}
+
+void fat32_unmount_vol(int vol) {
+    if (vol < 0 || vol >= FAT32_MAX_VOLS) return;
+    s_vols[vol].mounted = 0;
+    s_vols[vol].disk = -1;
+    s_vols[vol].cached_fat_sec = 0xFFFFFFFF;
+}
+
+// Диск тома пропал: том остаётся "смонтированным" (корень ждёт свою флешку
+// обратно, и пути вроде /sys должны отвечать "нет", а не "нет такого тома"),
+// но ни одно чтение до диска больше не доходит.
+void fat32_detach_disk(int vol) {
+    if (vol < 0 || vol >= FAT32_MAX_VOLS) return;
+    s_vols[vol].disk = -1;
+    s_vols[vol].cached_fat_sec = 0xFFFFFFFF;
+}
+
+uint32_t fat32_vol_serial(int vol) {
+    if (!fat32_vol_mounted(vol)) return 0;
+    return s_vols[vol].bpb.volume_id;
+}
+
+// Метка тома. Windows и mkfs пишут её в двух местах: в BPB и записью с
+// атрибутом 0x08 в корневом каталоге, причём при переименовании меняется
+// только вторая -- её и берём первой. "NO NAME" -- значит метки нет.
+void fat32_vol_label(int vol, char* out, int max) {
+    out[0] = '\0';
+    if (!fat32_vol_mounted(vol) || max < 2) return;
+    fat32_vol_t* saved = V;
+    fat32_select(vol);
+    char lab[12];
+    int found = 0;
+    uint32_t lba = g_data_lba + (g_bpb32.root_cluster - 2) * g_bpb32.sectors_per_cluster;
+    if (usb_blk_read_sectors(lba, 1, sector_buf32)) {
+        for (int i = 0; i < 16; i++) {
+            fat_dir_entry_t* e = (fat_dir_entry_t*)(sector_buf32 + i * 32);
+            if (e->filename[0] == 0) break;
+            if ((uint8_t)e->filename[0] == 0xE5) continue;
+            if ((e->attributes & 0x0F) == 0x0F) continue;          // запись LFN
+            if (e->attributes & 0x08) {
+                for (int k = 0; k < 11; k++) lab[k] = (k < 8) ? e->filename[k] : e->ext[k - 8];
+                found = 1;
                 break;
             }
         }
-        g_partition_lba = (fat_lba != 0) ? fat_lba : 2048;
     }
-
-    if (!ehci_msc_read_sectors(g_partition_lba, 1, sector_buf32)) return 0;
-    for (int i = 0; i < (int)sizeof(fat32_bpb_t); i++) {
-        ((uint8_t*)&g_bpb32)[i] = sector_buf32[i];
-    }
-
-    if (g_bpb32.bytes_per_sector != 512) return 0;
-
-    g_fat_lba = g_partition_lba + g_bpb32.reserved_sectors;
-    uint32_t fat_size = g_bpb32.sectors_per_fat_32;
-    g_data_lba = g_fat_lba + (g_bpb32.fat_count * fat_size);
-    g_current_cluster32 = g_bpb32.root_cluster;
-
-    g_mounted32 = 1;
-    return 1;
+    if (!found) for (int k = 0; k < 11; k++) lab[k] = g_bpb32.volume_label[k];
+    lab[11] = '\0';
+    int n = 11;
+    while (n > 0 && (lab[n - 1] == ' ' || lab[n - 1] == 0)) n--;
+    lab[n] = '\0';
+    V = saved;
+    if (!strcmp(lab, "NO NAME")) return;
+    int p = 0;
+    for (int k = 0; k < n && p < max - 1; k++) out[p++] = lab[k];
+    out[p] = '\0';
 }
 
 static uint32_t fat32_get_next_cluster(uint32_t cluster) {
@@ -76,14 +156,33 @@ static uint32_t fat32_get_next_cluster(uint32_t cluster) {
     uint32_t entry_offset = fat_offset % 512;
 
     if (fat_sector != g_cached_fat_sec32) {
-        if (!ehci_msc_read_sectors(fat_sector, 1, g_cached_fat_buf32)) return 0x0FFFFFFF;
+        if (!usb_blk_read_sectors(fat_sector, 1, g_cached_fat_buf32)) return 0x0FFFFFFF;
         g_cached_fat_sec32 = fat_sector;
     }
     uint32_t next = *(uint32_t*)&g_cached_fat_buf32[entry_offset];
     return next & 0x0FFFFFFF;
 }
 
+// FSInfo хранит подсказку "сколько кластеров свободно". Мы её не ведём, и
+// после первой же записи она врёт (fsck: "Free cluster summary wrong"). На
+// своей флешке это безобидно, а чужую потом вставят в Windows, которая этой
+// подсказке верит. Спецификация разрешает значение 0xFFFFFFFF -- "неизвестно,
+// посчитай сам": ставим его один раз на монтирование, перед первым изменением FAT.
+static void fat32_fsinfo_invalidate(void) {
+    // свой буфер: вызывающий может держать в sector_buf32 сектор каталога
+    static uint8_t fsinfo_buf[512] __attribute__((aligned(64)));
+    if (V->fsinfo_done || !g_bpb32.fs_info || g_bpb32.fs_info == 0xFFFF) return;
+    V->fsinfo_done = 1;
+    uint32_t lba = g_partition_lba + g_bpb32.fs_info;
+    if (!usb_blk_read_sectors(lba, 1, fsinfo_buf)) return;
+    if (*(uint32_t*)&fsinfo_buf[0] != 0x41615252 || *(uint32_t*)&fsinfo_buf[484] != 0x61417272) return;
+    *(uint32_t*)&fsinfo_buf[488] = 0xFFFFFFFF;
+    *(uint32_t*)&fsinfo_buf[492] = 0xFFFFFFFF;
+    usb_blk_write_sectors(lba, 1, fsinfo_buf);
+}
+
 static void fat32_set_cluster(uint32_t cluster, uint32_t value) {
+    fat32_fsinfo_invalidate();
     g_cached_fat_sec32 = 0xFFFFFFFF; // Сброс кэша чтения
     uint32_t fat_offset = cluster * 4;
     uint32_t fat_sector = g_fat_lba + (fat_offset / 512);
@@ -91,17 +190,17 @@ static void fat32_set_cluster(uint32_t cluster, uint32_t value) {
 
     for (int f = 0; f < g_bpb32.fat_count; f++) {
         uint32_t target_sec = fat_sector + (f * g_bpb32.sectors_per_fat_32);
-        if (!ehci_msc_read_sectors(target_sec, 1, sector_buf32)) return;
+        if (!usb_blk_read_sectors(target_sec, 1, sector_buf32)) return;
         uint32_t old = *(uint32_t*)&sector_buf32[entry_offset];
         *(uint32_t*)&sector_buf32[entry_offset] = (old & 0xF0000000) | (value & 0x0FFFFFFF);
-        ehci_msc_write_sectors(target_sec, 1, sector_buf32);
+        usb_blk_write_sectors(target_sec, 1, sector_buf32);
     }
 }
 
 static uint32_t fat32_find_free_cluster(void) {
     uint32_t total_fat_sectors = g_bpb32.sectors_per_fat_32;
     for (uint32_t s = 0; s < total_fat_sectors; s++) {
-        if (!ehci_msc_read_sectors(g_fat_lba + s, 1, sector_buf32)) return 0;
+        if (!usb_blk_read_sectors(g_fat_lba + s, 1, sector_buf32)) return 0;
         uint32_t* entries = (uint32_t*)sector_buf32;
         int start_idx = (s == 0) ? 2 : 0;
         for (int i = start_idx; i < 128; i++) {
@@ -142,9 +241,59 @@ typedef struct {
     uint16_t name3[2];
 } __attribute__((packed)) fat_lfn_entry_t;
 
+static uint8_t g_lfn_checksum = 0;   // контрольная сумма 8.3-имени из LFN-записей
+static void lfn_reset(void);
+
+// Контрольная сумма 8.3-имени (спецификация FAT): LFN относится к записи, только если она совпадает
+static uint8_t lfn_checksum_83(const uint8_t* name11) {
+    uint8_t sum = 0;
+    for (int i = 0; i < 11; i++) sum = (uint8_t)(((sum & 1) << 7) + (sum >> 1) + name11[i]);
+    return sum;
+}
+
+// Длинное имя от удалённого файла ("сирота") не должно приклеиться к чужой записи,
+// занявшей его слот, — иначе /etc/locale.conf читается как содержимое другого файла
+static void lfn_validate(const fat_dir_entry_t* e) {
+    if (global_lfn_buf[0] != '\0' && lfn_checksum_83((const uint8_t*)e->filename) != g_lfn_checksum)
+        lfn_reset();
+}
+
+// Длинное имя в FAT32 хранится в UTF-16, а система работает в UTF-8 (консоль
+// переводит UTF-8 в CP866 при выводе). Поэтому сначала собираем имя в кодовых
+// единицах UTF-16 по их позициям, а в UTF-8 переводим, когда имя собрано
+// целиком: длина в байтах и в символах разная, по месту переводить нельзя.
+static uint16_t g_lfn_u16[256];
+static int      g_lfn_u16_len = 0;
+
+static void lfn_reset(void) {
+    g_lfn_u16_len = 0;
+    global_lfn_buf[0] = '\0';
+}
+
+// UTF-16 -> UTF-8 (кириллица, латиница и прочая двухбайтная часть BMP)
+static void lfn_to_utf8(void) {
+    int o = 0;
+    for (int i = 0; i < g_lfn_u16_len && o < 250; i++) {
+        uint16_t c = g_lfn_u16[i];
+        if (!c) break;
+        if (c < 0x80) {
+            global_lfn_buf[o++] = (char)c;
+        } else if (c < 0x800) {
+            global_lfn_buf[o++] = (char)(0xC0 | (c >> 6));
+            global_lfn_buf[o++] = (char)(0x80 | (c & 0x3F));
+        } else {
+            global_lfn_buf[o++] = (char)(0xE0 | (c >> 12));
+            global_lfn_buf[o++] = (char)(0x80 | ((c >> 6) & 0x3F));
+            global_lfn_buf[o++] = (char)(0x80 | (c & 0x3F));
+        }
+    }
+    global_lfn_buf[o] = '\0';
+}
+
 static void parse_lfn_entry(const fat_lfn_entry_t* lfn) {
+    g_lfn_checksum = lfn->checksum;
     int seq = lfn->order & 0x1F;
-    if (seq < 1 || seq > 20) return;
+    if (seq < 1 || seq > 19) return;
     int idx = (seq - 1) * 13;
 
     uint16_t chars[13] = {
@@ -155,12 +304,17 @@ static void parse_lfn_entry(const fat_lfn_entry_t* lfn) {
 
     for (int i = 0; i < 13; i++) {
         uint16_t c = chars[i];
+        int pos = idx + i;
+        if (pos >= 255) break;
         if (c == 0x0000 || c == 0xFFFF) {
-            global_lfn_buf[idx + i] = '\0';
-            return;
+            g_lfn_u16[pos] = 0;
+            if (pos > g_lfn_u16_len) g_lfn_u16_len = pos;
+            break;
         }
-        global_lfn_buf[idx + i] = (c < 128) ? (char)c : '_';
+        g_lfn_u16[pos] = c;
+        if (pos + 1 > g_lfn_u16_len) g_lfn_u16_len = pos + 1;
     }
+    lfn_to_utf8();
 }
 
 static int is_valid_83(const char* name) {
@@ -211,24 +365,28 @@ static int strcasecmp(const char* s1, const char* s2) {
 }
 
 // Преобразование строкового имени в короткий формат 8.3 для создания директорийной записи
+// Байт, недопустимый в коротком имени (в том числе любой байт UTF-8 выше ASCII),
+// заменяется подчёркиванием: настоящее имя всё равно хранится в записях LFN.
+static char short_char(unsigned char c) {
+    if (c >= 'a' && c <= 'z') return (char)(c - 32);
+    if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) return (char)c;
+    if (c == '$' || c == '%' || c == '-' || c == '_' || c == '@' || c == '~' ||
+        c == '`' || c == '!' || c == '(' || c == ')' || c == '{' || c == '}' ||
+        c == '^' || c == '#' || c == '&') return (char)c;
+    return '_';
+}
+
 static void to_short_83(const char* src, char* out83) {
     for (int i = 0; i < 11; i++) out83[i] = ' ';
     int i = 0, d = 0;
-    while (src[i] && src[i] != '.' && d < 8) {
-        char c = src[i++];
-        if (c >= 'a' && c <= 'z') c -= 32;
-        out83[d++] = c;
-    }
+    while (src[i] && src[i] != '.' && d < 8) out83[d++] = short_char((unsigned char)src[i++]);
     while (src[i] && src[i] != '.') i++;
     if (src[i] == '.') {
         i++;
         d = 8;
-        while (src[i] && d < 11) {
-            char c = src[i++];
-            if (c >= 'a' && c <= 'z') c -= 32;
-            out83[d++] = c;
-        }
+        while (src[i] && d < 11) out83[d++] = short_char((unsigned char)src[i++]);
     }
+    if (out83[0] == ' ') out83[0] = '_';
 }
 
 static int compare_83(const fat_dir_entry_t* entry, const char* name83) {
@@ -250,6 +408,7 @@ const char* fat32_get_last_dir_name(void) {
 void fat32_dir(void) {
     if (!g_mounted32) return;
     for (int i = 0; i < 260; i++) global_lfn_buf[i] = '\0';
+    g_lfn_u16_len = 0;
     uint32_t cluster = g_current_cluster32;
     uint32_t spc = g_bpb32.sectors_per_cluster;
 
@@ -260,17 +419,18 @@ void fat32_dir(void) {
     while (cluster >= 2 && cluster < 0x0FFFFFF8) {
         uint32_t cluster_lba = g_data_lba + (cluster - 2) * spc;
         for (uint32_t s = 0; s < spc; s++) {
-            if (!ehci_msc_read_sectors(cluster_lba + s, 1, sector_buf32)) break;
+            if (!usb_blk_read_sectors(cluster_lba + s, 1, sector_buf32)) break;
             uint8_t* ptr = sector_buf32;
 
             for (int i = 0; i < 16; i++, ptr += 32) {
                 fat_dir_entry_t* entry = (fat_dir_entry_t*)ptr;
                 if (entry->filename[0] == 0x00) return;
-                if ((uint8_t)entry->filename[0] == 0xE5) { global_lfn_buf[0] = '\0'; continue; }
+                if ((uint8_t)entry->filename[0] == 0xE5) { lfn_reset(); continue; }
                 if (entry->attributes == 0x0F) { parse_lfn_entry((const fat_lfn_entry_t*)entry); continue; }
-                if (entry->attributes & 0x08) { global_lfn_buf[0] = '\0'; continue; }
+                if (entry->attributes & 0x08) { lfn_reset(); continue; }
 
                 char display_name[256];
+                lfn_validate(entry);
                 if (global_lfn_buf[0] != '\0') {
                     int p = 0; while (global_lfn_buf[p]) { display_name[p] = global_lfn_buf[p]; p++; }
                     display_name[p] = '\0';
@@ -321,7 +481,7 @@ void fat32_dir(void) {
                     kputs(sz_str, 0x55FF55);
                     kputs("\n", 0);
                 }
-                global_lfn_buf[0] = '\0';
+                lfn_reset();
             }
         }
         cluster = fat32_get_next_cluster(cluster);
@@ -354,7 +514,7 @@ int fat32_change_dir(const char* name) {
     if (strcmp(clean_name, "..") == 0) {
         if (g_current_cluster32 == g_bpb32.root_cluster) return 1;
         uint32_t cluster_lba = g_data_lba + (g_current_cluster32 - 2) * g_bpb32.sectors_per_cluster;
-        if (ehci_msc_read_sectors(cluster_lba, 1, sector_buf32)) {
+        if (usb_blk_read_sectors(cluster_lba, 1, sector_buf32)) {
             fat_dir_entry_t* entries = (fat_dir_entry_t*)sector_buf32;
             uint32_t parent = ((uint32_t)entries[1].cluster_high << 16) | entries[1].cluster_low;
             if (parent == 0) parent = g_bpb32.root_cluster;
@@ -369,6 +529,7 @@ int fat32_change_dir(const char* name) {
     to_short_83(clean_name, name83);
 
     for (int i = 0; i < 260; i++) global_lfn_buf[i] = '\0';
+    g_lfn_u16_len = 0;
     uint32_t cluster = g_current_cluster32;
     uint32_t spc = g_bpb32.sectors_per_cluster;
 
@@ -376,7 +537,7 @@ int fat32_change_dir(const char* name) {
     while (cluster >= 2 && cluster < 0x0FFFFFF8) {
         uint32_t cluster_lba = g_data_lba + (cluster - 2) * spc;
         for (uint32_t s = 0; s < spc; s++) {
-            if (!ehci_msc_read_sectors(cluster_lba + s, 1, sector_buf32)) break;
+            if (!usb_blk_read_sectors(cluster_lba + s, 1, sector_buf32)) break;
             uint8_t* ptr = sector_buf32;
 
             for (int i = 0; i < 16; i++, ptr += 32) {
@@ -393,6 +554,7 @@ int fat32_change_dir(const char* name) {
 
                 // Извлекаем имя с сохранением оригинального регистра
                 char filename[256];
+                lfn_validate(entry);
                 if (global_lfn_buf[0] != '\0') {
                     int p = 0; 
                     while (global_lfn_buf[p]) { filename[p] = global_lfn_buf[p]; p++; }
@@ -451,7 +613,7 @@ int fat32_change_dir(const char* name) {
                     return 1;
                 }
 
-                global_lfn_buf[0] = '\0';
+                lfn_reset();
             }
         }
         cluster = fat32_get_next_cluster(cluster);
@@ -478,9 +640,9 @@ static int fat32_resolve_path_to_entry(const char* path, fat_dir_entry_t* out_en
             dir_cluster = g_bpb32.root_cluster;
         } else {
             // Файл во вложенной папке: "/desprogs/ovfiles.prg" или "desprogs/ovfiles.prg"
-            char dir_path[64];
+            char dir_path[256];
             int dlen = (int)(last_slash - path);
-            if (dlen >= 63) dlen = 63;
+            if (dlen >= 255) dlen = 255;
             for (int i = 0; i < dlen; i++) dir_path[i] = path[i];
             dir_path[dlen] = '\0';
 
@@ -495,7 +657,10 @@ static int fat32_resolve_path_to_entry(const char* path, fat_dir_entry_t* out_en
 }
 
 
-int fat32_read_file(const char* name, void* out_buffer, uint32_t max_bytes) {
+// Чтение с произвольного смещения. Целые сектора идут прямо в буфер вызывающего,
+// а неполные (в начале и в конце) — через sector_buf32: раньше последний сектор читался
+// целиком прямо в буфер и затирал до 511 байт за его концом.
+int fat32_read_at(const char* name, uint32_t offset, void* out_buffer, uint32_t max_bytes) {
     if (!g_mounted32 || !out_buffer || max_bytes == 0) return 0;
 
     fat_dir_entry_t entry;
@@ -504,44 +669,77 @@ int fat32_read_file(const char* name, void* out_buffer, uint32_t max_bytes) {
 
     uint32_t cluster = ((uint32_t)entry.cluster_high << 16) | entry.cluster_low;
     uint32_t file_size = entry.file_size;
-    if (!cluster || file_size == 0) return 0;
+    if (!cluster || offset >= file_size) return 0;
 
-    uint32_t total_to_read = (file_size < max_bytes) ? file_size : max_bytes;
-    uint32_t bytes_read = 0;
-    uint8_t* out_ptr = (uint8_t*)out_buffer;
+    uint32_t total = file_size - offset;
+    if (total > max_bytes) total = max_bytes;
+
     uint32_t spc = g_bpb32.sectors_per_cluster;
-    uint32_t bytes_per_cluster = spc * 512;
+    uint32_t bpc = spc * 512;
 
-    // Ниже остаётся ваш проверенный цикл пакетного чтения секторов:
-    while (cluster >= 2 && cluster < 0x0FFFFFF8 && bytes_read < total_to_read) {
-        uint32_t run_start_cluster = cluster;
-        uint32_t run_cluster_count = 1;
+    // Пропускаем кластеры до смещения
+    for (uint32_t skip = offset / bpc; skip > 0; skip--) {
+        cluster = fat32_get_next_cluster(cluster);
+        if (cluster < 2 || cluster >= 0x0FFFFFF8) return 0;
+    }
+    uint32_t in_cluster = offset % bpc;
 
-        while (bytes_read + (run_cluster_count * bytes_per_cluster) < total_to_read) {
-            uint32_t next = fat32_get_next_cluster(run_start_cluster + run_cluster_count - 1);
-            if (next == run_start_cluster + run_cluster_count) {
-                run_cluster_count++;
-            } else {
-                break;
-            }
+    uint8_t* out = (uint8_t*)out_buffer;
+    uint32_t done = 0;
+
+    while (cluster >= 2 && cluster < 0x0FFFFFF8 && done < total) {
+        // Пакет подряд идущих кластеров — одним запросом к флешке
+        uint32_t run_start = cluster;
+        uint32_t run_count = 1;
+        while (done + run_count * bpc - in_cluster < total) {
+            uint32_t next = fat32_get_next_cluster(run_start + run_count - 1);
+            if (next != run_start + run_count) break;
+            run_count++;
         }
 
-        uint32_t run_bytes = run_cluster_count * bytes_per_cluster;
-        if (bytes_read + run_bytes > total_to_read) {
-            run_bytes = total_to_read - bytes_read;
-        }
-        uint32_t sectors_to_read = (run_bytes + 511) / 512;
+        uint32_t run_bytes = run_count * bpc - in_cluster;
+        if (run_bytes > total - done) run_bytes = total - done;
 
-        uint32_t start_lba = g_data_lba + (run_start_cluster - 2) * spc;
-        if (!ehci_msc_read_sectors(start_lba, sectors_to_read, out_ptr + bytes_read)) {
-            break;
+        uint32_t lba = g_data_lba + (run_start - 2) * spc + in_cluster / 512;
+        uint32_t sec_off = in_cluster % 512;
+        uint32_t left = run_bytes;
+
+        if (sec_off) {                                   // хвост сектора в начале
+            if (!usb_blk_read_sectors(lba, 1, sector_buf32)) return (int)done;
+            uint32_t n = 512 - sec_off;
+            if (n > left) n = left;
+            for (uint32_t i = 0; i < n; i++) out[done + i] = sector_buf32[sec_off + i];
+            done += n; left -= n; lba++;
+        }
+        uint32_t full = left / 512;
+        if (full) {                                      // целые сектора — напрямую
+            if (!usb_blk_read_sectors(lba, full, out + done)) return (int)done;
+            done += full * 512; left -= full * 512; lba += full;
+        }
+        if (left) {                                      // начало сектора в конце
+            if (!usb_blk_read_sectors(lba, 1, sector_buf32)) return (int)done;
+            for (uint32_t i = 0; i < left; i++) out[done + i] = sector_buf32[i];
+            done += left;
         }
 
-        bytes_read += run_bytes;
-        cluster = fat32_get_next_cluster(run_start_cluster + run_cluster_count - 1);
+        cluster = fat32_get_next_cluster(run_start + run_count - 1);
+        in_cluster = 0;
     }
 
-    return bytes_read;
+    return (int)done;
+}
+
+int fat32_read_file(const char* name, void* out_buffer, uint32_t max_bytes) {
+    return fat32_read_at(name, 0, out_buffer, max_bytes);
+}
+
+// Размер файла (0 — нет файла или это папка)
+uint32_t fat32_file_size(const char* name) {
+    if (!g_mounted32) return 0;
+    fat_dir_entry_t entry;
+    if (!fat32_resolve_path_to_entry(name, &entry)) return 0;
+    if (entry.attributes & 0x10) return 0;
+    return entry.file_size;
 }
 
 int fat32_file_exists(const char* name) {
@@ -583,7 +781,25 @@ static uint8_t calc_ntres(const char* src) {
     return ntres;
 }
 
-static void fill_lfn_entry(fat_lfn_entry_t* lfn, const char* name, int seq, int total_seq, uint8_t csum) {
+// UTF-8 -> UTF-16 для записи длинного имени. Возвращает число кодовых единиц.
+static int utf8_to_utf16(const char* src, uint16_t* out, int max) {
+    int n = 0;
+    const uint8_t* p = (const uint8_t*)src;
+    while (*p && n < max) {
+        uint32_t c;
+        if (*p < 0x80) c = *p++;
+        else if ((*p & 0xE0) == 0xC0 && p[1]) { c = ((uint32_t)(*p & 0x1F) << 6) | (p[1] & 0x3F); p += 2; }
+        else if ((*p & 0xF0) == 0xE0 && p[1] && p[2]) {
+            c = ((uint32_t)(*p & 0x0F) << 12) | ((uint32_t)(p[1] & 0x3F) << 6) | (p[2] & 0x3F); p += 3;
+        } else { c = '_'; p++; }                       // суррогаты и битые байты
+        if (c > 0xFFFF) c = '_';
+        out[n++] = (uint16_t)c;
+    }
+    return n;
+}
+
+static void fill_lfn_entry(fat_lfn_entry_t* lfn, const uint16_t* name, int name_len,
+                           int seq, int total_seq, uint8_t csum) {
     lfn->order = (seq == total_seq) ? (0x40 | seq) : seq;
     lfn->attribute = 0x0F;
     lfn->type = 0x00;
@@ -591,14 +807,12 @@ static void fill_lfn_entry(fat_lfn_entry_t* lfn, const char* name, int seq, int 
     lfn->cluster_low = 0x0000;
 
     int start_char = (seq - 1) * 13;
-    int name_len = 0;
-    while (name[name_len]) name_len++;
 
     uint16_t chars[13];
     for (int i = 0; i < 13; i++) {
         int char_idx = start_char + i;
         if (char_idx < name_len) {
-            chars[i] = (uint8_t)name[char_idx];
+            chars[i] = name[char_idx];
         } else if (char_idx == name_len) {
             chars[i] = 0x0000;
         } else {
@@ -625,18 +839,19 @@ static int fat32_entry_exists(const char* name) {
     uint32_t cluster = g_current_cluster32;
     uint32_t spc = g_bpb32.sectors_per_cluster;
     for (int i = 0; i < 260; i++) global_lfn_buf[i] = '\0';
+    g_lfn_u16_len = 0;
 
     while (cluster >= 2 && cluster < 0x0FFFFFF8) {
         uint32_t cluster_lba = g_data_lba + (cluster - 2) * spc;
         for (uint32_t s = 0; s < spc; s++) {
-            if (!ehci_msc_read_sectors(cluster_lba + s, 1, sector_buf32)) break;
+            if (!usb_blk_read_sectors(cluster_lba + s, 1, sector_buf32)) break;
             uint8_t* ptr = sector_buf32;
 
             for (int i = 0; i < 16; i++, ptr += 32) {
                 fat_dir_entry_t* entry = (fat_dir_entry_t*)ptr;
                 if (entry->filename[0] == 0x00) return 0;
                 if ((uint8_t)entry->filename[0] == 0xE5 || (entry->attributes & 0x08)) {
-                    global_lfn_buf[0] = '\0';
+                    lfn_reset();
                     continue;
                 }
                 if (entry->attributes == 0x0F) {
@@ -645,6 +860,7 @@ static int fat32_entry_exists(const char* name) {
                 }
 
                 char filename[256];
+                lfn_validate(entry);
                 if (global_lfn_buf[0] != '\0') {
                     int p = 0; while (global_lfn_buf[p]) { filename[p] = global_lfn_buf[p]; p++; }
                     filename[p] = '\0';
@@ -668,10 +884,10 @@ static int fat32_entry_exists(const char* name) {
                 short_name[sp] = '\0';
 
                 if (strcasecmp(filename, clean) == 0 || strcasecmp(short_name, clean) == 0 || compare_83(entry, name83)) {
-                    global_lfn_buf[0] = '\0';
+                    lfn_reset();
                     return 1;
                 }
-                global_lfn_buf[0] = '\0';
+                lfn_reset();
             }
         }
         cluster = fat32_get_next_cluster(cluster);
@@ -703,9 +919,9 @@ static uint32_t fat32_split_path(const char* path, char* out_filename, int max_f
         return g_bpb32.root_cluster;
     }
 
-    char dir_path[64];
+    char dir_path[256];
     int dlen = (int)(last_slash - path);
-    if (dlen >= 63) dlen = 63;
+    if (dlen >= 255) dlen = 255;
     for (int k = 0; k < dlen; k++) dir_path[k] = path[k];
     dir_path[dlen] = '\0';
 
@@ -743,8 +959,14 @@ int fat32_touch(const char* name) {
     uint8_t ntres = calc_ntres(clean_name);
     uint8_t csum  = lfn_checksum(name83);
 
-    int num_lfn = is_valid_83(clean_name) ? 0 : ((len + 12) / 13);
-    if (num_lfn > 4) num_lfn = 4;
+    // Длина считается в кодовых единицах UTF-16, а не в байтах: у кириллицы
+    // один символ занимает два байта UTF-8, и по байтам записей выходило вдвое
+    // больше, чем нужно
+    uint16_t name16[256];
+    int len16 = utf8_to_utf16(clean_name, name16, 255);
+    name16[len16] = 0;
+    int num_lfn = is_valid_83(clean_name) ? 0 : ((len16 + 12) / 13);
+    if (num_lfn > 19) num_lfn = 19;
     int total_entries = num_lfn + 1;
 
     uint32_t cluster = g_current_cluster32;
@@ -756,7 +978,7 @@ int fat32_touch(const char* name) {
         last_cluster = cluster;
         uint32_t cluster_lba = g_data_lba + (cluster - 2) * spc;
         for (uint32_t s = 0; s < spc; s++) {
-            if (!ehci_msc_read_sectors(cluster_lba + s, 1, sector_buf32)) {
+            if (!usb_blk_read_sectors(cluster_lba + s, 1, sector_buf32)) {
                 g_current_cluster32 = saved_cluster;
                 return 0;
             }
@@ -776,7 +998,7 @@ int fat32_touch(const char* name) {
                         for (int seq = num_lfn; seq >= 1; seq--) {
                             int slot_idx = i + (num_lfn - seq);
                             fat_lfn_entry_t* lfn_slot = (fat_lfn_entry_t*)(sector_buf32 + slot_idx * 32);
-                            fill_lfn_entry(lfn_slot, clean_name, seq, num_lfn, csum);
+                            fill_lfn_entry(lfn_slot, name16, len16, seq, num_lfn, csum);
                         }
                     }
 
@@ -795,7 +1017,7 @@ int fat32_touch(const char* name) {
                     entry->cluster_low = 0;
                     entry->file_size = 0;
 
-                    ehci_msc_write_sectors(cluster_lba + s, 1, sector_buf32);
+                    usb_blk_write_sectors(cluster_lba + s, 1, sector_buf32);
                     written = 1;
                     break;
                 }
@@ -805,7 +1027,7 @@ int fat32_touch(const char* name) {
             fat_dir_entry_t* last_e = (fat_dir_entry_t*)(sector_buf32 + 15 * 32);
             if (last_e->filename[0] == 0x00) {
                 last_e->filename[0] = (char)0xE5;
-                ehci_msc_write_sectors(cluster_lba + s, 1, sector_buf32);
+                usb_blk_write_sectors(cluster_lba + s, 1, sector_buf32);
             }
         }
         if (written) break;
@@ -825,13 +1047,13 @@ int fat32_touch(const char* name) {
         for (int i = 0; i < 512; i++) zero_buf[i] = 0;
         uint32_t new_dir_lba = g_data_lba + (new_dir_cluster - 2) * spc;
         for (uint32_t s = 0; s < spc; s++) {
-            ehci_msc_write_sectors(new_dir_lba + s, 1, zero_buf);
+            usb_blk_write_sectors(new_dir_lba + s, 1, zero_buf);
         }
 
         if (num_lfn > 0) {
             for (int seq = num_lfn; seq >= 1; seq--) {
                 fat_lfn_entry_t* lfn_slot = (fat_lfn_entry_t*)(zero_buf + (num_lfn - seq) * 32);
-                fill_lfn_entry(lfn_slot, clean_name, seq, num_lfn, csum);
+                fill_lfn_entry(lfn_slot, name16, len16, seq, num_lfn, csum);
             }
         }
 
@@ -843,7 +1065,7 @@ int fat32_touch(const char* name) {
         entry->cluster_high = 0;
         entry->cluster_low = 0;
         entry->file_size = 0;
-        ehci_msc_write_sectors(new_dir_lba, 1, zero_buf);
+        usb_blk_write_sectors(new_dir_lba, 1, zero_buf);
     }
 
     g_current_cluster32 = saved_cluster; // Восстанавливаем рабочую директорию
@@ -866,8 +1088,14 @@ int fat32_make_folder(const char* name) {
     uint8_t ntres = calc_ntres(clean_name);
     uint8_t csum  = lfn_checksum(name83);
 
-    int num_lfn = is_valid_83(clean_name) ? 0 : ((len + 12) / 13);
-    if (num_lfn > 4) num_lfn = 4;
+    // Длина считается в кодовых единицах UTF-16, а не в байтах: у кириллицы
+    // один символ занимает два байта UTF-8, и по байтам записей выходило вдвое
+    // больше, чем нужно
+    uint16_t name16[256];
+    int len16 = utf8_to_utf16(clean_name, name16, 255);
+    name16[len16] = 0;
+    int num_lfn = is_valid_83(clean_name) ? 0 : ((len16 + 12) / 13);
+    if (num_lfn > 19) num_lfn = 19;
     int total_entries = num_lfn + 1;
 
     uint32_t new_cluster = fat32_find_free_cluster();
@@ -883,7 +1111,7 @@ int fat32_make_folder(const char* name) {
         last_cluster = cluster;
         uint32_t cluster_lba = g_data_lba + (cluster - 2) * spc;
         for (uint32_t s = 0; s < spc; s++) {
-            if (!ehci_msc_read_sectors(cluster_lba + s, 1, sector_buf32)) return 0;
+            if (!usb_blk_read_sectors(cluster_lba + s, 1, sector_buf32)) return 0;
 
             for (int i = 0; i <= 16 - total_entries; i++) {
                 int all_free = 1;
@@ -900,7 +1128,7 @@ int fat32_make_folder(const char* name) {
                         for (int seq = num_lfn; seq >= 1; seq--) {
                             int slot_idx = i + (num_lfn - seq);
                             fat_lfn_entry_t* lfn_slot = (fat_lfn_entry_t*)(sector_buf32 + slot_idx * 32);
-                            fill_lfn_entry(lfn_slot, clean_name, seq, num_lfn, csum);
+                            fill_lfn_entry(lfn_slot, name16, len16, seq, num_lfn, csum);
                         }
                     }
 
@@ -913,7 +1141,7 @@ int fat32_make_folder(const char* name) {
                     entry->cluster_high = (new_cluster >> 16) & 0xFFFF;
                     entry->file_size = 0;
 
-                    ehci_msc_write_sectors(cluster_lba + s, 1, sector_buf32);
+                    usb_blk_write_sectors(cluster_lba + s, 1, sector_buf32);
                     written = 1;
                     break;
                 }
@@ -923,7 +1151,7 @@ int fat32_make_folder(const char* name) {
             fat_dir_entry_t* last_e = (fat_dir_entry_t*)(sector_buf32 + 15 * 32);
             if (last_e->filename[0] == 0x00) {
                 last_e->filename[0] = (char)0xE5;
-                ehci_msc_write_sectors(cluster_lba + s, 1, sector_buf32);
+                usb_blk_write_sectors(cluster_lba + s, 1, sector_buf32);
             }
         }
         if (written) break;
@@ -940,13 +1168,13 @@ int fat32_make_folder(const char* name) {
         for (int i = 0; i < 512; i++) zero_buf[i] = 0;
         uint32_t new_dir_lba = g_data_lba + (new_dir_cluster - 2) * spc;
         for (uint32_t s = 0; s < spc; s++) {
-            ehci_msc_write_sectors(new_dir_lba + s, 1, zero_buf);
+            usb_blk_write_sectors(new_dir_lba + s, 1, zero_buf);
         }
 
         if (num_lfn > 0) {
             for (int seq = num_lfn; seq >= 1; seq--) {
                 fat_lfn_entry_t* lfn_slot = (fat_lfn_entry_t*)(zero_buf + (num_lfn - seq) * 32);
-                fill_lfn_entry(lfn_slot, clean_name, seq, num_lfn, csum);
+                fill_lfn_entry(lfn_slot, name16, len16, seq, num_lfn, csum);
             }
         }
 
@@ -958,7 +1186,7 @@ int fat32_make_folder(const char* name) {
         entry->cluster_low = new_cluster & 0xFFFF;
         entry->cluster_high = (new_cluster >> 16) & 0xFFFF;
         entry->file_size = 0;
-        ehci_msc_write_sectors(new_dir_lba, 1, zero_buf);
+        usb_blk_write_sectors(new_dir_lba, 1, zero_buf);
     }
 
     // Инициализация папки записями "." и ".."
@@ -966,10 +1194,10 @@ int fat32_make_folder(const char* name) {
     for (int i = 0; i < 512; i++) zero_buf[i] = 0;
     uint32_t new_lba = g_data_lba + (new_cluster - 2) * spc;
     for (uint32_t s = 0; s < spc; s++) {
-        ehci_msc_write_sectors(new_lba + s, 1, zero_buf);
+        usb_blk_write_sectors(new_lba + s, 1, zero_buf);
     }
 
-    if (ehci_msc_read_sectors(new_lba, 1, sector_buf32)) {
+    if (usb_blk_read_sectors(new_lba, 1, sector_buf32)) {
         fat_dir_entry_t* entries = (fat_dir_entry_t*)sector_buf32;
 
         for (int c = 0; c < 8; c++) entries[0].filename[c] = ' ';
@@ -990,7 +1218,7 @@ int fat32_make_folder(const char* name) {
         entries[1].cluster_high = (parent >> 16) & 0xFFFF;
         entries[1].file_size = 0;
 
-        ehci_msc_write_sectors(new_lba, 1, sector_buf32);
+        usb_blk_write_sectors(new_lba, 1, sector_buf32);
     }
     return 1;
 }
@@ -1013,21 +1241,23 @@ int fat32_remove_file(const char* name) {
     uint32_t start_cluster = 0;
 
     for (int i = 0; i < 260; i++) global_lfn_buf[i] = '\0';
+    g_lfn_u16_len = 0;
 
     // 2. Поиск файла строго внутри целевого каталога
     while (cluster >= 2 && cluster < 0x0FFFFFF8) {
         uint32_t cluster_lba = g_data_lba + (cluster - 2) * spc;
         for (uint32_t s = 0; s < spc; s++) {
-            if (!ehci_msc_read_sectors(cluster_lba + s, 1, sector_buf32)) return 0;
+            if (!usb_blk_read_sectors(cluster_lba + s, 1, sector_buf32)) return 0;
             fat_dir_entry_t* entry = (fat_dir_entry_t*)sector_buf32;
 
             for (int i = 0; i < 16; i++, entry++) {
                 if (entry->filename[0] == 0x00) break;
-                if ((uint8_t)entry->filename[0] == 0xE5) { global_lfn_buf[0] = '\0'; continue; }
+                if ((uint8_t)entry->filename[0] == 0xE5) { lfn_reset(); continue; }
                 if (entry->attributes == 0x0F) { parse_lfn_entry((const fat_lfn_entry_t*)entry); continue; }
-                if (entry->attributes & 0x08) { global_lfn_buf[0] = '\0'; continue; }
+                if (entry->attributes & 0x08) { lfn_reset(); continue; }
 
                 char filename[256];
+                lfn_validate(entry);
                 if (global_lfn_buf[0] != '\0') {
                     int p = 0; while (global_lfn_buf[p]) { filename[p] = global_lfn_buf[p]; p++; }
                     filename[p] = '\0';
@@ -1056,7 +1286,7 @@ int fat32_remove_file(const char* name) {
                     start_cluster = ((uint32_t)entry->cluster_high << 16) | entry->cluster_low;
                     break;
                 }
-                global_lfn_buf[0] = '\0';
+                lfn_reset();
             }
             if (entry_index != -1) break;
         }
@@ -1074,11 +1304,31 @@ int fat32_remove_file(const char* name) {
         cur = next;
     }
 
-    // 4. Помечаем элемент каталога как удалённый (0xE5)
-    if (!ehci_msc_read_sectors(target_lba, 1, sector_buf32)) return 0;
+    // 4. Помечаем элемент каталога как удалённый (0xE5) — вместе с его LFN-записями перед ним
+    if (!usb_blk_read_sectors(target_lba, 1, sector_buf32)) return 0;
     fat_dir_entry_t* entries = (fat_dir_entry_t*)sector_buf32;
     entries[entry_index].filename[0] = (char)0xE5;
-    ehci_msc_write_sectors(target_lba, 1, sector_buf32);
+    int k = entry_index - 1;
+    while (k >= 0 && entries[k].attributes == 0x0F && (uint8_t)entries[k].filename[0] != 0xE5) {
+        entries[k].filename[0] = (char)0xE5;
+        k--;
+    }
+    usb_blk_write_sectors(target_lba, 1, sector_buf32);
+
+    // LFN-цепочка могла начаться в предыдущем секторе того же кластера
+    if (k < 0 && target_lba > g_data_lba) {
+        uint32_t prev_lba = target_lba - 1;
+        uint32_t rel = target_lba - g_data_lba;
+        if (rel % spc != 0 && usb_blk_read_sectors(prev_lba, 1, sector_buf32)) {
+            fat_dir_entry_t* prev = (fat_dir_entry_t*)sector_buf32;
+            int changed = 0;
+            for (int j = 15; j >= 0 && prev[j].attributes == 0x0F && (uint8_t)prev[j].filename[0] != 0xE5; j--) {
+                prev[j].filename[0] = (char)0xE5;
+                changed = 1;
+            }
+            if (changed) usb_blk_write_sectors(prev_lba, 1, sector_buf32);
+        }
+    }
     return 1;
 }
 
@@ -1130,7 +1380,7 @@ int fat32_write_file(const char* name, const void* in_buffer, uint32_t bytes_to_
                 sec_tmp[b] = in_ptr[bytes_written + b];
             }
 
-            ehci_msc_write_sectors(cluster_lba + s, 1, sec_tmp);
+            usb_blk_write_sectors(cluster_lba + s, 1, sec_tmp);
             bytes_written += chunk;
             if (bytes_written >= bytes_to_write) break;
         }
@@ -1142,19 +1392,21 @@ int fat32_write_file(const char* name, const void* in_buffer, uint32_t bytes_to_
 
     uint32_t dir_cluster = target_dir_cluster;
     for (int i = 0; i < 260; i++) global_lfn_buf[i] = '\0';
+    g_lfn_u16_len = 0;
 
     while (dir_cluster >= 2 && dir_cluster < 0x0FFFFFF8) {
         uint32_t cluster_lba = g_data_lba + (dir_cluster - 2) * spc;
         for (uint32_t s = 0; s < spc; s++) {
-            if (!ehci_msc_read_sectors(cluster_lba + s, 1, sector_buf32)) return 0;
+            if (!usb_blk_read_sectors(cluster_lba + s, 1, sector_buf32)) return 0;
             fat_dir_entry_t* entry = (fat_dir_entry_t*)sector_buf32;
 
             for (int i = 0; i < 16; i++, entry++) {
                 if (entry->filename[0] == 0x00) break;
-                if ((uint8_t)entry->filename[0] == 0xE5) { global_lfn_buf[0] = '\0'; continue; }
+                if ((uint8_t)entry->filename[0] == 0xE5) { lfn_reset(); continue; }
                 if (entry->attributes == 0x0F) { parse_lfn_entry((const fat_lfn_entry_t*)entry); continue; }
 
                 char filename[256];
+                lfn_validate(entry);
                 if (global_lfn_buf[0] != '\0') {
                     int p = 0; while (global_lfn_buf[p]) { filename[p] = global_lfn_buf[p]; p++; }
                     filename[p] = '\0';
@@ -1172,10 +1424,10 @@ int fat32_write_file(const char* name, const void* in_buffer, uint32_t bytes_to_
                     entry->cluster_low = first_cluster & 0xFFFF;
                     entry->cluster_high = (first_cluster >> 16) & 0xFFFF;
                     entry->file_size = bytes_to_write;
-                    ehci_msc_write_sectors(cluster_lba + s, 1, sector_buf32);
+                    usb_blk_write_sectors(cluster_lba + s, 1, sector_buf32);
                     return 1;
                 }
-                global_lfn_buf[0] = '\0';
+                lfn_reset();
             }
         }
         dir_cluster = fat32_get_next_cluster(dir_cluster);
@@ -1188,6 +1440,7 @@ static int fat32_find_entry_in_dir(uint32_t dir_cluster, const char* name, fat_d
     if (!g_mounted32 || dir_cluster < 2) return 0;
 
     for (int i = 0; i < 260; i++) global_lfn_buf[i] = '\0';
+    g_lfn_u16_len = 0;
     uint32_t cluster = dir_cluster;
     uint32_t spc = g_bpb32.sectors_per_cluster;
 
@@ -1197,16 +1450,17 @@ static int fat32_find_entry_in_dir(uint32_t dir_cluster, const char* name, fat_d
     while (cluster >= 2 && cluster < 0x0FFFFFF8) {
         uint32_t cluster_lba = g_data_lba + (cluster - 2) * spc;
         for (uint32_t s = 0; s < spc; s++) {
-            if (!ehci_msc_read_sectors(cluster_lba + s, 1, sector_buf32)) break;
+            if (!usb_blk_read_sectors(cluster_lba + s, 1, sector_buf32)) break;
             uint8_t* ptr = sector_buf32;
 
             for (int i = 0; i < 16; i++, ptr += 32) {
                 fat_dir_entry_t* entry = (fat_dir_entry_t*)ptr;
                 if (entry->filename[0] == 0x00) return 0;
-                if ((uint8_t)entry->filename[0] == 0xE5) { global_lfn_buf[0] = '\0'; continue; }
+                if ((uint8_t)entry->filename[0] == 0xE5) { lfn_reset(); continue; }
                 if (entry->attributes == 0x0F) { parse_lfn_entry((const fat_lfn_entry_t*)entry); continue; }
 
                 char filename[256];
+                lfn_validate(entry);
                 if (global_lfn_buf[0] != '\0') {
                     int p = 0; while (global_lfn_buf[p]) { filename[p] = global_lfn_buf[p]; p++; }
                     filename[p] = '\0';
@@ -1247,10 +1501,10 @@ static int fat32_find_entry_in_dir(uint32_t dir_cluster, const char* name, fat_d
 
                 if (strcasecmp(filename, name) == 0 || strcasecmp(short_name, name) == 0 || compare_83(entry, name83)) {
                     if (out_entry) *out_entry = *entry;
-                    global_lfn_buf[0] = '\0';
+                    lfn_reset();
                     return 1;
                 }
-                global_lfn_buf[0] = '\0';
+                lfn_reset();
             }
         }
         cluster = fat32_get_next_cluster(cluster);
@@ -1274,7 +1528,7 @@ static uint32_t fat32_walk_segments(uint32_t start_cluster, const char* path) {
         if (strcmp(seg, "..") == 0) {
             if (cluster == g_bpb32.root_cluster) continue;
             uint32_t cluster_lba = g_data_lba + (cluster - 2) * g_bpb32.sectors_per_cluster;
-            if (!ehci_msc_read_sectors(cluster_lba, 1, sector_buf32)) return 0;
+            if (!usb_blk_read_sectors(cluster_lba, 1, sector_buf32)) return 0;
             fat_dir_entry_t* entries = (fat_dir_entry_t*)sector_buf32;
             uint32_t parent = ((uint32_t)entries[1].cluster_high << 16) | entries[1].cluster_low;
             cluster = (parent == 0) ? g_bpb32.root_cluster : parent;
@@ -1310,6 +1564,14 @@ static uint32_t fat32_find_dir_cluster_by_path(const char* path) {
     return fat32_walk_segments(g_bpb32.root_cluster, path);
 }
 
+// Существует ли каталог по пути (абсолютному или относительному текущему)
+int fat32_dir_exists(const char* path) {
+    if (!g_mounted32) return 0;
+    if (!path || !path[0]) return 1;
+    if (path[0] == '/' && path[1] == '\0') return 1;      // корень есть всегда
+    return fat32_find_dir_cluster_by_path(path) >= 2;
+}
+
 // Чтение списка файлов любой папки (если path == NULL или "", читается текущая папка)
 int fat32_get_dir_files(const char* path, fs_file_info_t* out_list, int max_files) {
     if (!g_mounted32) return 0;
@@ -1324,26 +1586,28 @@ int fat32_get_dir_files(const char* path, fs_file_info_t* out_list, int max_file
     int count = 0;
     uint32_t spc = g_bpb32.sectors_per_cluster;
     for (int i = 0; i < 260; i++) global_lfn_buf[i] = '\0';
+    g_lfn_u16_len = 0;
 
     while (cluster >= 2 && cluster < 0x0FFFFFF8) {
         uint32_t cluster_lba = g_data_lba + (cluster - 2) * spc;
         for (uint32_t s = 0; s < spc; s++) {
-            if (!ehci_msc_read_sectors(cluster_lba + s, 1, sector_buf32)) return count;
+            if (!usb_blk_read_sectors(cluster_lba + s, 1, sector_buf32)) return count;
             uint8_t* ptr = sector_buf32;
 
             for (int i = 0; i < 16; i++, ptr += 32) {
                 fat_dir_entry_t* entry = (fat_dir_entry_t*)ptr;
                 if (entry->filename[0] == 0x00) return count;
-                if ((uint8_t)entry->filename[0] == 0xE5) { global_lfn_buf[0] = '\0'; continue; }
+                if ((uint8_t)entry->filename[0] == 0xE5) { lfn_reset(); continue; }
                 if (entry->attributes == 0x0F) { parse_lfn_entry((const fat_lfn_entry_t*)entry); continue; }
-                if (entry->attributes & 0x08) { global_lfn_buf[0] = '\0'; continue; }
+                if (entry->attributes & 0x08) { lfn_reset(); continue; }
 
                 if (entry->filename[0] == '.') {
-                    global_lfn_buf[0] = '\0';
+                    lfn_reset();
                     continue;
                 }
 
                 char display_name[64];
+                lfn_validate(entry);
                 if (global_lfn_buf[0] != '\0') {
                     int p = 0;
                     while (global_lfn_buf[p] && p < 63) { display_name[p] = global_lfn_buf[p]; p++; }
@@ -1386,7 +1650,7 @@ int fat32_get_dir_files(const char* path, fs_file_info_t* out_list, int max_file
                 out_list[count].cluster = ((uint32_t)entry->cluster_high << 16) | entry->cluster_low;
 
                 count++;
-                global_lfn_buf[0] = '\0';
+                lfn_reset();
 
                 if (count >= max_files) return count;
             }
@@ -1397,6 +1661,19 @@ int fat32_get_dir_files(const char* path, fs_file_info_t* out_list, int max_file
 }
 
 // расчет реального объема и занятого места на диске
+// Размер тома без обхода FAT. Занятое место считается чтением всей таблицы
+// (сотни секторов с флешки), и на загрузке это лишние секунды — там нужен
+// только размер, он лежит в BPB.
+uint32_t fat32_total_mb(void) {
+    fat32_select(0);
+    if (!g_mounted32 || g_bpb32.bytes_per_sector == 0) return 0;
+    uint32_t total_sectors = g_bpb32.total_sectors_long;
+    if (total_sectors == 0) total_sectors = g_bpb32.total_sectors_short;
+    uint32_t non_data = g_bpb32.reserved_sectors + g_bpb32.fat_count * g_bpb32.sectors_per_fat_32;
+    uint32_t data_sectors = (total_sectors > non_data) ? (total_sectors - non_data) : 0;
+    return (uint32_t)(((uint64_t)data_sectors * g_bpb32.bytes_per_sector) / (1024 * 1024));
+}
+
 void fat32_get_stats(uint32_t* out_used_mb, uint32_t* out_total_mb) {
     if (!g_mounted32 || g_bpb32.bytes_per_sector == 0) {
         if (out_used_mb) *out_used_mb = 0;
@@ -1427,7 +1704,7 @@ void fat32_get_stats(uint32_t* out_used_mb, uint32_t* out_total_mb) {
     uint32_t occupied_clusters = 0;
 
     for (uint32_t s = 0; s < total_fat_sectors; s++) {
-        if (!ehci_msc_read_sectors(g_fat_lba + s, 1, sector_buf32)) break;
+        if (!usb_blk_read_sectors(g_fat_lba + s, 1, sector_buf32)) break;
         uint32_t* entries = (uint32_t*)sector_buf32;
 
         int start_idx = (s == 0) ? 2 : 0;

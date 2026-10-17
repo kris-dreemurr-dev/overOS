@@ -1,4 +1,4 @@
-#include <stdint.h>
+#include "ovos.h"   // общие обёртки сисколов (src/lib)
 #include <stddef.h>
 #include <stdarg.h>
 
@@ -11,21 +11,11 @@ size_t strlen(const char* s);
 // ВЫВОД НА ЭКРАН DEVOS ЧЕРЕЗ VFS (FD 1 -> /dev/tty)
 // -----------------------------------------------------------------------------
 
-static inline int sys_write(int fd, const void* buf, uint32_t sz) {
-    int ret;
-    __asm__ volatile (
-        "int $0x80"
-        : "=a"(ret)
-        : "a"(13), "b"(fd), "c"(buf), "d"(sz)
-        : "memory"
-    );
-    return ret;
-}
 
 
 void sys_print(const char* str) {
     if (!str) return;
-    sys_write(1, str, (uint32_t)strlen(str));
+    ov_write(1, str, (uint32_t)strlen(str));
 }
 
 void* stderr = (void*)2;
@@ -168,18 +158,7 @@ void* memmove(void* dest, const void* src, size_t n) {
     return dest;
 }
 
-static void* sbrk(int64_t increment) {
-    uint64_t cur_brk = 0;
-    __asm__ volatile ("int $0x80" : "=a"(cur_brk) : "0"(14), "b"(0) : "memory");
-    if (increment == 0) return (void*)cur_brk;
-
-    uint64_t new_brk = cur_brk + increment;
-    uint64_t res = 0;
-    __asm__ volatile ("int $0x80" : "=a"(res) : "0"(14), "b"(new_brk) : "memory");
-    if (res == (uint64_t)-1) return (void*)-1;
-    
-    return (void*)cur_brk;
-}
+static void* sbrk(int64_t increment) { return ov_sbrk(increment); }
 
 void* malloc(size_t size) {
     if (size == 0 || size > 32 * 1024 * 1024) return NULL;
@@ -641,8 +620,7 @@ void exit(int status) {
         sys_print("\n");
     }
 
-    __asm__ volatile ("int $0x80" : : "a"(0), "b"(status) : "memory");
-    while (1);
+    ov_exit(status);
 }
 
 void abort(void) { exit(1); }
@@ -652,36 +630,6 @@ void abort(void) { exit(1); }
 // -----------------------------------------------------------------------------
 #define WAD_RAM_ADDR 0x05000000
 
-static inline int sys_open(const char* fn, int flags) {
-    int ret;
-    __asm__ volatile (
-        "int $0x80"
-        : "=a"(ret)
-        : "a"(10), "b"(fn), "c"(flags)
-        : "memory"
-    );
-    return ret;
-}
-
-static inline int sys_read(int fd, void* buf, int sz) {
-    int ret;
-    __asm__ volatile (
-        "int $0x80"
-        : "=a"(ret)
-        : "a"(11), "b"(fd), "c"(buf), "d"(sz)
-        : "memory"
-    );
-    return ret;
-}
-
-static inline void sys_close(int fd) {
-    __asm__ volatile (
-        "int $0x80"
-        :
-        : "a"(12), "b"(fd)
-        : "memory"
-    );
-}
 
 #define MAX_FILES 16
 typedef struct {
@@ -721,19 +669,19 @@ void* fopen(const char* filename, const char* mode) {
     int is_archive = (ext && (strcasecmp(ext, ".wad") == 0 || strcasecmp(ext, ".pak") == 0));
 
     if (is_archive) {
-        int fd = sys_open(base_name, 0); // 0 = O_RDONLY
+        int fd = ov_open(base_name, 0); // 0 = O_RDONLY
         if (fd < 0) return NULL;
 
         // Выделяем память под полный образ архива
         f->capacity = 25 * 1024 * 1024; 
         f->buffer = (uint8_t*)malloc(f->capacity);
         if (!f->buffer) {
-            sys_close(fd);
+            ov_close(fd);
             return NULL;
         }
 
-        int read_bytes = sys_read(fd, f->buffer, f->capacity);
-        sys_close(fd);
+        int read_bytes = ov_read(fd, f->buffer, f->capacity);
+        ov_close(fd);
 
         f->is_wad = 1;
         f->size = (read_bytes > 0) ? read_bytes : 0;
@@ -752,15 +700,15 @@ void* fopen(const char* filename, const char* mode) {
         f->is_open = 1;
         return f;
     } else {
-        int fd = sys_open(base_name, 0); // 0 = O_RDONLY
+        int fd = ov_open(base_name, 0); // 0 = O_RDONLY
         if (fd < 0) return NULL;
 
         f->capacity = 512 * 1024;
         f->buffer = malloc(f->capacity);
-        if (!f->buffer) { sys_close(fd); return NULL; }
+        if (!f->buffer) { ov_close(fd); return NULL; }
 
-        int bytes = sys_read(fd, f->buffer, f->capacity);
-        sys_close(fd);
+        int bytes = ov_read(fd, f->buffer, f->capacity);
+        ov_close(fd);
 
         f->size = (bytes > 0) ? bytes : 0;
         strcpy(f->name, base_name);
@@ -810,10 +758,10 @@ int fclose(void* stream) {
 
     // Запись файла через честный VFS open -> write -> close
     if (f->is_write && !f->is_wad && f->size > 0) {
-        int fd = sys_open(f->name, 1 | 0x40); // 1 = O_WRONLY, 0x40 = O_CREAT
+        int fd = ov_open(f->name, 1 | 0x40); // 1 = O_WRONLY, 0x40 = O_CREAT
         if (fd >= 0) {
-            sys_write(fd, f->buffer, f->size);
-            sys_close(fd);
+            ov_write(fd, f->buffer, f->size);
+            ov_close(fd);
         }
     }
 
@@ -852,23 +800,23 @@ int rename(const char* oldpath, const char* newpath) {
     const char* base_old = get_base_name(oldpath);
     const char* base_new = get_base_name(newpath);
 
-    int fd = sys_open(base_old, 0); // 0 = O_RDONLY
+    int fd = ov_open(base_old, 0); // 0 = O_RDONLY
     if (fd < 0) return -1;
 
     uint8_t* temp_buf = malloc(512 * 1024);
     if (!temp_buf) { 
-        sys_close(fd); 
+        ov_close(fd); 
         return -1; 
     }
 
-    int sz = sys_read(fd, temp_buf, 512 * 1024);
-    sys_close(fd);
+    int sz = ov_read(fd, temp_buf, 512 * 1024);
+    ov_close(fd);
 
     if (sz > 0) {
-        int out_fd = sys_open(base_new, 1 | 0x40); // 1 = O_WRONLY, 0x40 = O_CREAT
+        int out_fd = ov_open(base_new, 1 | 0x40); // 1 = O_WRONLY, 0x40 = O_CREAT
         if (out_fd >= 0) {
-            sys_write(out_fd, temp_buf, sz);
-            sys_close(out_fd);
+            ov_write(out_fd, temp_buf, sz);
+            ov_close(out_fd);
         }
     }
 

@@ -1,61 +1,5 @@
-#include <stdint.h>
+#include "ovos.h"   // общие обёртки сисколов (src/lib)
 #include <stddef.h>
-
-static inline void sys_exit(int code) {
-    __asm__ volatile ("int $0x80" : : "a"(0), "b"(code) : "memory");
-    while (1);
-}
-
-static inline int sys_open(const char* fn, int flags) {
-    int ret;
-    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(10), "b"(fn), "c"(flags) : "memory");
-    return ret;
-}
-
-static inline int sys_ioctl(int fd, uint64_t req, void* arg) {
-    int ret;
-    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(15), "b"(fd), "c"(req), "d"(arg) : "memory");
-    return ret;
-}
-
-static inline int sys_write(int fd, const void* buf, uint32_t sz) {
-    int ret;
-    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(13), "b"(fd), "c"(buf), "d"(sz) : "memory");
-    return ret;
-}
-
-static inline uint8_t sys_get_key(void) {
-    uint64_t ret;
-    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(6) : "memory");
-    return (uint8_t)ret;
-}
-
-static inline void sys_sleep(uint32_t ms) {
-    __asm__ volatile ("int $0x80" : : "a"(4), "b"(ms) : "memory");
-}
-
-static void* sys_sbrk(int64_t inc) {
-    uint64_t cur = 0;
-    __asm__ volatile ("int $0x80" : "=a"(cur) : "a"(14), "b"(0) : "memory");
-    if (inc == 0) return (void*)cur;
-    uint64_t res = 0;
-    __asm__ volatile ("int $0x80" : "=a"(res) : "a"(14), "b"(cur + inc) : "memory");
-    return (void*)cur;
-}
-
-typedef struct {
-    int x;
-    int y;
-    uint8_t buttons;
-    int last_dx;
-    int last_dy;
-} __attribute__((packed)) user_mouse_t;
-
-static inline int sys_get_mouse(user_mouse_t* ms) {
-    int ret;
-    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(7), "b"(ms) : "memory");
-    return ret;
-}
 
 typedef struct {
     uint32_t width, height, pitch, bpp;
@@ -156,16 +100,16 @@ static void draw_dec(int x, int y, int val, uint32_t color) {
 }
 
 int main(void) {
-    int fb_fd = sys_open("/dev/fb0", 0);
-    if (fb_fd < 0) sys_exit(1);
+    int fb_fd = ov_open("/dev/fb0", 0);
+    if (fb_fd < 0) ov_exit(1);
 
     fb_var_info_t info;
-    sys_ioctl(fb_fd, 0x4600, &info);
+    ov_ioctl(fb_fd, 0x4600, &info);
     g_sw = info.width;
     g_sh = info.height;
 
     uint32_t total_bytes = g_sw * g_sh * 4;
-    g_fb = (uint32_t*)sys_sbrk((int64_t)total_bytes);
+    g_fb = (uint32_t*)ov_sbrk((int64_t)total_bytes);
 
     draw_fill_rect(0, 0, g_sw, g_sh, 0x10141A);
 
@@ -176,14 +120,14 @@ int main(void) {
     int prev_y = g_sh / 2;
 
     while (1) {
-        uint8_t key = sys_get_key();
+        uint8_t key = ov_get_key();
         if (key == 0x01) break; // ESC
         if (key == 0x2E) {      // 'C'
             draw_fill_rect(canvas_x, canvas_y, canvas_w, canvas_h, 0x05070A);
         }
 
-        user_mouse_t ms;
-        sys_get_mouse(&ms);
+        ov_mouse_t ms;
+        ov_get_mouse(&ms);
 
         // Панель статуса слева
         draw_fill_rect(10, 10, 320, g_sh - 20, 0x1A212B);
@@ -227,8 +171,8 @@ int main(void) {
         prev_x = ms.x;
         prev_y = ms.y;
 
-        sys_write(fb_fd, g_fb, total_bytes);
-        sys_sleep(16);
+        ov_write(fb_fd, g_fb, total_bytes);
+        ov_sleep(16);
     }
 
     return 0;

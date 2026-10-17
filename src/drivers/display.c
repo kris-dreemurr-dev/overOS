@@ -19,7 +19,7 @@ static volatile uint32_t* s_backlight_ctl = 0;
 static uint32_t s_max_pwm = 0;
 
 void intel_set_backlight(int percent, int silent) {
-    if (percent < 10) percent = 10;
+    if (percent < 0) percent = 0;
     if (percent > 100) percent = 100;
 
     // Инициализация при первом вызове
@@ -46,7 +46,10 @@ void intel_set_backlight(int percent, int silent) {
     }
 
     // Мгновенная запись нового уровня без задержек шины
-    uint32_t target_val = (s_max_pwm * percent) / 100;
+    // 0..100% ложатся на [min_pwm .. max]: 0% — самая тусклая подсветка, но не чёрный экран (как в KDE)
+    uint32_t min_pwm = s_max_pwm / 50;
+    if (min_pwm == 0) min_pwm = 1;
+    uint32_t target_val = min_pwm + ((s_max_pwm - min_pwm) * (uint32_t)percent) / 100;
     *s_backlight_ctl = (s_max_pwm << 16) | target_val;
 
     if (silent == 0) {

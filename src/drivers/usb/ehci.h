@@ -43,6 +43,13 @@ typedef struct ehci_qh {
 #define EHCI_PID_IN     1
 #define EHCI_PID_SETUP  2
 
-void ehci_init(void);
+// Поднять контроллер и перечислить устройства. 0 -- контроллер работает
+// (даже если на нём пусто), <0 -- его нет или он не запустился.
+int  ehci_init(void);
+// Горячее подключение: пропавшие устройства снять, новые поднять (под usb_lock)
+void ehci_poll(void);
+// Есть ли подключение на корневом порту (одно чтение регистра)
+int  ehci_port_connected(int root_port);
+int  ehci_storage_found(void);
 
 #endif

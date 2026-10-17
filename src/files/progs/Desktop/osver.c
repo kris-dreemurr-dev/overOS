@@ -83,6 +83,6 @@ void osver_show(void) {
     if (s_osver_win) {
         s_osver_win->is_open = 1;      // Открываем только по клику из меню
         s_osver_win->is_minimized = 0;
-        s_osver_win->is_active = 1;
+        window_activate(s_osver_win);
     }
 }

@@ -1,18 +1,36 @@
+// =============================================================================
+// ehci.c — контроллер USB 2.0 (EHCI) и перечисление устройств на нём.
+//
+// Что здесь есть:
+//   * передача контроллера от BIOS, сброс, запуск;
+//   * управляющие передачи по нулевой точке (через асинхронное расписание);
+//   * перечисление: каждый корневой порт, а за ним -- хаб. На ноутбуках Intel
+//     за корневым портом стоит встроенный хаб чипсета (RMH), и все внешние
+//     разъёмы на самом деле -- его порты;
+//   * горячее подключение (ehci_poll): корневые порты по отметке смены
+//     подключения, порты хабов -- запросом GET_STATUS.
+// Накопители дальше доводит ehci-msc.c и регистрирует как диски в
+// drivers/blk.c. О файловой системе драйвер не знает ничего: раньше флешку
+// монтировал прямо отсюда (fs_mount), и вторую флешку было просто некуда деть.
+//
+// Low/Full-speed устройства (клавиатуры, мыши) за хабом требуют split-
+// транзакций, которых здесь нет; на корневом порту их забирает companion-
+// контроллер.
+// =============================================================================
+
 #include "ehci.h"
 #include "ehci-msc.h"
-#include "../../fs/fs.h"
-#include "../../fs/vfs.h"
+#include "usb.h"
 
 extern void kdebug(const char* str, uint32_t color);
 extern void itoa(int n, char* str);
 extern void sleep_ms(uint32_t ms);
-extern void kputs(const char* str, uint32_t color);
-extern void kputc(char c, uint32_t color);
-extern void hex_str(uint32_t val, char* out);
 
 // Перевод виртуального адреса ядра (Higher-Half) в физический адрес для DMA железа
 #define V2P(va) (((uintptr_t)(va) >= 0xFFFFFFFF80000000ULL) ? \
     (uint32_t)((uintptr_t)(va) - 0xFFFFFFFF80000000ULL) : \
+    ((uintptr_t)(va) >= 0xFFFF800000000000ULL) ? \
+    (uint32_t)((uintptr_t)(va) - 0xFFFF800000000000ULL) : \
     (uint32_t)(uintptr_t)(va))
 
 static void print_num(int val, uint32_t color) {
@@ -32,17 +50,6 @@ static void print_hex(uint32_t val, uint32_t color) {
     kdebug(hex_str, color);
 }
 
-static void print_hex16(uint16_t val, uint32_t color) {
-    char hex_str[7] = {'0', 'x'};
-    const char hex_chars[] = "0123456789ABCDEF";
-    for (int i = 3; i >= 0; i--) {
-        hex_str[2 + i] = hex_chars[val & 0xF];
-        val >>= 4;
-    }
-    hex_str[6] = '\0';
-    kdebug(hex_str, color);
-}
-
 static void usb_flush_range(volatile void* addr, uint32_t size) {
     if (!addr || size == 0) return;
     __asm__ __volatile__("mfence" ::: "memory");
@@ -50,7 +57,8 @@ static void usb_flush_range(volatile void* addr, uint32_t size) {
 
 // Экспортируем op_regs для работы ehci-msc.c
 ehci_op_regs_t* op_regs = 0;
-static int active_port = -1;
+static int s_up = 0;
+static int s_num_ports = 0;
 static pci_device_t g_ehci_dev;
 static uint8_t g_eecp = 0;
 
@@ -62,46 +70,58 @@ static volatile uint8_t shared_setup_pkt[8] __attribute__((aligned(64)));
 static volatile uint8_t dma_buffer[4096] __attribute__((aligned(4096)));
 static volatile uint32_t periodic_list[1024] __attribute__((aligned(4096)));
 
-// Стандартные и хабовые константы USB
-#define USB_REQ_GET_STATUS     0x00
-#define USB_REQ_CLEAR_FEATURE  0x01
-#define USB_REQ_SET_FEATURE    0x03
-#define USB_REQ_SET_ADDRESS    0x05
-#define USB_REQ_GET_DESCRIPTOR 0x06
-#define USB_REQ_SET_CONFIG     0x09
-
 #define HUB_FEAT_PORT_RESET    4
 #define HUB_FEAT_PORT_POWER    8
+#define HUB_FEAT_C_PORT_CONN   16
 #define HUB_FEAT_C_PORT_RESET  20
 
 #define HUB_PORT_STAT_CONN     (1 << 0)
 #define HUB_PORT_STAT_ENABLE   (1 << 1)
 #define HUB_PORT_STAT_RESET    (1 << 4)
 #define HUB_PORT_STAT_HIGH_SPD (1 << 10)
+#define HUB_PORT_CHG_CONN      (1 << 0)
 
-static int pci_find_ehci(pci_device_t* out_dev) {
-    for (uint16_t bus = 0; bus < 256; bus++) {
-        for (uint8_t slot = 0; slot < 32; slot++) {
-            for (uint8_t func = 0; func < 8; func++) {
-                uint32_t vendor_device = pci_config_read(bus, slot, func, 0x00);
-                if ((vendor_device & 0xFFFF) == 0xFFFF) continue;
+// ------------------------------------------------------- таблица устройств
+// Каждое устройство на шине: где оно сидит (корневой порт, хаб и его порт) и
+// кто оно (хаб, накопитель, что-то ещё). По этой таблице опрос понимает, что
+// пропало вместе с выдернутым хабом и на какой порт пришло новое.
+#define EDEV_MAX 16
+typedef struct {
+    int     used;
+    uint8_t addr;           // адрес на шине (1..127)
+    uint8_t mps0;           // размер пакета нулевой точки
+    int     root_port;      // корневой порт контроллера (с нуля)
+    uint8_t hub_addr;       // 0 -- сидит прямо на корневом порту
+    uint8_t hub_port;       // порт хаба (с единицы)
+    uint8_t is_hub;
+    uint8_t hub_nports;
+    int     msc;            // индекс в ehci-msc.c, -1 -- не накопитель
+} ehci_dev_t;
 
-                uint32_t class_rev = pci_config_read(bus, slot, func, 0x08);
-                uint8_t base_class = (class_rev >> 24) & 0xFF;
-                uint8_t subclass   = (class_rev >> 16) & 0xFF;
-                uint8_t prog_if    = (class_rev >> 8) & 0xFF;
+static ehci_dev_t s_dev[EDEV_MAX];
+static uint8_t    s_addr_used[128];
 
-                if (base_class == 0x0C && subclass == 0x03 && prog_if == 0x20) {
-                    out_dev->bus = bus;
-                    out_dev->slot = slot;
-                    out_dev->func = func;
-                    out_dev->bar0 = pci_config_read(bus, slot, func, 0x10) & ~0xF;
-                    return 1;
-                }
-            }
-        }
+static int alloc_addr(void) {
+    for (int a = 1; a < 128; a++) if (!s_addr_used[a]) { s_addr_used[a] = 1; return a; }
+    return -1;
+}
+
+static ehci_dev_t* dev_new(void) {
+    for (int i = 0; i < EDEV_MAX; i++) {
+        if (s_dev[i].used) continue;
+        ehci_dev_t* d = &s_dev[i];
+        for (int k = 0; k < (int)sizeof(*d); k++) ((uint8_t*)d)[k] = 0;
+        d->used = 1;
+        d->msc = -1;
+        return d;
     }
     return 0;
+}
+
+static int pci_find_ehci(pci_device_t* out_dev) {
+    if (!pci_find_usb_by_progif(0x20, out_dev)) return 0;
+    out_dev->bar0 = pci_config_read(out_dev->bus, out_dev->slot, out_dev->func, 0x10) & ~0xF;
+    return 1;
 }
 
 static uint8_t ehci_bios_handoff(pci_device_t* dev, volatile uint8_t* cap_regs) {
@@ -290,358 +310,199 @@ static int ehci_control_transfer(void* setup_pkt, void* buffer, int len, int is_
     return 0;
 }
 
-// Запрос и парсинг UTF-16LE строкового дескриптора USB в читаемую ASCII-строку
-static int ehci_get_string(uint8_t dev_addr, uint8_t str_idx, char* out_str, int max_len) {
-    if (str_idx == 0 || !out_str || max_len <= 0) return 0;
-    out_str[0] = '\0';
 
-    // LangID = 0x0409 (US English)
-    uint8_t setup[8] = { 0x80, USB_REQ_GET_DESCRIPTOR, str_idx, 0x03, 0x09, 0x04, 255, 0x00 };
-    if (!ehci_control_transfer(setup, (void*)dma_buffer, 255, 1, dev_addr, 64)) {
-        return 0;
-    }
+// ------------------------------------------------------- перечисление
+static void dev_remove(ehci_dev_t* d);
+static int  enumerate_at_addr0(int root_port, uint8_t hub_addr, uint8_t hub_port, int depth);
 
-    uint8_t len = dma_buffer[0];
-    if (len < 2 || dma_buffer[1] != 0x03) return 0;
+// Хаб: конфигурация, питание портов и все, кто уже воткнут
+static void hub_attach_port(ehci_dev_t* hub, uint8_t p, int depth);
 
-    int out_pos = 0;
-    for (int i = 2; i < len && out_pos < max_len - 1; i += 2) {
-        char c = (char)dma_buffer[i];
-        out_str[out_pos++] = (c >= 32 && c <= 126) ? c : '?';
-    }
-    out_str[out_pos] = '\0';
-    return 1;
-}
+static int hub_setup(ehci_dev_t* hub, int depth) {
+    uint8_t a = hub->addr, m = hub->mps0;
+    kdebug("[EHCI] hub at address ", 0x55FFFF); print_num(a, 0x55FFFF); kdebug("\n", 0);
 
-// Вычитка дескрипторов, текстовых имен и инициализация флешки
-static void ehci_dump_flash_drive(uint8_t dev_addr, uint8_t max_packet0) {
-    uint8_t setup_get_dev[8] = { 0x80, USB_REQ_GET_DESCRIPTOR, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00 };
-    if (!ehci_control_transfer(setup_get_dev, (void*)dma_buffer, 18, 1, dev_addr, max_packet0)) {
-        kdebug("  [!] Failed to get Flash Drive Device Descriptor.\n", 0xFF5555);
-        return;
-    }
-
-    uint16_t bcdUSB     = dma_buffer[2] | (dma_buffer[3] << 8);
-    uint8_t  devClass   = dma_buffer[4];
-    uint16_t idVendor   = dma_buffer[8]  | (dma_buffer[9] << 8);
-    uint16_t idProduct  = dma_buffer[10] | (dma_buffer[11] << 8);
-    uint16_t bcdDevice  = dma_buffer[12] | (dma_buffer[13] << 8);
-    uint8_t  iMfg       = dma_buffer[14];
-    uint8_t  iProd      = dma_buffer[15];
-    uint8_t  iSerial    = dma_buffer[16];
-    uint8_t  numConfigs = dma_buffer[17];
-
-    kdebug("\n========================================\n", 0x55FFFF);
-    kdebug(">>>  TARGET USB DEVICE IDENTIFIED!   <<<\n", 0x55FF55);
-    kdebug("========================================\n", 0x55FFFF);
-    kdebug("  Vendor ID    = ", 0xAAAAAA); print_hex16(idVendor, 0xFFFF55); kdebug("\n", 0);
-    kdebug("  Product ID   = ", 0xAAAAAA); print_hex16(idProduct, 0xFFFF55); kdebug("\n", 0);
-
-    // Вычитываем реальные текстовые строки из устройства
-    char str_buf[64];
-    if (ehci_get_string(dev_addr, iMfg, str_buf, sizeof(str_buf))) {
-        kdebug("  Manufacturer = \"", 0x55FF55); kdebug(str_buf, 0xFFFF55); kdebug("\"\n", 0x55FF55);
-    }
-    if (ehci_get_string(dev_addr, iProd, str_buf, sizeof(str_buf))) {
-        kdebug("  Product Name = \"", 0x55FF55); kdebug(str_buf, 0xFFFF55); kdebug("\"\n", 0x55FF55);
-    }
-    if (ehci_get_string(dev_addr, iSerial, str_buf, sizeof(str_buf))) {
-        kdebug("  Serial Num   = \"", 0x55FF55); kdebug(str_buf, 0xFFFF55); kdebug("\"\n", 0x55FF55);
-    }
-
-    kdebug("  USB Spec     = ", 0xAAAAAA);
-    print_num((bcdUSB >> 8) & 0xFF, 0xFFFF55); kdebug(".", 0xFFFFFF); print_num(bcdUSB & 0xFF, 0xFFFF55);
-    if (bcdUSB >= 0x0300)      kdebug(" (USB 3.x Flash Drive via USB2 link)\n", 0x55FF55);
-    else if (bcdUSB >= 0x0200) kdebug(" (USB 2.0 High-Speed Flash Drive)\n", 0x55FF55);
-    else                       kdebug(" (USB 1.x Legacy)\n", 0xFFAA00);
-
-    kdebug("  Link Speed   = High-Speed (480 Mbit/s)\n", 0x55FF55);
-    kdebug("  Device Class = ", 0xAAAAAA); print_hex(devClass, 0xFFFF55); kdebug("\n", 0);
-    kdebug("  bcdDevice    = ", 0xAAAAAA); print_hex16(bcdDevice, 0xFFFF55); kdebug("\n", 0);
-    kdebug("  #Configs     = ", 0xAAAAAA); print_num(numConfigs, 0xFFFF55); kdebug("\n", 0);
-
-    // Читаем Configuration Descriptor Header (9 байт)
-    uint8_t setup_get_cfg9[8] = { 0x80, USB_REQ_GET_DESCRIPTOR, 0x00, 0x02, 0x00, 0x00, 0x09, 0x00 };
-    if (!ehci_control_transfer(setup_get_cfg9, (void*)dma_buffer, 9, 1, dev_addr, max_packet0)) {
-        kdebug("  [!] Failed to read Config Descriptor header.\n", 0xFF5555);
-        kdebug("========================================\n", 0x55FFFF);
-        return;
-    }
-
-    uint16_t total_len = dma_buffer[2] | (dma_buffer[3] << 8);
-    if (total_len > sizeof(dma_buffer)) total_len = sizeof(dma_buffer);
-
-    uint8_t setup_get_cfg_full[8] = { 0x80, USB_REQ_GET_DESCRIPTOR, 0x00, 0x02, 0x00, 0x00,
-                                       (uint8_t)(total_len & 0xFF), (uint8_t)(total_len >> 8) };
-    if (!ehci_control_transfer(setup_get_cfg_full, (void*)dma_buffer, total_len, 1, dev_addr, max_packet0)) {
-        kdebug("  [!] Failed to read full Config Descriptor.\n", 0xFF5555);
-        kdebug("========================================\n", 0x55FFFF);
-        return;
-    }
-
-    // Проверяем интерфейс устройства
-    uint8_t is_mass_storage = 0;
-    uint32_t off = 0;
-    while (off + 2 <= total_len) {
-        uint8_t dlen  = dma_buffer[off];
-        uint8_t dtype = dma_buffer[off + 1];
-        if (dlen == 0) break;
-        if (dtype == 4 && off + 9 <= total_len) {
-            uint8_t ifClass = dma_buffer[off + 5];
-            uint8_t ifSub   = dma_buffer[off + 6];
-            uint8_t ifProto = dma_buffer[off + 7];
-
-            kdebug("  Interface    = Class ", 0xAAAAAA); print_hex(ifClass, 0xFFFF55);
-            kdebug(" SubClass ", 0xAAAAAA); print_hex(ifSub, 0xFFFF55);
-            kdebug(" Proto ", 0xAAAAAA); print_hex(ifProto, 0xFFFF55);
-            kdebug(" (", 0xAAAAAA);
-            if (ifClass == 0x08) {
-                kdebug("Mass Storage - Flash Drive Verified!", 0x55FF55);
-                is_mass_storage = 1;
-            } else if (ifClass == 0x03) {
-                kdebug("HID (Keyboard/Mouse)", 0x55FF55);
-            } else if (ifClass == 0x0E) {
-                kdebug("UVC Camera", 0x55FF55);
-            } else {
-                kdebug("Other", 0xFFAA00);
-            }
-            kdebug(")\n", 0xAAAAAA);
-            break;
-        }
-        off += dlen;
-    }
-    kdebug("========================================\n", 0x55FFFF);
-
-    // Если это флешка — конфигурируем и отдаем управление EHCI MSC-драйверу
-    if (is_mass_storage) {
-        uint8_t set_cfg[8] = { 0x00, USB_REQ_SET_CONFIG, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00 };
-        if (!ehci_control_transfer(set_cfg, 0, 0, 0, dev_addr, max_packet0)) {
-            kdebug("  [!] Failed to set device configuration!\n", 0xFF5555);
-            return;
-        }
-        sleep_ms(20);
-
-        if (ehci_msc_init_device(dev_addr, (const uint8_t*)dma_buffer, total_len)) {
-            static uint8_t sector_buf[512] __attribute__((aligned(64)));
-            kdebug("\n[MSC] Reading Sector 0 (MBR/Boot Sector)...\n", 0x55FFFF);
-
-            if (ehci_msc_read_sectors(0, 1, sector_buf)) {
-                uint16_t boot_sig = sector_buf[510] | (sector_buf[511] << 8);
-                kdebug("  [+] Read Sector 0 SUCCESS!\n", 0x55FF55);
-                kdebug("      Boot Signature: ", 0x55FF55); print_hex16(boot_sig, 0xFFFF55);
-
-                if (boot_sig == 0xAA55) {
-                    kdebug(" (VALID 0x55AA - Ready to mount FAT!)\n", 0x55FF55);
-                    if (fs_mount(0)) {
-                        vfs_init();
-                    }
-                } else {
-                    kdebug(" (No 0x55AA signature)\n", 0xFFAA00);
-                }
-            } else {
-                kdebug("  [!] Failed to read Sector 0!\n", 0xFF5555);
-            }
-        }
-    }
-}
-
-// Опрос хаба и поиск подключенных к нему устройств
-static void ehci_poll_hub(uint8_t hub_addr, uint8_t max_packet0) {
-    kdebug("\n[HUB] Configuring Intel RMH (Addr ", 0x55FFFF);
-    print_num(hub_addr, 0x55FFFF);
-    kdebug(")...\n", 0x55FFFF);
-
-    // 1. SET_CONFIGURATION(1)
     uint8_t set_cfg[8] = { 0x00, USB_REQ_SET_CONFIG, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00 };
-    if (!ehci_control_transfer(set_cfg, 0, 0, 0, hub_addr, max_packet0)) {
+    if (!ehci_control_transfer(set_cfg, 0, 0, 0, a, m)) {
         kdebug("  [!] Failed to set Hub configuration.\n", 0xFF5555);
-        return;
+        return -1;
     }
     sleep_ms(20);
 
-    // 2. GET_HUB_DESCRIPTOR (Descriptor type 0x29)
-    uint8_t get_hub_desc[8] = { 0xA0, USB_REQ_GET_DESCRIPTOR, 0x00, 0x29, 0x00, 0x00, 0x08, 0x00 };
-    if (!ehci_control_transfer(get_hub_desc, (void*)dma_buffer, 8, 1, hub_addr, max_packet0)) {
+    uint8_t get_hub_desc[8] = { 0xA0, USB_REQ_GET_DESCRIPTOR, 0x00, USB_DESC_HUB, 0x00, 0x00, 0x08, 0x00 };
+    if (!ehci_control_transfer(get_hub_desc, (void*)dma_buffer, 8, 1, a, m)) {
         kdebug("  [!] Failed to get Hub Descriptor.\n", 0xFF5555);
-        return;
+        return -1;
     }
-
-    uint8_t num_ports = dma_buffer[2];
+    hub->hub_nports = dma_buffer[2];
     uint32_t pwr_good_delay = (uint32_t)dma_buffer[5] * 2;
     if (pwr_good_delay < 100) pwr_good_delay = 100;
 
-    kdebug("  [+] Hub has ", 0x55FF55); print_num(num_ports, 0xFFFF55);
-    kdebug(" downstream ports. Power-good delay: ", 0xAAAAAA); print_num(pwr_good_delay, 0xFFFF55);
-    kdebug(" ms\n", 0);
-
-    // 3. Подаем питание на все порты
-    kdebug("  [+] Powering on Hub downstream ports...\n", 0xAAAAAA);
-    for (uint8_t p = 1; p <= num_ports; p++) {
+    for (uint8_t p = 1; p <= hub->hub_nports; p++) {
         uint8_t pwr_pkt[8] = { 0x23, USB_REQ_SET_FEATURE, HUB_FEAT_PORT_POWER, 0x00, p, 0x00, 0x00, 0x00 };
-        ehci_control_transfer(pwr_pkt, 0, 0, 0, hub_addr, max_packet0);
+        ehci_control_transfer(pwr_pkt, 0, 0, 0, a, m);
     }
     sleep_ms(pwr_good_delay);
 
-    // 4. Сканируем downstream-порты хаба
-    int found_flash = 0;
-    for (uint8_t p = 1; p <= num_ports; p++) {
-        uint8_t get_stat[8] = { 0xA3, USB_REQ_GET_STATUS, 0x00, 0x00, p, 0x00, 0x04, 0x00 };
-        if (!ehci_control_transfer(get_stat, (void*)dma_buffer, 4, 1, hub_addr, max_packet0)) {
-            continue;
-        }
-
-        uint16_t port_status = dma_buffer[0] | (dma_buffer[1] << 8);
-
-        if (port_status & HUB_PORT_STAT_CONN) {
-            kdebug("  [+] Device detected on Hub Port ", 0x55FF55);
-            print_num(p, 0xFFFF55);
-            kdebug("! Resetting port...\n", 0);
-
-            // Сброс порта (PORT_RESET)
-            uint8_t reset_pkt[8] = { 0x23, USB_REQ_SET_FEATURE, HUB_FEAT_PORT_RESET, 0x00, p, 0x00, 0x00, 0x00 };
-            ehci_control_transfer(reset_pkt, 0, 0, 0, hub_addr, max_packet0);
-            sleep_ms(60);
-
-            // Очистка флага C_PORT_RESET
-            uint8_t clr_reset[8] = { 0x23, USB_REQ_CLEAR_FEATURE, HUB_FEAT_C_PORT_RESET, 0x00, p, 0x00, 0x00, 0x00 };
-            ehci_control_transfer(clr_reset, 0, 0, 0, hub_addr, max_packet0);
-            sleep_ms(20);
-
-            // Читаем статус после сброса
-            ehci_control_transfer(get_stat, (void*)dma_buffer, 4, 1, hub_addr, max_packet0);
-            port_status = dma_buffer[0] | (dma_buffer[1] << 8);
-
-            if (!(port_status & HUB_PORT_STAT_ENABLE)) {
-                kdebug("  [-] Port not enabled after reset.\n", 0xFFAA00);
-                continue;
-            }
-
-            if (!(port_status & HUB_PORT_STAT_HIGH_SPD)) {
-                kdebug("  [!] Low/Full-Speed device on port. Skipped (requires EHCI Split-Transactions).\n", 0xFFAA00);
-                continue;
-            }
-
-            // USB recovery time
-            sleep_ms(100);
-
-            // 5. Устройство проснулось на адресе 0. Читаем первые 8 байт для max_packet0
-            uint8_t dev_max_pkt0 = 64;
-            uint8_t setup_get_desc8[8] = { 0x80, USB_REQ_GET_DESCRIPTOR, 0x00, 0x01, 0x00, 0x00, 0x08, 0x00 };
-            if (ehci_control_transfer(setup_get_desc8, (void*)dma_buffer, 8, 1, 0, 64)) {
-                if (dma_buffer[7] == 8 || dma_buffer[7] == 16 || dma_buffer[7] == 32 || dma_buffer[7] == 64) {
-                    dev_max_pkt0 = dma_buffer[7];
-                }
-            }
-
-            // 6. Назначаем устройству постоянный адрес 2
-            uint8_t setup_set_addr2[8] = { 0x00, USB_REQ_SET_ADDRESS, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00 };
-            if (!ehci_control_transfer(setup_set_addr2, 0, 0, 0, 0, dev_max_pkt0)) {
-                kdebug("  [!] Failed to set Address 2 on downstream device.\n", 0xFF5555);
-                continue;
-            }
-            sleep_ms(15);
-
-            // 7. Считываем полную информацию о флешке
-            ehci_dump_flash_drive(2, dev_max_pkt0);
-            found_flash = 1;
-            break;
-        }
-    }
-
-    if (!found_flash) {
-        kdebug("  [-] No High-Speed flash drive found on any downstream port of this hub.\n", 0xFFFF55);
-    }
+    for (uint8_t p = 1; p <= hub->hub_nports; p++) hub_attach_port(hub, p, depth);
+    return 0;
 }
 
-// Энумерация корневого устройства (на порту EHCI сидит Hub)
-static void ehci_enumerate_device(uint8_t max_packet0) {
-    uint8_t setup_set_addr[8] = { 0x00, USB_REQ_SET_ADDRESS, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00 };
-    if (!ehci_control_transfer(setup_set_addr, 0, 0, 0, 0, max_packet0)) {
+// Порт хаба: прочитать состояние, снять отметку о смене подключения и, если
+// там кто-то есть, сбросить порт и перечислить устройство. Отметку снимаем
+// всегда: по ней потом опрос узнаёт о выдёргивании и новой вставке.
+static void hub_attach_port(ehci_dev_t* hub, uint8_t p, int depth) {
+    uint8_t a = hub->addr, m = hub->mps0;
+    uint8_t get_stat[8] = { 0xA3, USB_REQ_GET_STATUS, 0x00, 0x00, p, 0x00, 0x04, 0x00 };
+    if (!ehci_control_transfer(get_stat, (void*)dma_buffer, 4, 1, a, m)) return;
+    uint16_t st = dma_buffer[0] | (dma_buffer[1] << 8);
+
+    uint8_t clr_conn[8] = { 0x23, USB_REQ_CLEAR_FEATURE, HUB_FEAT_C_PORT_CONN, 0x00, p, 0x00, 0x00, 0x00 };
+    ehci_control_transfer(clr_conn, 0, 0, 0, a, m);
+    if (!(st & HUB_PORT_STAT_CONN)) return;
+
+    kdebug("  [+] Device on hub port ", 0x55FF55); print_num(p, 0xFFFF55); kdebug("\n", 0);
+
+    uint8_t reset_pkt[8] = { 0x23, USB_REQ_SET_FEATURE, HUB_FEAT_PORT_RESET, 0x00, p, 0x00, 0x00, 0x00 };
+    ehci_control_transfer(reset_pkt, 0, 0, 0, a, m);
+    sleep_ms(60);
+    uint8_t clr_reset[8] = { 0x23, USB_REQ_CLEAR_FEATURE, HUB_FEAT_C_PORT_RESET, 0x00, p, 0x00, 0x00, 0x00 };
+    ehci_control_transfer(clr_reset, 0, 0, 0, a, m);
+    sleep_ms(20);
+
+    if (!ehci_control_transfer(get_stat, (void*)dma_buffer, 4, 1, a, m)) return;
+    st = dma_buffer[0] | (dma_buffer[1] << 8);
+    if (!(st & HUB_PORT_STAT_ENABLE)) {
+        kdebug("  [-] Port not enabled after reset.\n", 0xFFAA00);
+        return;
+    }
+    if (!(st & HUB_PORT_STAT_HIGH_SPD)) {
+        kdebug("  [!] Low/Full-Speed device on hub port. Skipped (requires split transactions).\n", 0xFFAA00);
+        return;
+    }
+    sleep_ms(100);                                   // USB recovery time
+    enumerate_at_addr0(hub->root_port, a, p, depth + 1);
+}
+
+// Устройство только что сброшено и отвечает по адресу 0: узнать размер
+// пакета, дать адрес, прочитать дескрипторы и решить, кто это.
+static int enumerate_at_addr0(int root_port, uint8_t hub_addr, uint8_t hub_port, int depth) {
+    if (depth > 3) return -1;                        // хаб за хабом за хабом -- хватит
+
+    uint8_t mps0 = 64;
+    uint8_t get8[8] = { 0x80, USB_REQ_GET_DESCRIPTOR, 0x00, USB_DESC_DEVICE, 0x00, 0x00, 0x08, 0x00 };
+    if (!ehci_control_transfer(get8, (void*)dma_buffer, 8, 1, 0, 64)) {
+        kdebug("  [!] No device descriptor at address 0.\n", 0xFF5555);
+        return -1;
+    }
+    if (dma_buffer[7] == 8 || dma_buffer[7] == 16 || dma_buffer[7] == 32 || dma_buffer[7] == 64) mps0 = dma_buffer[7];
+
+    int addr = alloc_addr();
+    if (addr < 0) return -1;
+    uint8_t set_addr[8] = { 0x00, USB_REQ_SET_ADDRESS, (uint8_t)addr, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    if (!ehci_control_transfer(set_addr, 0, 0, 0, 0, mps0)) {
         kdebug("  [!] SET_ADDRESS failed.\n", 0xFF5555);
-        return;
+        s_addr_used[addr] = 0;
+        return -1;
     }
-    sleep_ms(10);
+    sleep_ms(15);
 
-    uint8_t setup_get_dev[8] = { 0x80, USB_REQ_GET_DESCRIPTOR, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00 };
-    if (!ehci_control_transfer(setup_get_dev, (void*)dma_buffer, 18, 1, 1, max_packet0)) {
-        kdebug("  [!] Failed to get full Device Descriptor.\n", 0xFF5555);
-        return;
+    uint8_t get_dev[8] = { 0x80, USB_REQ_GET_DESCRIPTOR, 0x00, USB_DESC_DEVICE, 0x00, 0x00, 0x12, 0x00 };
+    if (!ehci_control_transfer(get_dev, (void*)dma_buffer, 18, 1, (uint8_t)addr, mps0)) {
+        s_addr_used[addr] = 0;
+        return -1;
     }
+    uint8_t  dev_class = dma_buffer[4];
+    uint16_t vid = dma_buffer[8]  | (dma_buffer[9] << 8);
+    uint16_t pid = dma_buffer[10] | (dma_buffer[11] << 8);
 
-    uint16_t bcdUSB     = dma_buffer[2] | (dma_buffer[3] << 8);
-    uint8_t  devClass   = dma_buffer[4];
-    uint16_t idVendor   = dma_buffer[8]  | (dma_buffer[9] << 8);
-    uint16_t idProduct  = dma_buffer[10] | (dma_buffer[11] << 8);
-    uint16_t bcdDevice  = dma_buffer[12] | (dma_buffer[13] << 8);
-    uint8_t  numConfigs = dma_buffer[17];
-
-    kdebug("\n=== Root USB Device Info ===\n", 0x55FFFF);
-    kdebug("  Vendor ID    = ", 0xAAAAAA); print_hex16(idVendor, 0xFFFF55); kdebug("\n", 0);
-    kdebug("  Product ID   = ", 0xAAAAAA); print_hex16(idProduct, 0xFFFF55); kdebug("\n", 0);
-    kdebug("  USB Spec     = ", 0xAAAAAA);
-    print_num((bcdUSB >> 8) & 0xFF, 0xFFFF55); kdebug(".", 0xFFFFFF); print_num(bcdUSB & 0xFF, 0xFFFF55);
-    kdebug(" (USB 2.0)\n", 0x55FF55);
-    kdebug("  Link Speed   = High-Speed (480 Mbit/s)\n", 0x55FF55);
-    kdebug("  Device Class = ", 0xAAAAAA); print_hex(devClass, 0xFFFF55); kdebug("\n", 0);
-    kdebug("  bcdDevice    = ", 0xAAAAAA); print_hex16(bcdDevice, 0xFFFF55); kdebug("\n", 0);
-    kdebug("  #Configs     = ", 0xAAAAAA); print_num(numConfigs, 0xFFFF55); kdebug("\n", 0);
-
-    uint8_t setup_get_cfg9[8] = { 0x80, USB_REQ_GET_DESCRIPTOR, 0x00, 0x02, 0x00, 0x00, 0x09, 0x00 };
-    if (!ehci_control_transfer(setup_get_cfg9, (void*)dma_buffer, 9, 1, 1, max_packet0)) {
-        kdebug("  [!] Failed to get Configuration Descriptor header.\n", 0xFF5555);
-        return;
+    uint8_t get_cfg9[8] = { 0x80, USB_REQ_GET_DESCRIPTOR, 0x00, USB_DESC_CONFIG, 0x00, 0x00, 0x09, 0x00 };
+    if (!ehci_control_transfer(get_cfg9, (void*)dma_buffer, 9, 1, (uint8_t)addr, mps0)) {
+        s_addr_used[addr] = 0;
+        return -1;
     }
-    uint16_t total_len = dma_buffer[2] | (dma_buffer[3] << 8);
-    if (total_len > sizeof(dma_buffer)) total_len = sizeof(dma_buffer);
-
-    uint8_t setup_get_cfg_full[8] = { 0x80, USB_REQ_GET_DESCRIPTOR, 0x00, 0x02, 0x00, 0x00,
-                                       (uint8_t)(total_len & 0xFF), (uint8_t)(total_len >> 8) };
-    if (!ehci_control_transfer(setup_get_cfg_full, (void*)dma_buffer, total_len, 1, 1, max_packet0)) {
-        kdebug("  [!] Failed to get full Configuration Descriptor.\n", 0xFF5555);
-        return;
+    uint16_t total = dma_buffer[2] | (dma_buffer[3] << 8);
+    if (total > sizeof(dma_buffer)) total = sizeof(dma_buffer);
+    uint8_t get_cfg[8] = { 0x80, USB_REQ_GET_DESCRIPTOR, 0x00, USB_DESC_CONFIG, 0x00, 0x00,
+                           (uint8_t)(total & 0xFF), (uint8_t)(total >> 8) };
+    if (!ehci_control_transfer(get_cfg, (void*)dma_buffer, total, 1, (uint8_t)addr, mps0)) {
+        s_addr_used[addr] = 0;
+        return -1;
     }
 
-    uint8_t ifClass = 0;
-    uint32_t off = 0;
-    while (off + 2 <= total_len) {
-        uint8_t dlen  = dma_buffer[off];
-        uint8_t dtype = dma_buffer[off + 1];
+    uint8_t cfg_value = dma_buffer[5];
+    uint8_t if_class = 0;
+    for (uint32_t off = 0; off + 2 <= total; ) {
+        uint8_t dlen = dma_buffer[off], dtype = dma_buffer[off + 1];
         if (dlen == 0) break;
-        if (dtype == 4 && off + 9 <= total_len) {
-            ifClass = dma_buffer[off + 5];
-            uint8_t ifSub   = dma_buffer[off + 6];
-            uint8_t ifProto = dma_buffer[off + 7];
-            kdebug("  Interface    = Class ", 0xAAAAAA); print_hex(ifClass, 0xFFFF55);
-            kdebug(" SubClass ", 0xAAAAAA); print_hex(ifSub, 0xFFFF55);
-            kdebug(" Proto ", 0xAAAAAA); print_hex(ifProto, 0xFFFF55);
-            kdebug(" (", 0xAAAAAA);
-            if (ifClass == 0x09) kdebug("Hub", 0x55FF55);
-            else if (ifClass == 0x08) kdebug("Mass Storage", 0x55FF55);
-            else kdebug("Other", 0xFFAA00);
-            kdebug(")\n", 0xAAAAAA);
-            break;
-        }
+        if (dtype == USB_DESC_INTERFACE && off + 9 <= total) { if_class = dma_buffer[off + 5]; break; }
         off += dlen;
     }
-    kdebug("============================\n", 0x55FFFF);
 
-    if (devClass == 0x09 || ifClass == 0x09) {
-        ehci_poll_hub(1, max_packet0);
-    } else if (ifClass == 0x08) {
-        // Прямое подключение флешки к корневому порту (как в QEMU)
-        ehci_dump_flash_drive(1, max_packet0);
+    ehci_dev_t* d = dev_new();
+    if (!d) { s_addr_used[addr] = 0; return -1; }
+    d->addr = (uint8_t)addr;
+    d->mps0 = mps0;
+    d->root_port = root_port;
+    d->hub_addr = hub_addr;
+    d->hub_port = hub_port;
+
+    kdebug("[EHCI] device ", 0x55FFFF); print_hex((uint32_t)vid << 16 | pid, 0xFFFF55);
+    kdebug(" at address ", 0xAAAAAA); print_num(addr, 0xFFFFFF);
+    kdebug(", class ", 0xAAAAAA); print_num(if_class ? if_class : dev_class, 0xFFFFFF); kdebug("\n", 0);
+
+    if (dev_class == USB_CLASS_HUB || if_class == USB_CLASS_HUB) {
+        d->is_hub = 1;
+        hub_setup(d, depth);
+    } else if (if_class == USB_CLASS_STORAGE) {
+        uint8_t set_cfg[8] = { 0x00, USB_REQ_SET_CONFIG, cfg_value ? cfg_value : 1, 0x00, 0x00, 0x00, 0x00, 0x00 };
+        if (!ehci_control_transfer(set_cfg, 0, 0, 0, (uint8_t)addr, mps0)) {
+            kdebug("  [!] Failed to set device configuration!\n", 0xFF5555);
+            return 0;
+        }
+        sleep_ms(20);
+        d->msc = ehci_msc_attach((uint8_t)addr, root_port, (const uint8_t*)dma_buffer, total, vid, pid);
     }
+    return 0;
 }
 
-void ehci_init(void) {
-    kdebug("\n[EHCI] Initializing Host Controller...\n", 0x55FFFF);
+// Устройство ушло: его диск (если это накопитель) пропадает в реестре, а если
+// это хаб -- вместе с ним всё, что было за ним.
+static void dev_remove(ehci_dev_t* d) {
+    if (!d->used) return;
+    if (d->is_hub) {
+        for (int i = 0; i < EDEV_MAX; i++)
+            if (s_dev[i].used && s_dev[i].hub_addr == d->addr && &s_dev[i] != d) dev_remove(&s_dev[i]);
+    }
+    if (d->msc >= 0) ehci_msc_detach(d->msc);
+    s_addr_used[d->addr] = 0;
+    d->used = 0;
+}
 
+// Подключено ли что-то к корневому порту. На ноутбуках Intel за ним всегда
+// встроенный хаб, и порт "подключён" всегда -- такой ответ ничего не доказывает,
+// выдёргивание за хабом видно по его порту (ehci_poll) и по отказу передачи.
+int ehci_port_connected(int root_port) {
+    if (!op_regs || root_port < 0 || root_port >= s_num_ports) return 0;
+    return (op_regs->portsc[root_port] & 1) ? 1 : 0;
+}
+
+int ehci_storage_found(void) { return ehci_msc_alive_count() > 0; }
+
+static void root_port_attach(int i) {
+    if (ehci_reset_port(i)) enumerate_at_addr0(i, 0, 0, 0);
+}
+
+int ehci_init(void) {
+    kdebug("\n[EHCI] Initializing Host Controller...\n", 0x55FFFF);
+    s_up = 0;
     pci_device_t ehci_dev;
     if (!pci_find_ehci(&ehci_dev)) {
         kdebug("  [!] EHCI Controller not found!\n", 0xFF5555);
-        return;
+        return -1;
     }
     g_ehci_dev = ehci_dev;
+    s_num_ports = 0;
 
     uint32_t ehci_id = pci_config_read(ehci_dev.bus, ehci_dev.slot, ehci_dev.func, 0x00);
     kdebug("  [i] EHCI VID:DID = ", 0xAAAAAA);
@@ -660,14 +521,15 @@ void ehci_init(void) {
         kdebug(" [!] Bus Master: OFF! Controller cannot DMA into RAM!\n", 0xFF5555);
     }
 
-    volatile uint8_t* cap_regs = (volatile uint8_t*)ehci_dev.bar0;
+    volatile uint8_t* cap_regs = (volatile uint8_t*)(uintptr_t)ehci_dev.bar0;
     uint8_t cap_length = cap_regs[0];
     uint32_t hcsparams = *(volatile uint32_t*)(cap_regs + 4);
     uint8_t num_ports = hcsparams & 0x0F;
+    s_num_ports = num_ports;
 
     g_eecp = ehci_bios_handoff(&ehci_dev, cap_regs);
 
-    op_regs = (ehci_op_regs_t*)(ehci_dev.bar0 + cap_length);
+    op_regs = (ehci_op_regs_t*)(uintptr_t)(ehci_dev.bar0 + cap_length);
 
     // Сброс контроллера
     op_regs->usbcmd &= ~1;
@@ -715,7 +577,7 @@ void ehci_init(void) {
     
     if (op_regs->usbsts & (1 << 12)) {
         kdebug("  [!] Controller FAILED to start (HCHalted bit is stuck)!\n", 0xFF5555);
-        return; // Аварийно выходим из драйвера, чтобы не вешать всю ОС
+        return -1; // Аварийно выходим из драйвера, чтобы не вешать всю ОС
     }
     kdebug("  [+] Controller is RUNNING!\n", 0x55FF55);
 
@@ -725,50 +587,64 @@ void ehci_init(void) {
     }
     sleep_ms(100);
 
+
+    // Отметки о смене подключения снимаем до перечисления: дальше по ним
+    // опрос узнаёт о выдёргивании и новой вставке.
+    for (int i = 0; i < num_ports; i++) op_regs->portsc[i] = (op_regs->portsc[i] & ~0x2A) | 0x02;
+
     kdebug("  [+] Scanning and resetting root ports...\n", 0xAAAAAA);
-    for (int i = 0; i < num_ports; i++) {
-        if (ehci_reset_port(i)) {
-            active_port = i;
-            break;
+    for (int i = 0; i < num_ports; i++) root_port_attach(i);
+    s_up = 1;
+    return 0;
+}
+
+// ------------------------------------------------------- горячее подключение
+// Раз в полсекунды (из usb_poll, под usb_lock). Корневой порт сообщает о смене
+// подключения сам (бит CSC), хаб -- только на запрос GET_STATUS, а это
+// управляющая передача на каждый порт, поэтому хабы спрашиваем через раз.
+void ehci_poll(void) {
+    static int tick = 0;
+    if (!s_up || !op_regs) return;
+    tick++;
+
+    for (int i = 0; i < s_num_ports; i++) {
+        uint32_t sc = op_regs->portsc[i];
+        if (!(sc & 0x02)) continue;                          // смены не было
+        op_regs->portsc[i] = (sc & ~0x2A) | 0x02;            // снять отметку
+        for (int k = 0; k < EDEV_MAX; k++)
+            if (s_dev[k].used && s_dev[k].root_port == i && !s_dev[k].hub_addr) dev_remove(&s_dev[k]);
+        if (sc & 1) { sleep_ms(100); root_port_attach(i); }
+    }
+
+    // Накопитель замолчал (пять секунд без ответа, ошибка транзакции), а порт
+    // его по-прежнему видит. На Intel за встроенным хабом корневой порт не
+    // пустеет никогда, и выдёргивание тоже выглядит так. Снимаем устройство и
+    // поднимаем порт заново: если флешка на месте, она вернётся новым диском,
+    // и монтирование узнает в нём прежнюю.
+    // Раз в две секунды, не чаще: мёртвая флешка отвечает таймаутами.
+    for (int k = 0; (tick & 3) == 0 && k < EDEV_MAX; k++) {
+        ehci_dev_t* d = &s_dev[k];
+        if (!d->used || d->msc < 0 || !ehci_msc_is_gone(d->msc)) continue;
+        int rp = d->root_port;
+        uint8_t ha = d->hub_addr, hp = d->hub_port;
+        dev_remove(d);
+        if (!ha) { if (ehci_port_connected(rp)) root_port_attach(rp); continue; }
+        for (int h = 0; h < EDEV_MAX; h++)
+            if (s_dev[h].used && s_dev[h].is_hub && s_dev[h].addr == ha) { hub_attach_port(&s_dev[h], hp, 1); break; }
+    }
+
+    if (tick & 1) return;
+    for (int k = 0; k < EDEV_MAX; k++) {
+        ehci_dev_t* hub = &s_dev[k];
+        if (!hub->used || !hub->is_hub) continue;
+        for (uint8_t p = 1; p <= hub->hub_nports; p++) {
+            uint8_t get_stat[8] = { 0xA3, USB_REQ_GET_STATUS, 0x00, 0x00, p, 0x00, 0x04, 0x00 };
+            if (!ehci_control_transfer(get_stat, (void*)dma_buffer, 4, 1, hub->addr, hub->mps0)) continue;
+            uint16_t chg = dma_buffer[2] | (dma_buffer[3] << 8);
+            if (!(chg & HUB_PORT_CHG_CONN)) continue;
+            for (int c = 0; c < EDEV_MAX; c++)
+                if (s_dev[c].used && s_dev[c].hub_addr == hub->addr && s_dev[c].hub_port == p) dev_remove(&s_dev[c]);
+            hub_attach_port(hub, p, 1);                      // снимет отметку и поднимет новое
         }
     }
-
-    if (active_port == -1) {
-        kdebug("  [-] No High-Speed USB device detected on root ports.\n", 0xFFFF55);
-        return;
-    }
-
-    kdebug("  -> Requesting Root Device Descriptor (8 bytes)...\n", 0xAAAAAA);
-    uint8_t setup_get_desc[8] = { 0x80, USB_REQ_GET_DESCRIPTOR, 0x00, 0x01, 0x00, 0x00, 0x08, 0x00 };
-
-    if (ehci_control_transfer(setup_get_desc, (void*)dma_buffer, 8, 1, 0, 64)) {
-        kdebug("  [+] SUCCESS! Descriptor Received via EHCI!\n", 0x55FF55);
-        uint8_t max_packet0 = dma_buffer[7];
-        if (max_packet0 != 8 && max_packet0 != 16 && max_packet0 != 32 && max_packet0 != 64) {
-            max_packet0 = 64;
-        }
-        ehci_enumerate_device(max_packet0);
-    } else {
-        kdebug("  [!] Failed to get root descriptor via EHCI.\n", 0xFF5555);
-    }
-}
-
-static void ehci_print_hex32(uint32_t val, uint32_t color) {
-    char buf[16];
-    hex_str(val, buf);
-    kputs(buf, color);
-}
-
-static void ehci_print_num(int val, uint32_t color) {
-    char buf[16];
-    itoa(val, buf);
-    kputs(buf, color);
-}
-
-static void ehci_flush_range(volatile void* addr, uint32_t size) {
-    if (!addr || size == 0) return;
-    uintptr_t p = (uintptr_t)addr & ~63;
-    uintptr_t end = (uintptr_t)addr + size;
-    for (; p < end; p += 64) __asm__ __volatile__("clflush (%0)" :: "r"(p) : "memory");
-    __asm__ __volatile__("mfence" ::: "memory");
 }

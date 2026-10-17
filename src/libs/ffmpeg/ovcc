@@ -1,0 +1,34 @@
+#!/bin/sh
+# ovcc — компилятор «под overOS» для сборки настоящего FFmpeg.
+#
+# FFmpeg собирается обычным gcc, но без заголовков и библиотек хозяйской
+# системы: вместо них наш сисрут (src/libs/ffmpeg/include) и libffsys.a
+# (src/libs/ffmpeg/ffsys.c + libc.c + libm.c). Поэтому ./configure видит ровно те
+# функции, которые у overOS действительно есть, и всё остальное FFmpeg
+# подставляет своими реализациями.
+#
+# OV_ROOT — корень дерева overOS, OV_SYSLIB — путь к libffsys.a.
+: "${OV_ROOT:?не задан OV_ROOT}"
+: "${OV_SYSLIB:?не задан OV_SYSLIB}"
+GCC_INC=$(gcc -print-file-name=include)
+
+CFLAGS="-m64 -std=gnu11 -ffreestanding -fPIE -fvisibility=hidden -fno-plt
+        -fno-builtin -fno-stack-protector -mno-red-zone -U_FORTIFY_SOURCE
+        -fno-asynchronous-unwind-tables -fno-common
+        -nostdinc -isystem $GCC_INC -isystem $OV_ROOT/src/libs/ffmpeg/include
+        -I$OV_ROOT/src/libs -I$OV_ROOT/src/libs/common -DOVOS=1"
+
+# Линковка (есть -o без -c) — своей библиотекой и точкой входа main:
+# ./configure проверяет функции линковкой, и так он узнаёт правду о сисруте.
+link=1
+for a in "$@"; do
+    case "$a" in
+        -c|-E|-S) link=0 ;;
+    esac
+done
+
+if [ "$link" = 1 ]; then
+    exec gcc $CFLAGS -nostdlib -no-pie -Wl,-e,main "$@" "$OV_SYSLIB" -lgcc
+else
+    exec gcc $CFLAGS "$@"
+fi

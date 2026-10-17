@@ -10,7 +10,7 @@ CRT0_SRC  := $(firstword $(wildcard ../../../asm/crt0.asm ../../asm/crt0.asm ../
 
 CFLAGS    := -m64 -std=gnu99 -O2 -ffreestanding -fno-pic -fno-pie \
              -fno-stack-protector -fno-builtin -mcmodel=large -Wall -Wextra \
-             -DDOOMGENERIC -Idoomgeneric -I.
+             -DDOOMGENERIC -Idoomgeneric -I. -I../../../lib
 
 # Исходники из корня DOOM и из подпапки doomgeneric
 SRCS_ROOT := $(wildcard *.c)

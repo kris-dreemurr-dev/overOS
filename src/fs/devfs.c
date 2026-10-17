@@ -35,21 +35,34 @@ static int64_t dev_tty_read(vfs_node_t* node, uint64_t offset, uint64_t size, ui
     task_t* caller = sched_get_current_task();
     int tty_id = (caller && caller->tty_id >= 0) ? caller->tty_id : tty_get_active_id();
 
-    uint64_t read_bytes = 0;
-    while (read_bytes < size) {
-        uint8_t sc = 0;
-        while (!tty_kbd_pop(tty_id, &sc)) {
-            sched_yield(); // Ждем нажатия клавиши в своей очереди TTY
-        }
+    // Клавиатуру читает только процесс переднего плана этого TTY: иначе фоновая
+    // программа прошлого сеанса перехватила бы пароль следующего пользователя
+    if (!tty_is_foreground(caller)) return -1;
 
-        if (sc & 0x80) continue; // Игнорируем отпускание клавиши
-        char c = (sc < 128) ? scancode_ascii[sc] : 0;
-        if (!c) continue;
+    // Канонический ввод: строку собирает драйвер TTY (эхо, Backspace, раскладка),
+    // а не каждая программа сама по сканкодам
+    char line[256];
+    int n = tty_line_read(tty_id, line, sizeof(line));
+    uint64_t out = 0;
+    for (int i = 0; i < n && out < size; i++) buffer[out++] = (uint8_t)line[i];
+    if (out < size) buffer[out++] = '\n';
+    return (int64_t)out;
+}
 
-        buffer[read_bytes++] = (uint8_t)c;
-        if (c == '\n') break; // Возвращаем управление на переносе строки (канонический ввод)
-    }
-    return (int64_t)read_bytes;
+// Управление эхо (ввод пароля): ioctl(fd, TTY_IOCTL_ECHO, 0/1), как termios ECHO
+#define TTY_IOCTL_ECHO 0x5401
+// Запоминать ли строки в истории команд: включает её только оболочка. Ядру
+// не отличить команду от имени пользователя, которое спрашивает login.prg, --
+// решает тот, кто читает строку.
+#define TTY_IOCTL_HIST 0x5402
+
+static int dev_tty_ioctl(vfs_node_t* node, uint64_t request, uint64_t arg) {
+    (void)node;
+    task_t* caller = sched_get_current_task();
+    int tty_id = (caller && caller->tty_id >= 0) ? caller->tty_id : tty_get_active_id();
+    if (request == TTY_IOCTL_ECHO) { tty_set_echo(tty_id, (int)arg); return 0; }
+    if (request == TTY_IOCTL_HIST) { tty_set_history(tty_id, (int)arg); return 0; }
+    return -1;
 }
 
 static int64_t dev_tty_write(vfs_node_t* node, uint64_t offset, uint64_t size, const uint8_t* buffer) {
@@ -69,7 +82,7 @@ static vfs_ops_t g_tty_ops = {
     .write = dev_tty_write,
     .open  = NULL,
     .close = NULL,
-    .ioctl = NULL
+    .ioctl = dev_tty_ioctl
 };
 
 // ----------------- /dev/fb0 -----------------
@@ -81,6 +94,12 @@ static uint32_t* g_fb_shadow = 0;
 static uint64_t  g_fb_shadow_bytes = 0;
 static int       g_fb_shadow_ok = 0;      // копия совпадает с LFB
 static uint32_t  g_fb_shadow_gen = 0;     // значение g_lfb_gen на момент нашей последней записи
+// Строки, которые писала частичная запись мимо теневой копии: следующий полный
+// кадр переписывает их целиком, не сравнивая. Раньше для этого тень на том же
+// участке портили побайтово (~байт), и на окне во весь экран это были
+// мегабайты байтового цикла на каждый кадр.
+#define FB_MAX_ROWS 4096
+static uint8_t   g_fb_row_dirty[FB_MAX_ROWS];
 
 static inline void fb_copy_q(void* d, const void* s, uint64_t qwords) {
     __asm__ volatile ("rep movsq" : "+D"(d), "+S"(s), "+c"(qwords) : : "memory");
@@ -88,7 +107,9 @@ static inline void fb_copy_q(void* d, const void* s, uint64_t qwords) {
 
 static int64_t dev_fb_write(vfs_node_t* node, uint64_t offset, uint64_t size, const uint8_t* buffer) {
     (void)node;
-    (void)offset;   // /dev/fb0 — всегда "кадр с начала экрана": VFS двигает позицию после каждого write
+    // Смещение теперь уважается: композитор выводит одну полосу строк (едет
+    // курсор — меняются двадцать строк, а не весь экран), сделав перед записью
+    // lseek. Полный кадр по-прежнему идёт с нулевого смещения.
     if (!lfb || !buffer) return -1;
 
     // ЗАЩИТА: Если процесс запущен на фоновом TTY — НЕ трогаем физический экран!
@@ -103,7 +124,9 @@ static int64_t dev_fb_write(vfs_node_t* node, uint64_t offset, uint64_t size, co
 
     uint64_t row   = (uint64_t)screen_width * 4;
     uint64_t total = row * screen_height;
-    uint64_t len   = size < total ? size : total;
+    uint64_t base  = offset;
+    if (base >= total) return 0;
+    uint64_t len   = (size < total - base) ? size : (total - base);
     uint8_t* lfb8  = (uint8_t*)lfb;
 
 #if FB_DIFF_WRITE
@@ -114,7 +137,7 @@ static int64_t dev_fb_write(vfs_node_t* node, uint64_t offset, uint64_t size, co
         g_fb_shadow_ok = 0;
     }
 
-    if (g_fb_shadow && g_fb_shadow_bytes == total && len == total && (row & 7) == 0) {
+    if (g_fb_shadow && g_fb_shadow_bytes == total && base == 0 && len == total && (row & 7) == 0) {
         uint64_t q = row / 8;
         uint8_t* sh8 = (uint8_t*)g_fb_shadow;
 
@@ -123,6 +146,12 @@ static int64_t dev_fb_write(vfs_node_t* node, uint64_t offset, uint64_t size, co
             for (uint64_t y = 0; y < screen_height; y++) {
                 const uint64_t* s  = (const uint64_t*)(buffer + y * row);
                 uint64_t*       sh = (uint64_t*)(sh8 + y * row);
+                if (y < FB_MAX_ROWS && g_fb_row_dirty[y]) {   // тень тут не знает, что в LFB
+                    g_fb_row_dirty[y] = 0;
+                    fb_copy_q(lfb8 + y * screen_pitch, s, q);
+                    fb_copy_q(sh, s, q);
+                    continue;
+                }
                 uint64_t a = 0;
                 while (a < q && s[a] == sh[a]) a++;
                 if (a == q) continue;                       // строка не изменилась
@@ -138,6 +167,7 @@ static int64_t dev_fb_write(vfs_node_t* node, uint64_t offset, uint64_t size, co
                 fb_copy_q(sh8 + y * row, buffer + y * row, q);
             }
             g_fb_shadow_ok = 1;
+            for (uint64_t y = 0; y < screen_height && y < FB_MAX_ROWS; y++) g_fb_row_dirty[y] = 0;
         }
         __asm__ volatile ("sfence" ::: "memory");
         g_fb_shadow_gen = g_lfb_gen;
@@ -145,12 +175,22 @@ static int64_t dev_fb_write(vfs_node_t* node, uint64_t offset, uint64_t size, co
     }
 #endif
 
-    // Простой путь (частичная запись, нет памяти под копию, FB_DIFF_WRITE=0): строки с учётом pitch
-    g_fb_shadow_ok = 0;
+    // Простой путь (частичная запись, нет памяти под копию, FB_DIFF_WRITE=0): строки с учётом pitch.
+    // Теневую копию при частичной записи не выбрасываем, а обновляем на том же
+    // участке: иначе следующий полный кадр пришлось бы гнать в LFB целиком.
+    // Теневая копия экрана -- это кэш "что уже лежит в LFB", по которому полный
+    // кадр пишет только изменившееся. Частичная запись (полоса строк под
+    // курсором) в этот кэш попадать НЕ должна: пробовали записывать туда те же
+    // байты -- и обои пропадали, полный кадр считал эти строки совпавшими и не
+    // трогал их. Поэтому такие строки помечаются в g_fb_row_dirty: следующий
+    // полный кадр перепишет ровно их, а все остальные по-прежнему сравнит.
+    int shadow_live = (g_fb_shadow && g_fb_shadow_bytes == total &&
+                       g_fb_shadow_ok && g_fb_shadow_gen == g_lfb_gen && screen_height <= FB_MAX_ROWS);
+    if (!shadow_live) g_fb_shadow_ok = 0;
     uint64_t left = len, done = 0;
     while (left) {
-        uint64_t y = done / row;
-        uint64_t x = done % row;
+        uint64_t y = (base + done) / row;
+        uint64_t x = (base + done) % row;
         uint64_t n = (row - x < left) ? (row - x) : left;
         void* d = lfb8 + y * screen_pitch + x;
         const void* s = buffer + done;
@@ -161,10 +201,12 @@ static int64_t dev_fb_write(vfs_node_t* node, uint64_t offset, uint64_t size, co
         } else {
             __asm__ volatile ("rep movsb" : "+D"(d), "+S"(s), "+c"(cnt) : : "memory");
         }
+        if (shadow_live) g_fb_row_dirty[y] = 1;     // «тут не знаю, перепиши»
         done += n;
         left -= n;
     }
     __asm__ volatile ("sfence" ::: "memory");
+    if (shadow_live) g_fb_shadow_gen = g_lfb_gen;
     return (int64_t)done;
 }
 

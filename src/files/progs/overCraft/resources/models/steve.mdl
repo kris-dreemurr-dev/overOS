@@ -1,0 +1,27 @@
+# Модель игрока — коробки как у Стива в Minecraft.
+#
+#   texture W H              размер развёртки
+#   part ИМЯ px py pz        часть и точка, вокруг которой она вращается
+#   box x y z  w h d  u v    коробка: угол, размер, начало развёртки
+#
+# Единицы — пиксели модели: 16 = один блок, y = 0 — ступни, перед — к -z.
+# Развёртка коробки — как в Minecraft (см. tools/ovcraft_textures.py).
+texture 64 64
+
+part head 0 24 0
+box -4 24 -4  8 8 8  0 0
+
+part body 0 24 0
+box -4 12 -2  8 12 4  16 16
+
+part right_arm 6 22 0
+box 4 12 -2  4 12 4  40 16
+
+part left_arm -6 22 0
+box -8 12 -2  4 12 4  32 48
+
+part right_leg 2 12 0
+box 0 0 -2  4 12 4  0 16
+
+part left_leg -2 12 0
+box -4 0 -2  4 12 4  16 48

@@ -8,6 +8,13 @@ global switch_to
 ;   RSI = next
 
 switch_to:
+    ; 0. Сохраняем состояние FPU/SSE уходящей задачи (prev->fpu, смещение 16)
+    mov rax, [rdi + 16]
+    test rax, rax
+    jz .no_fpu_save
+    fxsave [rax]
+.no_fpu_save:
+
     ; 1. Сохраняем callee-saved регистры текущей задачи на её стеке
     push rbp
     push rbx
@@ -40,5 +47,13 @@ switch_to:
     pop rbx
     pop rbp
 
-    ; 6. Переход на точку возобновления (RIP с вершины стека)
+    ; 6. Восстанавливаем состояние FPU/SSE возобновляемой задачи (next->fpu).
+    ;    RSI здесь всё ещё указывает на next: регистр caller-saved и не менялся.
+    mov rax, [rsi + 16]
+    test rax, rax
+    jz .no_fpu_restore
+    fxrstor [rax]
+.no_fpu_restore:
+
+    ; 7. Переход на точку возобновления (RIP с вершины стека)
     ret

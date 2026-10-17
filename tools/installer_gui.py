@@ -493,6 +493,23 @@ def run_install_wizard():
 # ==============================================================================
 # ПРОЦЕДУРА СБОРКИ И ЗАПИСИ НА ДИСК
 # ==============================================================================
+# Сборка -- от имени того, кто запустил sudo, а не от root
+# ==============================================================================
+# Установщику root нужен только для записи на флешку. Раньше он и собирал от
+# root: build/ становился чужим, следующая обычная сборка падала с "Отказано в
+# доступе", а после "make clean" заново собирался весь FFmpeg -- минуты на
+# каждую установку. Теперь make идёт от SUDO_USER, параллельно на всех ядрах.
+def make_cmd(*args):
+    cmd = ["make", f"-j{os.cpu_count() or 1}", *args]
+    user = os.environ.get("SUDO_USER")
+    if os.geteuid() == 0 and user and user != "root":
+        # PATH -- для nasm/mtools, остальное -- чтобы "make run" открыл окно QEMU
+        # и звук на рабочем столе пользователя
+        keep = "PATH,DISPLAY,XAUTHORITY,WAYLAND_DISPLAY,XDG_RUNTIME_DIR,PULSE_SERVER"
+        cmd = ["sudo", "-u", user, f"--preserve-env={keep}"] + cmd
+    return cmd
+
+# ==============================================================================
 def execute_build_and_flash(cfg, os_ver, sel_mods, sel_progs):
     disk = cfg["target_disk"]
     target_dev = disk["path"]
@@ -506,20 +523,22 @@ def execute_build_and_flash(cfg, os_ver, sel_mods, sel_progs):
         "Пожалуйста, подождите..."
     ], "Компиляция...")
 
-    subprocess.run(["make", "clean"], capture_output=True)
+    # "make clean" здесь больше нет: Makefile сам замечает смену размера тома,
+    # набора модулей и программ (build/.accounts), а очистка стирала собранный
+    # FFmpeg и превращала каждую установку в полную пересборку.
 
     # Преобразуем списки модулей и программ в имена без расширений для Makefile
     raw_mods = " ".join([m.replace(".sys", "") for m in sel_mods])
     raw_progs = " ".join([p.replace(".prg", "") for p in sel_progs])
 
-    cmd = [
-        "make", "all",
+    cmd = make_cmd(
+        "all",
         f"PART_SIZE_MB={cfg['size_mb']}",
         f"WITH_DOOM={1 if cfg['with_doom'] else 0}",
         f"WITH_QUAKE={1 if cfg['with_quake'] else 0}",
         f"INSTALL_MODULES={raw_mods}",
         f"INSTALL_PROGS={raw_progs}"
-    ]
+    )
     res = subprocess.run(cmd, capture_output=True, text=True)
 
     if res.returncode != 0 or not os.path.isfile(IMG_PATH):
@@ -612,7 +631,7 @@ def action_update_kernel():
         "Пожалуйста, подождите..."
     ], "Компиляция ядра...")
 
-    res = subprocess.run(["make", KERNEL_BIN], capture_output=True, text=True)
+    res = subprocess.run(make_cmd(KERNEL_BIN), capture_output=True, text=True)
     if res.returncode != 0 or not os.path.isfile(KERNEL_BIN):
         render_frame("Ошибка сборки", [f"{FG_RED}Не удалось собрать kernel.bin!{FG_WHITE}"], "ENTER=Назад")
         while True:
@@ -661,7 +680,7 @@ def action_test_qemu():
             if get_key() in ('ENTER', 'F3', 'ESC'): return
     restore_terminal()
     print(">>> Запуск overOS в QEMU...")
-    subprocess.run(["make", "run"])
+    subprocess.run(make_cmd("run"))
     sys.stdout.write("\033[2J\033[H")
 
 def main():
@@ -717,7 +736,7 @@ def main():
             elif choice.startswith("Обновить ядро"): action_update_kernel()
             elif choice.startswith("Протестировать"): action_test_qemu()
             elif choice.startswith("Очистить"):
-                subprocess.run(["make", "clean"], capture_output=True)
+                subprocess.run(make_cmd("clean"), capture_output=True)
                 render_frame("Очистка", [f"{FG_GREEN}Сборка очищена!{FG_WHITE}"], "ENTER=Готово")
                 while True:
                     if get_key() in ('ENTER', 'F3', 'ESC'): break

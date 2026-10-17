@@ -1,31 +1,18 @@
 // math.c — Интерактивный граф-плоттер с правильным шрифтом Y и биндами F9-F12 для devOS (Ring 3).
 
-#include <stdint.h>
+#include "ovos.h"   // общие обёртки сисколов (src/lib)
 
 #pragma GCC optimize ("no-tree-loop-distribute-patterns")
 
 #define FB_W 320
 #define FB_H 200
 
-static inline uint64_t syscall3(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3) {
-    uint64_t ret;
-    __asm__ volatile ("int $0x80"
-                      : "=a"(ret)
-                      : "a"(num), "b"(a1), "c"(a2), "d"(a3)
-                      : "memory");
-    return ret;
-}
-
-static inline void sys_print(const char* str) {
-    syscall3(1, (uint64_t)str, 0x00FFFFFF, 0);
-}
-
 static void run_plotter(void);
 
 int main(void) {
-    sys_print("[MATH.PRG] Plotter with F9-F12 bindings and fixed Y font started.\n");
+    ov_print("[MATH.PRG] Plotter with F9-F12 bindings and fixed Y font started.\n");
     run_plotter();
-    syscall3(0, 0, 0, 0);
+    ov_sc(0, 0, 0, 0);
     while (1) { }
     return 0;
 }
@@ -44,7 +31,7 @@ static void sleep_ms(uint32_t ms) {
     while (rdtsc64() < end) __asm__ volatile ("pause");
 }
 
-static void present(void) { syscall3(21, (uint64_t)fb, 0, 0); }
+static void present(void) { ov_sc(21, (uint64_t)fb, 0, 0); }
 
 static void clear_fb(uint32_t color) {
     for (int i = 0; i < FB_W * FB_H; i++) fb[i] = color;
@@ -249,15 +236,15 @@ static int calculate_y(int x, const char* formula) {
 }
 
 static void run_plotter(void) {
-    uint64_t heap = syscall3(14, 0, 0, 0);
+    uint64_t heap = ov_sc(14, 0, 0, 0);
     if (heap == (uint64_t)-1) return;
-    if (syscall3(14, heap + FB_W * FB_H * 4, 0, 0) == (uint64_t)-1) return;
+    if (ov_sc(14, heap + FB_W * FB_H * 4, 0, 0) == (uint64_t)-1) return;
     fb = (uint32_t*)heap;
 
-    uint32_t k = (uint32_t)syscall3(22, 0, 0, 0);
+    uint32_t k = (uint32_t)ov_sc(22, 0, 0, 0);
     if (k) tsc_per_ms = k;
 
-    while ((uint8_t)syscall3(6, 0, 0, 0) != 0) { }
+    while ((uint8_t)ov_sc(6, 0, 0, 0) != 0) { }
 
     char formula_buf[64] = "Y = 5 * SIN(X)";
     int buf_len = 14;
@@ -268,7 +255,7 @@ static void run_plotter(void) {
         uint8_t sc;
         int esc_pressed = 0;
 
-        while ((sc = (uint8_t)syscall3(6, 0, 0, 0)) != 0) {
+        while ((sc = (uint8_t)ov_sc(6, 0, 0, 0)) != 0) {
             if (sc == 0x01) { // ESC
                 if (mode == 1) { mode = 0; t = 0; }
                 else { esc_pressed = 1; break; }

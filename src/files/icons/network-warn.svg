@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!-- Сеть без доступа наружу -->
+  <rect x="3.5" y="5" width="8" height="6" rx="1" fill="none" stroke="currentColor" stroke-width="1.6"/>
+  <path d="M7.5 11 V15 H16 V11.5" fill="none" stroke="currentColor" stroke-width="1.6"/>
+  <path d="M16 11 L21 20 H11 Z" fill="#FFC84B"/>
+  <rect x="15.2" y="14" width="1.6" height="3.4" fill="#1B1E20"/>
+</svg>

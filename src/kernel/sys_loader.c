@@ -1,3 +1,4 @@
+#include "users.h"
 #include "sys_loader.h"
 #include "../drivers/api.h"
 #include "../fs/fs.h"
@@ -37,7 +38,6 @@ extern void set_term_hook(void (*hook)(const char* text));
 extern void sys_exec_cmd(const char* cmd);
 
 extern const ksym_api_t auto_ksyms[];
-extern char current_path[];
 
 static const char scancode_ascii[128] = {
     0,    27,  '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b',
@@ -119,7 +119,7 @@ static int sys_readline(char* buf, int max_len) {
 // Загрузка перемещаемых модулей (.SYS формата SREL, см. tools/elf2sys.py)
 // ============================================================================
 #define SYS_MAX_MEM     (4u * 1024 * 1024)   // потолок: образ + .bss одного модуля
-#define SYS_PHYS_LIMIT  0x20000000ULL        // 512 МБ: столько vmm_init мапит в higher-half
+#define SYS_PHYS_LIMIT  0x100000000ULL       // 4 ГБ: прямое окно ядра покрывает всю физпамять
 
 typedef struct __attribute__((packed)) {
     char     magic[4];      // "SREL"
@@ -177,7 +177,7 @@ static void sys_api_fill(void) {
     a->fs_write_file = fs_write_file;
     a->fs_get_dir_files = (int (*)(void*, int))fs_get_dir_files;
     a->kernel_symbols = auto_ksyms;
-    a->current_path = current_path;
+    a->current_path = tty_cwd();   // путь TTY, в котором модуль запускают
     a->kbd_poll = sys_kbd_poll;
 }
 
@@ -199,6 +199,11 @@ static int sys_load_fail(uint64_t phys, const char* msg) {
 }
 
 int sys_load_module(const char* filename, const char* args) {
+    // Модуль .SYS исполняется в Ring 0 — это полный доступ к машине, только для root
+    if (cred_uid() != UID_ROOT) {
+        kputs("[-] Permission denied: kernel modules (.sys) require root. Use su.\n", 0xFF5555);
+        return -1;
+    }
 
     // 1. Временно берём максимум непрерывной физической памяти и читаем файл прямо в неё
     const uint32_t max_pages = SYS_MAX_MEM / PAGE_SIZE;
@@ -210,7 +215,7 @@ int sys_load_module(const char* filename, const char* args) {
         kputs("[-] Module error: out of physical memory\n", 0xFF5555);
         return 0;
     }
-    if (phys + SYS_MAX_MEM > SYS_PHYS_LIMIT) {   // higher-half мапит только первые 512 МБ
+    if (phys + SYS_MAX_MEM > SYS_PHYS_LIMIT) {   // модули грузим в нижнюю память
         sys_load_unlock();
         return sys_load_fail(phys, "[-] Module error: memory above 512 MB is not mapped\n");
     }

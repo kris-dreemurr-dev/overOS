@@ -8,7 +8,7 @@ CRT0_SRC  := $(firstword $(wildcard ../../../asm/crt0.asm ../../asm/crt0.asm ../
 # Флаги компиляции из вашего Doom
 CFLAGS    := -m64 -std=gnu99 -O2 -ffreestanding -fno-pic -fno-pie \
              -fno-stack-protector -fno-builtin -mcmodel=large -Wall -Wextra \
-             -Iquakegeneric -I.
+             -Iquakegeneric -I. -I../../../lib
 
 # Ищем исходники Quake
 SRCS_ROOT := $(wildcard *.c)

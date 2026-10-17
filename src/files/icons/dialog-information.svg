@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!-- Сведения: синий круг с буквой i -->
+  <circle cx="12" cy="12" r="10" fill="#3DAEE9"/>
+  <circle cx="12" cy="7.2" r="1.5" fill="#FCFCFC"/>
+  <rect x="10.8" y="10" width="2.4" height="8" rx="1.1" fill="#FCFCFC"/>
+</svg>

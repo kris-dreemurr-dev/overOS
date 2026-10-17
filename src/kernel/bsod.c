@@ -1,3 +1,5 @@
+#include "smp.h"
+#include "tty.h"
 #include "bsod.h"
 #include "user_mode.h"
 #include <stdint.h>
@@ -126,6 +128,10 @@ void show_bsod(const char* reason, uint32_t error_code, int exc_no, uint64_t fau
         : "rax", "rcx", "rdx", "memory"
     );
 
+    // Экран смерти — на видимый TTY: упасть могла задача фоновой консоли,
+    // и тогда синий экран ушёл бы в невидимый буфер
+    tty_console_force(tty_get_active_id());
+
     clear_screen(0x000088); 
 
     kputs("\n  :(  devOS x86_64 CRASH SCREEN - STOP CODE: ", 0xFFFFFF);
@@ -221,8 +227,26 @@ void show_bsod(const char* reason, uint32_t error_code, int exc_no, uint64_t fau
     }
 }
 
-void handle_cpu_exception(int exc_no, uint64_t fault_eip, uint64_t fault_esp) {
-    if (g_user_mode_active) {
+// Проба MSR: регистр может отсутствовать, и тогда rdmsr/wrmsr даёт #GP. Ядро
+// на живом ноутбуке от этого падать не должно, поэтому перед обращением
+// ставится флаг, а обработчик просто перешагивает инструкцию (обе -- по два
+// байта: 0F 32 и 0F 30) и помечает попытку неудачной.
+volatile int g_msr_probe = 0;
+volatile int g_msr_fault = 0;
+
+void handle_cpu_exception(int exc_no, uint64_t fault_eip, uint64_t fault_esp, uint64_t fault_cs,
+                          uint64_t* rip_slot) {
+    if (exc_no == 13 && g_msr_probe && rip_slot) {   // #GP во время пробы MSR
+        g_msr_probe = 0;
+        g_msr_fault = 1;
+        *rip_slot += 2;
+        return;
+    }
+    // Сбой самой программы — только если CPU был в Ring 3 (CS.RPL == 3). Сбой в Ring 0
+    // посреди сисколла — ошибка ядра: убить процесс и жить дальше нельзя, ядро могло
+    // держать fs_lock или быть на середине изменения своих структур.
+    (void)g_user_mode_active;
+    if ((fault_cs & 3) == 3) {
         kputs("\n  [devOS Guard] Crash caught in User Mode (Ring 3)!\n", 0xFF5555);
         kputs("  * Exception: ", 0xFFFF55);
         bsod_print_num(exc_no);
@@ -266,10 +290,14 @@ void handle_cpu_exception(int exc_no, uint64_t fault_eip, uint64_t fault_esp) {
 }
 
 void default_exception_handler(uint64_t* frame) {
+    // Сбой на рабочем ядре — дело его программы, не ядра ОС (smp.c)
+    if (smp_on_ap()) smp_ap_exception(frame);
+
     // Извлекаем данные из кадра прерывания, сформированного в interrupts.asm
     int      exc_no    = (int)frame[15];
     uint64_t fault_eip = frame[17];
     uint64_t fault_esp = frame[20];
+    uint64_t fault_cs  = frame[18];
 
-    handle_cpu_exception(exc_no, fault_eip, fault_esp);
+    handle_cpu_exception(exc_no, fault_eip, fault_esp, fault_cs, &frame[17]);
 }

@@ -70,6 +70,7 @@ static uint16_t net_checksum(void* data, size_t len) {
 static inline uint32_t virt_to_phys(void* vaddr) {
     uintptr_t va = (uintptr_t)vaddr;
     if (va >= 0xFFFFFFFF80000000ULL) return (uint32_t)(va - 0xFFFFFFFF80000000ULL);
+    if (va >= 0xFFFF800000000000ULL) return (uint32_t)(va - 0xFFFF800000000000ULL);
     if (va >= 0x80000000UL)          return (uint32_t)(va - 0x80000000UL);
     return (uint32_t)va;
 }

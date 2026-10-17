@@ -1,0 +1,50 @@
+Ассемблерные ядра FFT не длиннее 131072 точек.
+
+Заплата 01-tx-tables вырезала таблицы FFT длиннее 131072 отсчётов (это
+двадцать мегабайт .bss на каждое открытие библиотеки). Ассемблерные кодлеты
+x86 при этом продолжали объявлять, что умеют длины до 2097152, и ссылались
+на вырезанные таблицы. Здесь мы приводим их объявления в соответствие с
+таблицами: длиннее 131072 просто не бывает.
+
+Сами ссылки на символы вырезанных таблиц остаются в объектниках ассемблера
+(код для таких длин недостижим, но линкер требует символ) — заглушки для них
+определены в src/libs/ffmpeg/ffsys.c.
+--- a/libavutil/x86/tx_float_init.c
++++ b/libavutil/x86/tx_float_init.c
+@@ -271,15 +271,15 @@
+            AV_TX_INPLACE | FF_TX_PRESHUFFLE | FF_TX_ASM_CALL, AV_CPU_FLAG_AVXSLOW),
+     TX_DEF(fft32_ns, FFT, 32, 32, 2, 0, 352, b8_i2, fma3, FMA3, AV_TX_INPLACE | FF_TX_PRESHUFFLE,
+            AV_CPU_FLAG_AVXSLOW),
+-    TX_DEF(fft_sr,    FFT, 64, 2097152, 2, 0, 256, b8_i2, avx, AVX,  0, AV_CPU_FLAG_AVXSLOW),
+-    TX_DEF(fft_sr_asm, FFT, 64, 2097152, 2, 0, 320, b8_i2, avx, AVX,
++    TX_DEF(fft_sr,    FFT, 64, 131072, 2, 0, 256, b8_i2, avx, AVX,  0, AV_CPU_FLAG_AVXSLOW),
++    TX_DEF(fft_sr_asm, FFT, 64, 131072, 2, 0, 320, b8_i2, avx, AVX,
+            AV_TX_INPLACE | FF_TX_PRESHUFFLE | FF_TX_ASM_CALL, AV_CPU_FLAG_AVXSLOW),
+-    TX_DEF(fft_sr_ns, FFT, 64, 2097152, 2, 0, 320, b8_i2, avx, AVX,  AV_TX_INPLACE | FF_TX_PRESHUFFLE,
++    TX_DEF(fft_sr_ns, FFT, 64, 131072, 2, 0, 320, b8_i2, avx, AVX,  AV_TX_INPLACE | FF_TX_PRESHUFFLE,
+            AV_CPU_FLAG_AVXSLOW),
+-    TX_DEF(fft_sr,    FFT, 64, 2097152, 2, 0, 288, b8_i2, fma3,  FMA3,  0, AV_CPU_FLAG_AVXSLOW),
+-    TX_DEF(fft_sr_asm, FFT, 64, 2097152, 2, 0, 352, b8_i2, fma3,  FMA3,
++    TX_DEF(fft_sr,    FFT, 64, 131072, 2, 0, 288, b8_i2, fma3,  FMA3,  0, AV_CPU_FLAG_AVXSLOW),
++    TX_DEF(fft_sr_asm, FFT, 64, 131072, 2, 0, 352, b8_i2, fma3,  FMA3,
+            AV_TX_INPLACE | FF_TX_PRESHUFFLE | FF_TX_ASM_CALL, AV_CPU_FLAG_AVXSLOW),
+-    TX_DEF(fft_sr_ns, FFT, 64, 2097152, 2, 0, 352, b8_i2, fma3,  FMA3,  AV_TX_INPLACE | FF_TX_PRESHUFFLE,
++    TX_DEF(fft_sr_ns, FFT, 64, 131072, 2, 0, 352, b8_i2, fma3,  FMA3,  AV_TX_INPLACE | FF_TX_PRESHUFFLE,
+            AV_CPU_FLAG_AVXSLOW),
+ 
+ #if HAVE_AVX2_EXTERNAL
+@@ -288,11 +288,11 @@
+     TX_DEF(fft15_ns, FFT, 15, 15, 15, 0, 384, factor_init, avx2, AVX2,
+            AV_TX_INPLACE | FF_TX_PRESHUFFLE, AV_CPU_FLAG_AVXSLOW),
+ 
+-    TX_DEF(fft_sr,    FFT, 64, 2097152, 2, 0, 320, b8_i2, avx2, AVX2, 0,
++    TX_DEF(fft_sr,    FFT, 64, 131072, 2, 0, 320, b8_i2, avx2, AVX2, 0,
+            AV_CPU_FLAG_AVXSLOW | AV_CPU_FLAG_SLOW_GATHER),
+-    TX_DEF(fft_sr_asm, FFT, 64, 2097152, 2, 0, 384, b8_i2, avx2, AVX2,
++    TX_DEF(fft_sr_asm, FFT, 64, 131072, 2, 0, 384, b8_i2, avx2, AVX2,
+            AV_TX_INPLACE | FF_TX_PRESHUFFLE | FF_TX_ASM_CALL, AV_CPU_FLAG_AVXSLOW | AV_CPU_FLAG_SLOW_GATHER),
+-    TX_DEF(fft_sr_ns, FFT, 64, 2097152, 2, 0, 384, b8_i2, avx2, AVX2, AV_TX_INPLACE | FF_TX_PRESHUFFLE,
++    TX_DEF(fft_sr_ns, FFT, 64, 131072, 2, 0, 384, b8_i2, avx2, AVX2, AV_TX_INPLACE | FF_TX_PRESHUFFLE,
+            AV_CPU_FLAG_AVXSLOW | AV_CPU_FLAG_SLOW_GATHER),
+ 
+     TX_DEF(fft_pfa_15xM, FFT, 60, TX_LEN_UNLIMITED, 15, 2, 320, fft_pfa_init, avx2, AVX2,

@@ -12,6 +12,10 @@
 #define  FUN_EDITION        1
 #define  DEBUG_MODE         0
 #define  BSOD_ENABLED       1
+// Intel (7-я серия и новее): порты USB на старте у EHCI ("Smart Auto" в BIOS),
+// а мы, как и Linux, перекидываем их на xHCI -- там работают и флешки, и
+// USB-клавиатуры с мышами. 0 -- оставить, как раздала прошивка
+#define  USB_ROUTE_TO_XHCI  1
 // ==============================================================
 
 #if !FUN_EDITION

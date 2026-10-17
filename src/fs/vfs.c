@@ -2,6 +2,11 @@
 #include "devfs.h"
 #include "fs.h"
 #include "../kernel/sched.h"
+#include "../kernel/users.h"
+#include "../kernel/tty.h"
+extern const char* fs_caller_cwd(void);
+#include "../memory/pmm.h"
+#include "../memory/vmm.h"
 
 extern void kputs(const char* str, uint32_t color);
 extern int  strcmp(const char* s1, const char* s2);
@@ -12,37 +17,48 @@ static int               g_fat32_node_count = 0;
 
 // Обертка операций над файлами FAT32
 static int64_t vfs_fat32_read(vfs_node_t* node, uint64_t offset, uint64_t size, uint8_t* buffer) {
-    (void)offset;
     if (size == 0 || !buffer) return 0;
+    if (offset > 0xFFFFFFFFULL) return 0;
+    if (size > 0xFFFFFFFFULL) size = 0xFFFFFFFFULL;
 
+    // С текущей позиции дескриптора; 0 — конец файла (раньше каждый read читал с начала)
     fs_lock();
-    // Аппаратный драйвер EHCI читает секторами по 512 байт.
-    // Если буфер процесса меньше 512 байт, читаем через промежуточный буфер ядра,
-    // чтобы не затереть стек/память Ring 3 за пределами size.
-    if (size < 512) {
-        static uint8_t sec_tmp[512] __attribute__((aligned(64)));
-        int rd = fs_read_file(node->name, sec_tmp, 512);
-        fs_unlock();
-        if (rd <= 0) return rd;
-
-        uint32_t to_copy = (uint32_t)size;
-        if ((uint32_t)rd < to_copy) to_copy = (uint32_t)rd;
-        for (uint32_t i = 0; i < to_copy; i++) {
-            buffer[i] = sec_tmp[i];
-        }
-        return (int64_t)to_copy;
-    }
-
-    int read_bytes = fs_read_file(node->name, buffer, (uint32_t)size);
+    int rd = fs_read_at(node->name, (uint32_t)offset, buffer, (uint32_t)size);
     fs_unlock();
-    return read_bytes;
+    return rd < 0 ? -1 : rd;
 }
 
+#define VFS_MAX_RMW (16u * 1024 * 1024)
+
+// Запись со смещения 0 заменяет файл целиком (так рассчитаны текущие программы: открыть
+// на запись и записать всё одним write). Запись дальше — дописывание/правка: файл
+// читается, меняется нужный кусок и записывается заново (FAT-драйвер пока умеет только целиком).
 static int64_t vfs_fat32_write(vfs_node_t* node, uint64_t offset, uint64_t size, const uint8_t* buffer) {
-    (void)offset;
+    if (offset == 0) {
+        fs_lock();
+        int written = fs_write_file(node->name, buffer, (uint32_t)size);
+        fs_unlock();
+        return written ? (int64_t)size : -1;
+    }
+
     fs_lock();
-    int written = fs_write_file(node->name, buffer, (uint32_t)size);
+    uint32_t old_size = fs_file_size(node->name);
+    uint64_t new_size = offset + size;
+    if (new_size < old_size) new_size = old_size;
+    if (new_size > VFS_MAX_RMW) { fs_unlock(); return -1; }
+
+    uint32_t pages = (uint32_t)((new_size + 4095) / 4096);
+    void* phys = pmm_alloc_pages(pages);
+    if (!phys) { fs_unlock(); return -1; }
+    uint8_t* tmp = (uint8_t*)PHYS_TO_VIRT(phys);
+
+    for (uint64_t i = 0; i < new_size; i++) tmp[i] = 0;
+    if (old_size) fs_read_at(node->name, 0, tmp, old_size);
+    for (uint64_t i = 0; i < size; i++) tmp[offset + i] = buffer[i];
+    int written = fs_write_file(node->name, tmp, (uint32_t)new_size);
     fs_unlock();
+
+    for (uint32_t i = 0; i < pages; i++) pmm_free_page((uint8_t*)phys + (uint64_t)i * 4096);
     return written ? (int64_t)size : -1;
 }
 
@@ -105,16 +121,26 @@ vfs_node_t* vfs_resolve_path(const char* path) {
         }
     }
 
+    vfs_node_t* node = NULL;
     if (g_fat32_node_count < MAX_VFS_NODES) {
-        vfs_node_t* node = &g_fat32_nodes[g_fat32_node_count++];
-        kstrncpy(node->name, path, sizeof(node->name));
-        node->type = VFS_FILE;
-        node->ops = &g_fat32_ops;
-        node->size = 0;
-        return node;
+        node = &g_fat32_nodes[g_fat32_node_count++];
+    } else {
+        // Кэш полон: переиспользуем узел, который не держит ни один открытый дескриптор
+        // (раньше после 64 разных файлов open() навсегда возвращал -1)
+        for (int i = 0; i < MAX_VFS_NODES && !node; i++) {
+            int used = 0;
+            for (int f = 0; f < MAX_GLOBAL_FDS; f++) {
+                if (g_fd_pool[f].is_used && g_fd_pool[f].node == &g_fat32_nodes[i]) { used = 1; break; }
+            }
+            if (!used) node = &g_fat32_nodes[i];
+        }
     }
-
-    return NULL;
+    if (!node) return NULL;
+    kstrncpy(node->name, path, sizeof(node->name));
+    node->type = VFS_FILE;
+    node->ops = &g_fat32_ops;
+    node->size = 0;
+    return node;
 }
 
 file_descriptor_t* vfs_allocate_fd(vfs_node_t* node, uint32_t flags) {
@@ -162,17 +188,32 @@ int vfs_sys_open(const char* path, uint32_t flags) {
         const char* p = path;
         if (p[0] == '/') p++;
         if (kstrncmp(p, "dev/", 4) != 0) {
+            // Создать файл можно только с правом записи в каталог
+            if (!perm_check_parent(curr->uid, curr->gid, path, fs_caller_cwd(), PERM_W)) return -1;
+
             fs_lock();
             int created = fs_touch(path); // Передаем полный путь path!
             fs_unlock();
 
             if (created) {
+                perm_on_create(curr->uid, curr->gid, path, fs_caller_cwd(), 0);
                 node = vfs_resolve_path(path);
             }
         }
+    } else if (node && node->type == VFS_FILE) {
+        // Существующий файл: R для чтения, W для записи
+        int want = 0;
+        uint32_t acc = flags & 3;
+        if (acc == O_RDONLY || acc == O_RDWR) want |= PERM_R;
+        if (acc == O_WRONLY || acc == O_RDWR) want |= PERM_W;
+        if (!perm_check(curr->uid, curr->gid, path, fs_caller_cwd(), want)) return -1;
     }
 
     if (!node) return -1;
+
+    // Кадровый буфер (весь экран) — только root и процессу на переднем плане TTY
+    if (node->type == VFS_CHARDEVICE && strcmp(node->name, "fb0") == 0 &&
+        curr->uid != UID_ROOT && !tty_is_foreground(curr)) return -1;
 
     if (node->ops && node->ops->open) {
         if (node->ops->open(node, flags) != 0) return -1;
@@ -207,6 +248,35 @@ int64_t vfs_sys_write(int fd_num, const void* buf, uint64_t count) {
     int64_t ret = fd->node->ops->write(fd->node, fd->offset, count, (const uint8_t*)buf);
     if (ret > 0) fd->offset += ret;
     return ret;
+}
+
+int64_t vfs_sys_lseek(int fd_num, int64_t off, int whence) {
+    task_t* curr = sched_get_current_task();
+    if (!curr || fd_num < 0 || fd_num >= MAX_FD || !curr->fd_table[fd_num]) return -1;
+
+    file_descriptor_t* fd = curr->fd_table[fd_num];
+    if (!fd->node) return -1;
+
+    int64_t base;
+    switch (whence) {
+        case 0: base = 0; break;                       // SEEK_SET
+        case 1: base = (int64_t)fd->offset; break;     // SEEK_CUR
+        case 2: {                                      // SEEK_END
+            // Размер в узле VFS не хранится (он создаётся на лету), поэтому
+            // спрашиваем файловую систему
+            if (fd->node->type != VFS_FILE) return -1;
+            fs_lock();
+            uint32_t sz = fs_file_size(fd->node->name);
+            fs_unlock();
+            base = (int64_t)sz;
+            break;
+        }
+        default: return -1;
+    }
+    int64_t pos = base + off;
+    if (pos < 0) return -1;
+    fd->offset = (uint64_t)pos;
+    return pos;
 }
 
 int vfs_sys_close(int fd_num) {

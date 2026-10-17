@@ -1,20 +1,27 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "../font/font.h"
+#include "../drivers/hda.h"
+#include "../drivers/usb/hid.h"
+#include "cpu.h"
+#include "contheme.h"
 #include "../drivers/pci.h"
 #include "../fs/fs.h"
 #include "../memory/pmm.h"
 #include "../memory/vmm.h"
 #include "user_mode.h"
 #include "sched.h"
+#include "smp.h"
 #include "tty.h"
 #include "config.h"
 #include "loader_kernel.h"
+#include "../fs/mount.h"
+#include "login.h"
 
 #include "../files/image/sprite.h"
 #include "../files/image/image.h"
 
-uint32_t current_bg_color = 0x000000;
+// Цвет фона консоли — поле TTY (tty_console()->bg_color); здесь только дефолт для ранней загрузки
 int mc_mode = 0;
 void init_mc_monitor(void) {}
 
@@ -41,6 +48,7 @@ typedef struct {
 } __attribute__((packed)) vbe_info_t;
 
 volatile uint32_t* lfb;
+int g_lfb_wc_entries = 0;            // записей таблиц страниц LFB с типом WC (0 -- видеопамять некэшируемая)
 uint16_t screen_width;
 uint16_t screen_height;
 uint16_t screen_pitch;
@@ -60,24 +68,12 @@ volatile int      g_fb_write_tty = -2;
 #define MAX_SCREEN_WIDTH  1920
 #define MAX_SCREEN_HEIGHT 1080
 uint32_t back_buffer[MAX_SCREEN_WIDTH * MAX_SCREEN_HEIGHT];
-uint32_t* current_draw_buffer = back_buffer;
+// Кольцо прокрутки TTY1: как и его экранный буфер, статическое (остальные TTY
+// получают своё при первом Alt+F2..F6). Шаг строки — screen_width, под него же
+// выделяется память в tty_spawn: с разными шагами прокрутка писала за буфер и
+// рушила чужую память (ядро падало на первой же прокрутке в TTY2).
+uint32_t kernel_screen_history[TTY_HIST_HEIGHT * MAX_SCREEN_WIDTH];
 
-#define HIST_HEIGHT 64
-static uint32_t screen_history[HIST_HEIGHT * MAX_SCREEN_WIDTH];
-int total_scrolled_px = 0;
-int scroll_offset_px = 0;
-
-int cursor_x = 0;
-int cursor_y = 0;
-int prompt_min_x = 0;
-
-//static uint32_t saved_console_buffer[MAX_SCREEN_WIDTH * MAX_SCREEN_HEIGHT];
-static int saved_cursor_x = 0;
-static int saved_cursor_y = 0;
-static int saved_total_scrolled_px = 0;
-static int saved_scroll_offset_px = 0;
-
-char current_path[128] = "/";
 
 // Динамический хук потока вывода терминала (для модулей типа DE.SYS)
 static void (*g_term_hook)(const char* text) = 0;
@@ -86,38 +82,48 @@ void set_term_hook(void (*hook)(const char* text)) {
     g_term_hook = hook;
 }
 
-static int console_is_saved = 0;
+void clear_screen(uint32_t color);
+uint32_t con_tint(const tty_t* con, uint32_t c);   // палитра консоли (определена ниже)
+
+// Снимок консоли на время работы модуля в графике — у каждого TTY свой
+static int console_is_saved[TTY_SLOTS];
+static int saved_cursor_x[TTY_SLOTS], saved_cursor_y[TTY_SLOTS];
+static int saved_total_scrolled[TTY_SLOTS], saved_scroll_offset[TTY_SLOTS];
 
 // TTY, которому принадлежит вызывающая задача (для модулей — TTY, где их запустили)
 static tty_t* console_task_tty(void) {
-    task_t* me = sched_get_current_task();
-    int id = (me && me->tty_id >= 0) ? me->tty_id : tty_get_active_id();
-    return tty_get(id);
+    return tty_console();
 }
 
 void console_save_state(void) {
-    tty_t* owner = console_task_tty();
-    if (owner) owner->gfx_mode = 1;   // экран занят модулем: мигание курсора консоли выключено
-    if (console_is_saved) return; // Не перезаписываем снимок повторно во время работы подмодулей!
-    saved_cursor_x = cursor_x;
-    saved_cursor_y = cursor_y;
-    saved_total_scrolled_px = total_scrolled_px;
-    saved_scroll_offset_px = scroll_offset_px;
-    console_is_saved = 1;
+    tty_t* con = console_task_tty();
+    if (!con) return;
+    con->gfx_mode = 1;   // экран занят модулем: мигание курсора консоли выключено
+    if (console_is_saved[con->id]) return;   // не перезаписываем снимок во время подмодулей
+    saved_cursor_x[con->id]      = con->cursor_x;
+    saved_cursor_y[con->id]      = con->cursor_y;
+    saved_total_scrolled[con->id] = con->total_scrolled_px;
+    saved_scroll_offset[con->id]  = con->scroll_offset_px;
+    console_is_saved[con->id] = 1;
 }
 
 void console_restore_state(void) {
-    tty_t* owner = console_task_tty();
-    if (owner) owner->gfx_mode = 0;
-    cursor_x = saved_cursor_x;
-    cursor_y = saved_cursor_y;
-    total_scrolled_px = saved_total_scrolled_px;
-    scroll_offset_px = saved_scroll_offset_px;
-
-    current_bg_color = 0x000000;
+    tty_t* con = console_task_tty();
+    if (!con) return;
+    con->gfx_mode = 0;
+    // Модуль рисовал прямо в буфер TTY: после выхода чистим экран, иначе
+    // приглашение печаталось поверх остатков его картинки
+    clear_screen(CON_BG);
+    con->cursor_x         = 0;
+    con->cursor_y         = 0;
+    con->total_scrolled_px = 0;
+    con->scroll_offset_px  = 0;
+    con->bg_color = con_tint(con, CON_BG);
+    (void)saved_cursor_x; (void)saved_cursor_y;
+    (void)saved_total_scrolled; (void)saved_scroll_offset;
 
     flush_buffer();
-    console_is_saved = 0;
+    console_is_saved[con->id] = 0;
 }
 
 extern void usb_controller_init(void);
@@ -136,10 +142,6 @@ extern uint64_t* vmm_get_kernel_pml4_phys(void);
 extern void timer_isr_asm(void);
 extern int prog_load_module(const char* filename, const char* args);
 
-#define MAX_INPUT 256
-extern char input_buffer[MAX_INPUT];
-extern int input_len;
-extern int kbd_layout;
 extern uint64_t* kernel_pml4;
 
 uint32_t timer_ticks = 0;
@@ -270,9 +272,10 @@ void sleep_ms(uint32_t ms) {
     // Если прерывания включены — спим строго по тикам таймера
     uint32_t start = timer_ticks;
     while ((timer_ticks - start) < ms) {
-        // Уступаем процессор другим задачам, пока ждём тика
+        // Уступаем процессор другим задачам, а если ждать больше некого — спим до
+        // следующего прерывания таймера (hlt): раньше ядро крутило pause и грело CPU на 100%
         sched_yield();
-        __asm__ volatile ("pause");
+        __asm__ volatile ("hlt");
     }
 }
 
@@ -323,28 +326,33 @@ static inline void mark_dirty(int x0, int y0, int x1, int y1) {
 void gfx_mark_all_dirty(void) { mark_dirty(0, 0, screen_width, screen_height); }
 
 // Полный сброс буфера в LFB. Рисует ВСЁ — безопасен для кода, который пишет
-// в current_draw_buffer напрямую (put_pixel, модули, desktop).
+// в буфер TTY напрямую (put_pixel, модули, desktop).
 void flush_buffer(void) {
+    tty_t* con = tty_console();
+    if (!con || !con->buffer) return;
+    // На экран попадает только активный TTY: фоновая оболочка рисует в свой буфер
+    if (con->id != tty_get_active_id()) return;
+
     uint8_t* lfb_bytes = (uint8_t*)lfb;
     const size_t w = screen_width;
 
-    if (scroll_offset_px == 0) {
+    if (con->scroll_offset_px == 0) {
         if (screen_pitch == w * sizeof(uint32_t)) {
-            copy32(lfb_bytes, current_draw_buffer, w * screen_height);
+            copy32(lfb_bytes, con->buffer, w * screen_height);
         } else {
             for (int y = 0; y < screen_height; y++)
-                copy32(lfb_bytes + (size_t)y * screen_pitch, &current_draw_buffer[y * w], w);
+                copy32(lfb_bytes + (size_t)y * screen_pitch, &con->buffer[y * w], w);
         }
     } else {
         // Просмотр истории: копируем целыми строками, а не по пикселю
-        int virtual_y = total_scrolled_px - scroll_offset_px;
+        int virtual_y = con->total_scrolled_px - con->scroll_offset_px;
         for (int y = 0; y < screen_height; y++) {
             int src_y = virtual_y + y;
             void* dst = lfb_bytes + (size_t)y * screen_pitch;
-            if (src_y >= 0 && src_y < total_scrolled_px) {
-                copy32(dst, &screen_history[(src_y % HIST_HEIGHT) * MAX_SCREEN_WIDTH], w);
-            } else if (src_y >= total_scrolled_px && (src_y - total_scrolled_px) < screen_height) {
-                copy32(dst, &current_draw_buffer[(src_y - total_scrolled_px) * w], w);
+            if (src_y >= 0 && src_y < con->total_scrolled_px) {
+                copy32(dst, &con->history[(size_t)(src_y % TTY_HIST_HEIGHT) * w], w);
+            } else if (src_y >= con->total_scrolled_px && (src_y - con->total_scrolled_px) < screen_height) {
+                copy32(dst, &con->buffer[(src_y - con->total_scrolled_px) * w], w);
             } else {
                 fill32(dst, 0, w);
             }
@@ -357,90 +365,169 @@ void flush_buffer(void) {
 
 // Сброс только изменённого прямоугольника (консоль: символ = 8x16, курсор = 8x2)
 void flush_dirty(void) {
+    tty_t* con = tty_console();
+    if (!con || !con->buffer) return;
+    if (con->id != tty_get_active_id()) { dirty_reset(); return; }
     if (dirty_x0 >= dirty_x1) return;
-    if (scroll_offset_px != 0) { flush_buffer(); return; }
+    if (con->scroll_offset_px != 0) { flush_buffer(); return; }
 
     int x0 = dirty_x0, y0 = dirty_y0, x1 = dirty_x1, y1 = dirty_y1;
     dirty_reset();
 
     size_t n = (size_t)(x1 - x0);
     uint8_t* dst = (uint8_t*)lfb + (size_t)y0 * screen_pitch + (size_t)x0 * 4;
-    const uint32_t* src = current_draw_buffer + (size_t)y0 * screen_width + x0;
+    const uint32_t* src = con->buffer + (size_t)y0 * con->w_px + x0;
     for (int y = y0; y < y1; y++) {
         copy32(dst, src, n);
         dst += screen_pitch;
-        src += screen_width;
+        src += con->w_px;
     }
     __asm__ volatile ("sfence" ::: "memory");
     g_lfb_gen++;
 }
 
 void put_pixel(int x, int y, uint32_t color) {
-    if (x < 0 || x >= screen_width || y < 0 || y >= screen_height) return;
-    current_draw_buffer[y * screen_width + x] = color;
+    tty_t* con = tty_console();
+    if (!con || !con->buffer) return;
+    if (x < 0 || x >= con->w_px || y < 0 || y >= con->h_px) return;
+    con->buffer[y * con->w_px + x] = color;
 }
 
 void fill_rect(int x, int y, int w, int h, uint32_t color) {
+    tty_t* con = tty_console();
+    color = con_tint(con, color);
+    if (!con || !con->buffer) return;
     int x1 = x + w, y1 = y + h;
     if (x < 0) x = 0;
     if (y < 0) y = 0;
-    if (x1 > screen_width)  x1 = screen_width;
-    if (y1 > screen_height) y1 = screen_height;
+    if (x1 > con->w_px) x1 = con->w_px;
+    if (y1 > con->h_px) y1 = con->h_px;
     if (x >= x1 || y >= y1) return;
-    uint32_t* row = current_draw_buffer + (size_t)y * screen_width + x;
-    for (int yy = y; yy < y1; yy++, row += screen_width)
+    uint32_t* row = con->buffer + (size_t)y * con->w_px + x;
+    for (int yy = y; yy < y1; yy++, row += con->w_px)
         fill32(row, color, (size_t)(x1 - x));
     mark_dirty(x, y, x1, y1);
 }
 
+// Перевод цвета из палитры терминала в классическую палитру текстовой консоли.
+//
+// Пишущие в консоль (ядро, оболочка, fastfetch) знают один набор имён CON_*.
+// Это цвета ОКНА терминала; на tty1..tty6 должна быть классика — чёрный фон и
+// яркие цвета VGA, как в консоли Linux. Перевод делается здесь, в самом низу,
+// поэтому ни одному вызывающему не нужно знать, в какую консоль он пишет.
+uint32_t con_tint(const tty_t* con, uint32_t c) {
+    if (con && con->is_pty) return c;            // окно терминала — своя тема
+    switch (c) {
+        case CON_BG:      return CONT_BG;
+        case CON_BG_ALT:  return CONT_BG_ALT;
+        case CON_FG:      return CONT_FG;
+        case CON_DIM:     return CONT_DIM;
+        case CON_RED:     return CONT_RED;
+        case CON_GREEN:   return CONT_GREEN;
+        case CON_YELLOW:  return CONT_YELLOW;
+        case CON_BLUE:    return CONT_BLUE;
+        case CON_MAGENTA: return CONT_MAGENTA;
+        case CON_CYAN:    return CONT_CYAN;
+        default:          return c;              // произвольный цвет (логотип, модуль) не трогаем
+    }
+}
+
 void draw_cursor(uint32_t color) {
-    fill_rect(cursor_x, cursor_y + 14, 8, 2, color);
+    tty_t* con = tty_console();
+    if (!con) return;
+    fill_rect(con->cursor_x, con->cursor_y + 14, 8, 2, con_tint(con, color));
 }
 
 void clear_screen(uint32_t color) {
-    current_bg_color = color;
-    fill32(current_draw_buffer, color, (size_t)screen_width * screen_height);
-    cursor_x = 0;
-    cursor_y = 0;
-    total_scrolled_px = 0;
-    scroll_offset_px = 0;
+    tty_t* con = tty_console();
+    if (!con || !con->buffer) return;
+    color = con_tint(con, color);
+    con->bg_color = color;
+    fill32(con->buffer, color, (size_t)con->w_px * con->h_px);
+    con->cursor_x = 0;
+    con->cursor_y = 0;
+    con->total_scrolled_px = 0;
+    con->scroll_offset_px = 0;
     gfx_mark_all_dirty();
 }
 
 void scroll_screen(void) {
-    const size_t w = screen_width;
+    tty_t* con = tty_console();
+    if (!con || !con->buffer || !con->history) return;
+    const size_t w = con->w_px;
+    const int    h = con->h_px;
     for (int y = 0; y < 16; y++) {
-        int hist_y = (total_scrolled_px + y) % HIST_HEIGHT;
-        copy32(&screen_history[hist_y * MAX_SCREEN_WIDTH], &current_draw_buffer[y * w], w);
+        int hist_y = (con->total_scrolled_px + y) % TTY_HIST_HEIGHT;
+        copy32(&con->history[(size_t)hist_y * w], &con->buffer[y * w], w);
     }
-    total_scrolled_px += 16;
+    con->total_scrolled_px += 16;
 
     // один непрерывный сдвиг вверх (dst < src, прямой rep movs корректен)
-    copy32(current_draw_buffer, current_draw_buffer + 16 * w, (size_t)(screen_height - 16) * w);
-    fill32(current_draw_buffer + (size_t)(screen_height - 16) * w, current_bg_color, 16 * w);
-    cursor_y -= 16;
+    copy32(con->buffer, con->buffer + 16 * w, (size_t)(h - 16) * w);
+    fill32(con->buffer + (size_t)(h - 16) * w, con->bg_color, 16 * w);
+    con->cursor_y -= 16;
     gfx_mark_all_dirty();
 }
 
-static uint8_t utf8_to_cp866(uint8_t b1, uint8_t b2) {
-    if (b1 == 0xD0) {
-        if (b2 >= 0x90 && b2 <= 0xBF) return (uint8_t)(b2 - 0x90 + 0x80);
-        if (b2 == 0x81) return 0x85;
-    }
-    if (b1 == 0xD1) {
-        if (b2 >= 0x80 && b2 <= 0x8F) return (uint8_t)(b2 - 0x80 + 0xE0);
-        if (b2 == 0x91) return 0xA5;
+// Юникод -> CP866. Кириллица ложится в таблицу один в один, а типографику
+// (длинное тире, кавычки, многоточие) CP866 просто не знает: её заменяем
+// похожими знаками, иначе в консоли вместо «—» появлялось "тАФ" — это были
+// сырые байты UTF-8, нарисованные как символы кодовой страницы.
+static uint8_t uni_to_cp866(uint32_t cp) {
+    if (cp < 0x80) return (uint8_t)cp;
+    if (cp >= 0x410 && cp <= 0x43F) return (uint8_t)(0x80 + (cp - 0x410));
+    if (cp >= 0x440 && cp <= 0x44F) return (uint8_t)(0xE0 + (cp - 0x440));
+    if (cp == 0x401) return 0x85;              // Ё -> Е
+    if (cp == 0x451) return 0xA5;              // ё -> е
+    switch (cp) {
+        case 0x00A0: return ' ';               // неразрывный пробел
+        case 0x00AB: case 0x00BB:              // « »
+        case 0x201C: case 0x201D: case 0x201E: return '"';
+        case 0x2018: case 0x2019: case 0x02BC: return '\'';
+        case 0x2010: case 0x2011: case 0x2012:
+        case 0x2013: case 0x2014: case 0x2015: return '-';   // тире всех видов
+        case 0x2026: return 0xFA;              // многоточие -> точка-середина
+        case 0x00B7: case 0x2022: case 0x2219: return 0xFA;
+        case 0x00B0: return 0xF8;              // градус
+        case 0x2116: return 0xFC;              // №
+        case 0x00A9: return 'c';
+        case 0x2192: return '>';
+        case 0x2190: return '<';
     }
     return '?';
+}
+
+// Разбор UTF-8 по одному байту. Возвращает 1, когда символ собран целиком,
+// и кладёт его код CP866 в *out. Состояние живёт у вызывающего, поэтому одна
+// и та же функция обслуживает и посимвольный kputc, и строковый kputs_at.
+typedef struct { uint32_t cp; int need; } utf8_state_t;
+
+static int utf8_feed(utf8_state_t* st, uint8_t b, uint8_t* out) {
+    if (st->need) {
+        if ((b & 0xC0) != 0x80) { st->need = 0; *out = '?'; return 1; }   // битая последовательность
+        st->cp = (st->cp << 6) | (b & 0x3F);
+        if (--st->need) return 0;
+        *out = uni_to_cp866(st->cp);
+        return 1;
+    }
+    if (b < 0x80)        { *out = b; return 1; }
+    if ((b & 0xE0) == 0xC0) { st->cp = b & 0x1F; st->need = 1; return 0; }
+    if ((b & 0xF0) == 0xE0) { st->cp = b & 0x0F; st->need = 2; return 0; }
+    if ((b & 0xF8) == 0xF0) { st->cp = b & 0x07; st->need = 3; return 0; }
+    *out = '?';                                 // одиночный байт продолжения
+    return 1;
 }
 
 // Отрисовка символа с возможностью прозрачного фона (быстрый путь без проверок на каждый пиксель)
 void draw_char_ex(int start_x, int start_y, char c, uint32_t color, int opaque) {
     unsigned char uc = (unsigned char)c;
     const uint8_t* glyph = &fontdata_ru_8x16[uc * 16];
+    tty_t* con = tty_console();
+    if (!con || !con->buffer) return;
+    color = con_tint(con, color);
 
     if (start_x < 0 || start_y < 0 ||
-        start_x + 8 > screen_width || start_y + 16 > screen_height) {
+        start_x + 8 > con->w_px || start_y + 16 > con->h_px) {
         // редкий случай: символ на краю экрана — медленный путь с клиппингом
         for (int row = 0; row < 16; row++) {
             uint8_t bits = glyph[row];
@@ -448,7 +535,7 @@ void draw_char_ex(int start_x, int start_y, char c, uint32_t color, int opaque) 
                 if (bits & (0x80 >> col)) {
                     put_pixel(start_x + col, start_y + row, color);
                 } else if (opaque) {
-                    put_pixel(start_x + col, start_y + row, current_bg_color);
+                    put_pixel(start_x + col, start_y + row, con->bg_color);
                 }
             }
         }
@@ -456,9 +543,9 @@ void draw_char_ex(int start_x, int start_y, char c, uint32_t color, int opaque) 
         return;
     }
 
-    uint32_t* d = current_draw_buffer + (size_t)start_y * screen_width + start_x;
-    const uint32_t bg = current_bg_color;
-    for (int row = 0; row < 16; row++, d += screen_width) {
+    uint32_t* d = con->buffer + (size_t)start_y * con->w_px + start_x;
+    const uint32_t bg = con->bg_color;
+    for (int row = 0; row < 16; row++, d += con->w_px) {
         unsigned bits = glyph[row];
         if (opaque) {
 #pragma GCC unroll 8
@@ -478,23 +565,14 @@ void draw_char(int start_x, int start_y, char c, uint32_t color) {
 
 void kputs_at(int x, int y, const char* str, uint32_t color) {
     int cx = x;
-    uint8_t utf8_prefix = 0;
+    utf8_state_t st = { 0, 0 };
 
     while (*str) {
-        uint8_t uc = (uint8_t)*str;
-        if (uc == 0xD0 || uc == 0xD1) {
-            utf8_prefix = uc;
-            str++;
-            continue;
-        }
-        if (utf8_prefix) {
-            uc = utf8_to_cp866(utf8_prefix, uc);
-            utf8_prefix = 0;
-        }
+        uint8_t uc;
+        if (!utf8_feed(&st, (uint8_t)*str++, &uc)) continue;
         // [ФИКС]: opaque = 0, чтобы фон окна не затирался цветом обоев
         draw_char_ex(cx, y, (char)uc, color, 0);
         cx += 8;
-        str++;
     }
 }
 
@@ -517,44 +595,47 @@ void kputc(char c, uint32_t color) {
         return;
     }
 
-    static uint8_t utf8_prefix = 0;
-    uint8_t uc = (uint8_t)c;
+    static utf8_state_t st = { 0, 0 };
+    uint8_t uc;
+    if (!utf8_feed(&st, (uint8_t)c, &uc)) return;    // ждём остальные байты символа
 
-    if (uc == 0xD0 || uc == 0xD1) {
-        utf8_prefix = uc;
-        return;
-    }
-    if (utf8_prefix) {
-        uc = utf8_to_cp866(utf8_prefix, uc);
-        utf8_prefix = 0;
-    }
+    tty_t* con = tty_console();
+    if (!con || !con->buffer) return;
 
-    draw_cursor(current_bg_color);
+    draw_cursor(con->bg_color);
 
     if (uc == '\b') {
-        if (cursor_x >= 8) {
-            cursor_x -= 8;
-            fill_rect(cursor_x, cursor_y, 8, 16, current_bg_color);
-            draw_cursor(0xFFFFFF);
+        // Возврат через край строки: длинная команда занимает несколько строк
+        // экрана, и без перехода наверх её нельзя было стереть (это видно при
+        // листании истории стрелками).
+        if (con->cursor_x >= 8) {
+            con->cursor_x -= 8;
+        } else if (con->cursor_y >= 16) {
+            con->cursor_y -= 16;
+            con->cursor_x = con->w_px - 8;
+        } else {
+            return;
         }
+        fill_rect(con->cursor_x, con->cursor_y, 8, 16, con->bg_color);
+        draw_cursor(CON_CURSOR);
         return;
     }
 
     if (uc == '\n') {
-        cursor_x = 0;
-        cursor_y += 16;
+        con->cursor_x = 0;
+        con->cursor_y += 16;
     } else if (uc == '\r') {
-        cursor_x = 0;
+        con->cursor_x = 0;
     } else {
-        draw_char(cursor_x, cursor_y, (char)uc, color);
-        cursor_x += 8;
-        if (cursor_x + 8 > screen_width) {
-            cursor_x = 0;
-            cursor_y += 16;
+        draw_char(con->cursor_x, con->cursor_y, (char)uc, color);
+        con->cursor_x += 8;
+        if (con->cursor_x + 8 > con->w_px) {
+            con->cursor_x = 0;
+            con->cursor_y += 16;
         }
     }
 
-    if (cursor_y + 16 > screen_height) {
+    if (con->cursor_y + 16 > con->h_px) {
         scroll_screen();
     }
 }
@@ -575,14 +656,14 @@ void kdebug(const char* str, uint32_t color) {
 }
 
 uint32_t get_back_pixel(int x, int y) {
-    if (x < 0 || x >= screen_width || y < 0 || y >= screen_height) return 0;
-    return current_draw_buffer[y * screen_width + x];
+    tty_t* con = tty_console();
+    if (!con || !con->buffer) return 0;
+    if (x < 0 || x >= con->w_px || y < 0 || y >= con->h_px) return 0;
+    return con->buffer[y * con->w_px + x];
 }
 
 void print_prompt(void) {
-    kputs("root@" OS_LOWER_NAME ":", 0x55FF55);
-    kputs(current_path, 0x55FFFF);
-    kputs("$ ", 0xFFFFFF);
+    login_print_prompt();   // "login:" / "Password:" / "user@overos:/path$ " — по состоянию TTY
     flush_dirty();
 }
 
@@ -598,7 +679,7 @@ void sys_reboot(void) {
 }
 
 static void render_frame(int x_pos, int y_pos) {
-    clear_screen(0x000000);
+    clear_screen(CON_BG);
 
     for (int y = 0; y < IMAGE_HEIGHT; y++) {
         for (int x = 0; x < IMAGE_WIDTH; x++) {
@@ -755,14 +836,21 @@ void cmd_fastfetch(void) {
     int scaled_h = LOGO_ASCII_ROWS * 16;  // Высота в пикселях (строка шрифта = 16px)
 #endif
 
-    int total_h = scaled_h > 230 ? scaled_h : 230;
+    // Текстовый блок fastfetch -- 16 строк по 16 точек, плюс полоска цветов
+    int total_h = scaled_h > 320 ? scaled_h : 320;
 
-    while (cursor_y + total_h > screen_height) {
+    tty_t* con = tty_console();
+    // Высоту берём у самой консоли, а не у экрана: у окна терминала она своя,
+    // и по screen_height прокрутка не срабатывала -- вывод уезжал за нижний
+    // край и просто пропадал.
+    int guard = 256;
+    while (con->cursor_y > 0 && con->cursor_y + total_h > con->h_px && guard-- > 0) {
         scroll_screen();
     }
+    if (con->cursor_y < 0) con->cursor_y = 0;
 
-    int start_x = cursor_x;
-    int start_y = cursor_y;
+    int start_x = con->cursor_x;
+    int start_y = con->cursor_y;
 
     int sprite_x = start_x + 10;
     int sprite_y = start_y + (total_h - scaled_h) / 2;
@@ -784,7 +872,7 @@ void cmd_fastfetch(void) {
 #else
     // Отрисовка нового ASCII-секундомера фирменным бирюзовым цветом
     for (int r = 0; r < LOGO_ASCII_ROWS; r++) {
-        kputs_at(sprite_x, sprite_y + (r * 16), logo_ascii[r], 0x55FFFF);
+        kputs_at(sprite_x, sprite_y + (r * 16), logo_ascii[r], CON_CYAN);
     }
 #endif
 
@@ -793,24 +881,36 @@ void cmd_fastfetch(void) {
     int text_y = start_y;
 
     // Имя хоста
-    kputs_at(text_x, text_y, "root@" OS_LOWER_NAME, 0x55FF55); text_y += 16;
-    kputs_at(text_x, text_y, "----------------------------", 0x666666); text_y += 16;
+    // Шапка fastfetch: кто на самом деле работает в этом TTY, а не всегда root
+    {
+        char who[64];
+        int wp = 0;
+        tty_t* tcon = tty_console();
+        const char* uname_s = (tcon && tcon->login_name[0]) ? tcon->login_name : "root";
+        while (*uname_s && wp < 32) who[wp++] = *uname_s++;
+        who[wp++] = '@';
+        const char* hn = OS_LOWER_NAME;
+        while (*hn && wp < 60) who[wp++] = *hn++;
+        who[wp] = '\0';
+        kputs_at(text_x, text_y, who, CON_GREEN); text_y += 16;
+    }
+    kputs_at(text_x, text_y, "----------------------------", CON_DIM); text_y += 16;
 
     // OS & Kernel
-    kputs_at(text_x, text_y, "OS:          ", 0x55FFFF);
-    kputs_at(text_x + 13 * 8, text_y, OS_NAME " x86_64", 0xFFFFFF); text_y += 16;
+    kputs_at(text_x, text_y, "OS:          ", CON_CYAN);
+    kputs_at(text_x + 13 * 8, text_y, OS_NAME " x86_64", CON_FG); text_y += 16;
 
     char host_str[64];
     get_smbios_host(host_str, sizeof(host_str));
-    kputs_at(text_x, text_y, "Host:        ", 0x55FFFF);
-    kputs_at(text_x + 13 * 8, text_y, host_str, 0xFFFFFF); text_y += 16;
+    kputs_at(text_x, text_y, "Host:        ", CON_CYAN);
+    kputs_at(text_x + 13 * 8, text_y, host_str, CON_FG); text_y += 16;
 
-    kputs_at(text_x, text_y, "Kernel:      ", 0x55FFFF);
-    kputs_at(text_x + 13 * 8, text_y, OS_NAME " " OS_VERSION " (" OS_ARCH ")", 0xFFFFFF);
+    kputs_at(text_x, text_y, "Kernel:      ", CON_CYAN);
+    kputs_at(text_x + 13 * 8, text_y, OS_NAME " " OS_VERSION " (" OS_ARCH ")", CON_FG);
     text_y += 16;
 
     // Uptime
-    kputs_at(text_x, text_y, "Uptime:      ", 0x55FFFF);
+    kputs_at(text_x, text_y, "Uptime:      ", CON_CYAN);
     char up_msg[64];
     int up_p = 0;
     if (days > 0) {
@@ -823,10 +923,10 @@ void cmd_fastfetch(void) {
     up_msg[up_p++] = 'm'; up_msg[up_p++] = ' ';
     itoa(secs, buf); for (int i = 0; buf[i]; i++) up_msg[up_p++] = buf[i];
     up_msg[up_p++] = 's'; up_msg[up_p] = '\0';
-    kputs_at(text_x + 13 * 8, text_y, up_msg, 0xFFFFFF); text_y += 16;
+    kputs_at(text_x + 13 * 8, text_y, up_msg, CON_FG); text_y += 16;
 
     // Display
-    kputs_at(text_x, text_y, "Display:     ", 0x55FFFF);
+    kputs_at(text_x, text_y, "Display:     ", CON_CYAN);
     char res_buf[48];
     char w_s[8], h_s[8];
     itoa(screen_width, w_s); 
@@ -838,38 +938,80 @@ void cmd_fastfetch(void) {
     const char* bpp_str = " @ 60 Hz [VBE LFB]";
     for (int i = 0; bpp_str[i]; i++) res_buf[rp++] = bpp_str[i];
     res_buf[rp] = '\0';
-    kputs_at(text_x + 13 * 8, text_y, res_buf, 0xFFFFFF); 
+    kputs_at(text_x + 13 * 8, text_y, res_buf, CON_FG); 
     text_y += 16;
 
     // Shell
-    kputs_at(text_x, text_y, "Shell:       ", 0x55FFFF);
-    kputs_at(text_x + 13 * 8, text_y, "bash-lite (overOS)", 0xFFFFFF); 
+    kputs_at(text_x, text_y, "Shell:       ", CON_CYAN);
+    kputs_at(text_x + 13 * 8, text_y, "bash-lite (overOS)", CON_FG); 
     text_y += 16;
 
     // Terminal
-    kputs_at(text_x, text_y, "Terminal:    ", 0x55FFFF);
-    kputs_at(text_x + 13 * 8, text_y, "kernel-console", 0xFFFFFF); 
+    kputs_at(text_x, text_y, "Terminal:    ", CON_CYAN);
+    {
+        tty_t* tcon = tty_console();
+        kputs_at(text_x + 13 * 8, text_y,
+                 (tcon && tcon->is_pty) ? "overTerm (pty)" : "kernel-console", CON_FG);
+    } 
     text_y += 16;
 
     // Font
-    kputs_at(text_x, text_y, "Font:        ", 0x55FFFF);
-    kputs_at(text_x + 13 * 8, text_y, "8x16-tty (CP866)", 0xFFFFFF); 
+    kputs_at(text_x, text_y, "Font:        ", CON_CYAN);
+    kputs_at(text_x + 13 * 8, text_y, "8x16-tty (CP866)", CON_FG); 
     text_y += 16;
 
-    // CPU
+    // CPU: модель, сколько ядер и потоков мы ВИДИМ, и настоящая частота
     char cpu_str[48];
     get_cpu_brand(cpu_str);
-    kputs_at(text_x, text_y, "CPU:         ", 0x55FFFF);
-    kputs_at(text_x + 13 * 8, text_y, cpu_str, 0xFFFFFF); text_y += 16;
+    kputs_at(text_x, text_y, "CPU:         ", CON_CYAN);
+    kputs_at(text_x + 13 * 8, text_y, cpu_str, CON_FG); text_y += 16;
+    {
+        const cpu_info_t* ci = cpu_get();
+        char line[96];
+        int p = 0;
+        char num[16];
+        #define CPU_PUT(str) do { const char* _s = (str); \
+            while (*_s && p < (int)sizeof(line) - 1) line[p++] = *_s++; } while (0)
+        CPU_PUT("ядер ");    itoa(ci->cores, num);   CPU_PUT(num);
+        CPU_PUT(", потоков "); itoa(ci->threads, num); CPU_PUT(num);
+        CPU_PUT(" (занято 1), ");
+        // Текущая частота -- измеренная по APERF/MPERF. Под гипервизором этих
+        // счётчиков нет, и вместо нуля честнее показать паспортную.
+        int mhz = ci->cur_mhz ? ci->cur_mhz : ci->base_mhz;
+        if (mhz) {
+            itoa(mhz, num); CPU_PUT(num); CPU_PUT(" МГц");
+            if (!ci->cur_mhz) CPU_PUT(" (паспорт)");
+            if (ci->max_mhz > mhz) { CPU_PUT(" из "); itoa(ci->max_mhz, num); CPU_PUT(num); }
+        } else {
+            CPU_PUT("частота неизвестна");
+        }
+        line[p] = '\0';
+        #undef CPU_PUT
+        kputs_at(text_x, text_y, "Частота:     ", CON_CYAN);
+        kputs_at(text_x + 13 * 8, text_y, line, ci->turbo_on ? CON_GREEN : CON_FG);
+        text_y += 16;
+
+        const char* gov = (ci->governor == CPU_GOV_HWP)    ? "HWP, максимум" :
+                          (ci->governor == CPU_GOV_PSTATE) ? "P-state, максимум" :
+                                                             "управляет прошивка";
+        int gw = 0;
+        for (const char* g = gov; *g; g++) if (((uint8_t)*g & 0xC0) != 0x80) gw++;
+        kputs_at(text_x, text_y, "Питание:     ", CON_CYAN);
+        kputs_at(text_x + 13 * 8, text_y, gov, CON_FG);
+        kputs_at(text_x + 13 * 8 + gw * 8, text_y,
+                 ci->turbo_on ? "  турбо вкл." : "  турбо выкл.",
+                 ci->turbo_on ? CON_GREEN : CON_DIM);
+        text_y += 16;
+    }
 
     // GPU
     char gpu_str[36];
     get_pci_gpu(gpu_str);
-    kputs_at(text_x, text_y, "GPU:         ", 0x55FFFF);
-    kputs_at(text_x + 13 * 8, text_y, gpu_str, 0xFFFFFF); text_y += 16;
+    kputs_at(text_x, text_y, "GPU:         ", CON_CYAN);
+    kputs_at(text_x + 13 * 8, text_y, gpu_str, CON_FG); text_y += 16;
 
     // Memory
-    kputs_at(text_x, text_y, "Memory:      ", 0x55FFFF);
+    kputs_at(text_x, text_y, "Memory:      ", CON_CYAN);
 
     uint64_t used_bytes = pmm_get_used_blocks() * PAGE_SIZE;
     uint64_t total_bytes = pmm_get_total_blocks() * PAGE_SIZE;
@@ -914,12 +1056,12 @@ void cmd_fastfetch(void) {
     for (int i = 0; m_p2[i]; i++) mem_buf[mp++] = m_p2[i];
     mem_buf[mp] = '\0';
 
-    uint32_t mem_col = (mem_percent > 80) ? 0xFF5555 : (mem_percent > 50) ? 0xFFFF55 : 0x55FF55;
+    uint32_t mem_col = (mem_percent > 80) ? CON_RED : (mem_percent > 50) ? CON_YELLOW : CON_GREEN;
     kputs_at(text_x + 13 * 8, text_y, mem_buf, mem_col);
     text_y += 16;
 
     // Disk
-    kputs_at(text_x, text_y, "Disk (/):    ", 0x55FFFF);
+    kputs_at(text_x, text_y, "Disk (/):    ", CON_CYAN);
 
     uint32_t disk_used_mb = 0, disk_total_mb = 0;
     fs_get_stats(&disk_used_mb, &disk_total_mb);
@@ -947,22 +1089,22 @@ void cmd_fastfetch(void) {
     for (int i = 0; d_p2[i]; i++) disk_buf[dp++] = d_p2[i];
     disk_buf[dp] = '\0';
 
-    uint32_t disk_col = (disk_percent > 80) ? 0xFF5555 : (disk_percent > 50) ? 0xFFFF55 : 0x55FF55;
+    uint32_t disk_col = (disk_percent > 80) ? CON_RED : (disk_percent > 50) ? CON_YELLOW : CON_GREEN;
     kputs_at(text_x + 13 * 8, text_y, disk_buf, disk_col);
     text_y += 16;
 
     // Audio
-    kputs_at(text_x, text_y, "Audio:       ", 0x55FFFF);
-    kputs_at(text_x + 13 * 8, text_y, pci_get_audio_controller_name(), 0xFFFF55); text_y += 24;
+    kputs_at(text_x, text_y, "Audio:       ", CON_CYAN);
+    kputs_at(text_x + 13 * 8, text_y, pci_get_audio_controller_name(), CON_YELLOW); text_y += 24;
 
     // Цветовая палитра
     static const uint32_t palette_colors[8] = {
         0x000000, 0xAA0000, 0x00AA00, 0xAA5500,
-        0x0000AA, 0xAA00AA, 0x00AAAA, 0xAAAAAA
+        0x0000AA, 0xAA00AA, 0x00AAAA, CON_DIM
     };
     static const uint32_t bright_colors[8] = {
-        0x555555, 0xFF5555, 0x55FF55, 0xFFFF55,
-        0x5555FF, 0xFF55FF, 0x55FFFF, 0xFFFFFF
+        0x555555, CON_RED, CON_GREEN, CON_YELLOW,
+        0x5555FF, 0xFF55FF, CON_CYAN, CON_FG
     };
 
     int box_w = 12;
@@ -977,11 +1119,13 @@ void cmd_fastfetch(void) {
     }
     text_y += (box_h * 2 + 12);
 
-    cursor_x = 0;
-    cursor_y = start_y + total_h + 48;
-    while (cursor_y + 48 > screen_height) {
+    con->cursor_x = 0;
+    con->cursor_y = start_y + total_h + 48;
+    int guard2 = 256;
+    while (con->cursor_y + 48 > con->h_px && guard2-- > 0) {
         scroll_screen();
     }
+    if (con->cursor_y < 0) con->cursor_y = 0;
 
     flush_buffer();
 }
@@ -1012,7 +1156,8 @@ void hex_str(uint32_t val, char* out) {
 }
 
 extern void show_bsod(const char* reason, uint32_t error_code, int exc_no, uint64_t fault_eip, uint64_t fault_esp);
-extern void handle_cpu_exception(int exc_no, uint64_t fault_eip, uint64_t fault_esp);
+extern void handle_cpu_exception(int exc_no, uint64_t fault_eip, uint64_t fault_esp, uint64_t fault_cs,
+                                 uint64_t* rip_slot);
 
 struct idt_entry {
     uint16_t base_low;
@@ -1062,6 +1207,8 @@ __attribute__((naked)) void isr_common_stub(void) {
         "movq 88(%rsp), %rsi\n\t" // RIP -> передаем как fault_eip (в rsi)
         "movq 112(%rsp), %rdx\n\t" // RSP -> передаем как fault_esp (в rdx)
         "movq 72(%rsp), %rdi\n\t" // Номер вектора -> передаем как exc_no (в rdi)
+        "movq 96(%rsp), %rcx\n\t" // CS -> fault_cs (кольцо, где случился сбой)
+        "leaq 88(%rsp), %r8\n\t"  // адрес ячейки с RIP: обработчик может его сдвинуть
 
         "call handle_cpu_exception\n\t"
 
@@ -1080,17 +1227,28 @@ __attribute__((naked)) void isr_common_stub(void) {
 }
 
 // Упрощенные отдельные макросы-точки входа для таблицы IDT
+// У части исключений процессор САМ кладёт на стек код ошибки (#DF, #TS, #NP,
+// #SS, #GP, #PF, #AC, #CP). Раньше заглушка клала фиктивный код для всех
+// подряд, и у этих восьми весь кадр уезжал на 8 байт: вместо RIP читался код
+// ошибки, вместо CS -- настоящий RIP. А проверка "сбой был в Ring 3" смотрит
+// именно на CS, то есть падение программы по #PF или #GP -- самые частые --
+// разбиралось по младшим битам её же RIP и часто уходило в BSOD вместо того,
+// чтобы просто убить процесс. Поэтому заглушек теперь две.
 #define DEF_STUB(n) \
     __attribute__((naked)) static void isr_stub_##n(void) { \
         __asm__ __volatile__("pushq $0\n\tpushq $" #n "\n\tjmp isr_common_stub"); \
     }
+#define DEF_STUB_EC(n) \
+    __attribute__((naked)) static void isr_stub_##n(void) { \
+        __asm__ __volatile__("pushq $" #n "\n\tjmp isr_common_stub"); \
+    }
 
 DEF_STUB(0)  DEF_STUB(1)  DEF_STUB(2)  DEF_STUB(3)
 DEF_STUB(4)  DEF_STUB(5)  DEF_STUB(6)  DEF_STUB(7)
-DEF_STUB(8)  DEF_STUB(9)  DEF_STUB(10) DEF_STUB(11)
-DEF_STUB(12) DEF_STUB(13) DEF_STUB(14) DEF_STUB(15)
-DEF_STUB(16) DEF_STUB(17) DEF_STUB(18) DEF_STUB(19)
-DEF_STUB(20) DEF_STUB(21) DEF_STUB(22) DEF_STUB(23)
+DEF_STUB_EC(8)  DEF_STUB(9)  DEF_STUB_EC(10) DEF_STUB_EC(11)
+DEF_STUB_EC(12) DEF_STUB_EC(13) DEF_STUB_EC(14) DEF_STUB(15)
+DEF_STUB(16) DEF_STUB_EC(17) DEF_STUB(18) DEF_STUB(19)
+DEF_STUB(20) DEF_STUB_EC(21) DEF_STUB(22) DEF_STUB(23)
 DEF_STUB(24) DEF_STUB(25) DEF_STUB(26) DEF_STUB(27)
 DEF_STUB(28) DEF_STUB(29) DEF_STUB(30) DEF_STUB(31)
 static int sched_preempt_counter = 0;
@@ -1099,7 +1257,21 @@ static int sched_preempt_counter = 0;
 void timer_isr_handler(void) {
     timer_ticks++;
 
+    // Тик достаётся той задаче, которая была на процессоре: из этих счётчиков
+    // диспетчер задач считает загрузку (простой — это тики pid 0, он же hlt).
+    {
+        task_t* run = sched_get_current_task();
+        if (run) run->cpu_ticks++;
+    }
+
     outb(0x20, 0x20);
+
+    // Звуковую очередь обслуживает ядро, а не программа: иначе стоит плееру
+    // замолчать (пауза, переключение TTY), и DMA пойдёт по второму кругу.
+    hda_tick();
+
+    // USB-клавиатуры и мыши: отчёты из второго кольца событий xHCI (drivers/usb/hid.c)
+    usb_hid_tick();
 
     // Вытесняем всегда, в том числе задачи в Ring 3 (у каждой свой стек входа в ядро)
     sched_preempt_counter++;
@@ -1183,24 +1355,20 @@ void init_crash_guard_idt(void) {
 static uint8_t bmp_load_buffer[512 * 1024];
 
 void render_boot_logo(void) {
-    // Переходим в системную папку обычной строкой
-    fs_change_dir("sys"); 
+    // Полный путь: положение драйвера теперь выставляет сама ФС по каталогу
+    // вызывающего, поэтому "перейти в sys и прочитать logo.bmp" больше не работает
+    int bytes = fs_read_file("/sys/logo.bmp", bmp_load_buffer, sizeof(bmp_load_buffer));
 
-    // Читаем файл в оригинальном регистре — наш FAT32 драйвер с LFN и strcasecmp легко его найдет
-    int bytes = fs_read_file("logo.bmp", bmp_load_buffer, sizeof(bmp_load_buffer));
-
-    fs_go_root(); // Возвращаемся в корень файловой системы
-
-    clear_screen(0x000000); // Чёрный экран по умолчанию 
+    clear_screen(CON_BG); // Чёрный экран по умолчанию 
 
     // Если файл не найден или меньше минимального размера заголовка BMP (54 байта)
     if (bytes <= 54) {
         int text_x = (screen_width - (13 * 8)) / 2; 
         int text_y = (screen_height / 2) - 8; 
-        kputs_at(text_x, text_y, "LOGO NOT FOUND", 0xFF5555); 
+        kputs_at(text_x, text_y, "LOGO NOT FOUND", CON_RED); 
         flush_buffer(); 
         sleep_ms(3500); 
-        clear_screen(0x000000); 
+        clear_screen(CON_BG); 
         flush_buffer(); 
         return;
     }
@@ -1208,10 +1376,10 @@ void render_boot_logo(void) {
     // Проверяем сигнатуру 'BM' (0x4D42)
     uint16_t* signature = (uint16_t*)bmp_load_buffer;
     if (*signature != 0x4D42) {
-        kputs_at(100, 100, "INVALID BMP FORMAT", 0xFF5555); 
+        kputs_at(100, 100, "INVALID BMP FORMAT", CON_RED); 
         flush_buffer(); 
         sleep_ms(3500); 
-        clear_screen(0x000000); 
+        clear_screen(CON_BG); 
         flush_buffer(); 
         return;
     }
@@ -1223,10 +1391,10 @@ void render_boot_logo(void) {
     uint16_t bpp         = *(uint16_t*)(bmp_load_buffer + 28);
 
     if (bpp != 24 && bpp != 32) {
-        kputs_at(100, 100, "UNSUPPORTED BMP BPP", 0xFF5555); 
+        kputs_at(100, 100, "UNSUPPORTED BMP BPP", CON_RED); 
         flush_buffer(); 
         sleep_ms(3500); 
-        clear_screen(0x000000); 
+        clear_screen(CON_BG); 
         flush_buffer(); 
         return;
     }
@@ -1266,20 +1434,19 @@ void render_boot_logo(void) {
 
     flush_buffer(); 
     sleep_ms(1500); 
-    clear_screen(0x000000); 
+    clear_screen(CON_BG); 
     flush_buffer(); 
 }
 
 void print_tty_banner(int tty_id) {
-    kputs(OS_NAME " " OS_ARCH " " OS_VERSION " / tty", 0x55FF55);
+    kputs(OS_NAME " " OS_ARCH " " OS_VERSION " / tty", CON_GREEN);
     char num_buf[16];
     itoa(tty_id + 1, num_buf);
-    kputs(num_buf, 0x55FFFF);
-    kputs("\n\n", 0xFFFFFF);
+    kputs(num_buf, CON_CYAN);
+    kputs("\n\n", CON_FG);
 
-    kputs("Защита от ДОЛБАЁБОВ!!! не вытаскивайте флешку с ОС а если и вытащили не втыкайте, не поможет.\n\n", 0x00AA00);
-    fs_dir();
-    kputs("\n", 0xFFFFFF);
+    kputs("Защита от ДОЛБАЁБОВ!!! не вытаскивайте флешку с ОС а если и вытащили не втыкайте, не поможет.\n\n", CON_DIM);
+    // Листинг корня теперь показывается после входа (login.c), как motd
 }
 
 // Наш первый настоящий float-таймер высокого разрешения!
@@ -1322,8 +1489,18 @@ void check_and_run_autostart(void) {
             }
             path[p] = '\0';
 
-            // Запускаем программу в графическом/пользовательском режиме
-            prog_load_module(path, 0);
+            // Запускаем программу в графическом/пользовательском режиме.
+            // Если не вышло -- говорим об этом: молчащий автозапуск однажды
+            // стоил мне часа поисков (рабочий стол просто не появлялся).
+            int rc = prog_load_module(path, 0);
+            if (rc != 0) {
+                char num[16]; itoa(rc, num);
+                kputs("[автозапуск] ", 0xFF5555);
+                kputs(path, 0xFFFFFF);
+                kputs(" завершилась с кодом ", 0xFF5555);
+                kputs(num, 0xFFFFFF);
+                kputs("\n", 0xFF5555);
+            }
         }
     }
 }
@@ -1335,10 +1512,43 @@ void kernel_main(void) {
     screen_height = vbe->height;
     screen_pitch = vbe->pitch;
 
-    pmm_init(512 * 1024 * 1024); 
-    vmm_init();
+    // --- Физическая память: карту отдал BIOS (INT 15h E820) в stage2 ---------
+    // Раньше объём был прошит константой 512 МБ, и на машине с 8 или 16 ГБ
+    // система использовала шестнадцатую часть ОЗУ.
+    uint32_t  e820_count = *(volatile uint32_t*)(uintptr_t)E820_COUNT_ADDR;
+    e820_entry_t* e820   = (e820_entry_t*)(uintptr_t)E820_LIST_ADDR;
+
+    uint64_t ram_top = 0;
+    if (e820_count > 0 && e820_count <= 96) {
+        for (uint32_t i = 0; i < e820_count; i++) {
+            if (e820[i].type != E820_USABLE) continue;
+            uint64_t end = e820[i].base + e820[i].length;
+            if (end > ram_top) ram_top = end;
+        }
+    }
+    // Битмап PMM лежит по 0x1F00000 и занимает не больше мегабайта, то есть
+    // описывает до 32 ГБ; прямое окно vmm ограничено 64 ГБ. Берём меньшее.
+    if (ram_top > 32ULL * 1024 * 1024 * 1024) ram_top = 32ULL * 1024 * 1024 * 1024;
+    if (ram_top < 64ULL * 1024 * 1024) ram_top = 512ULL * 1024 * 1024;   // BIOS промолчал
+    g_ram_bytes = ram_top;
+
+    pmm_init(ram_top);
+    vmm_init(ram_top);
     enable_write_combining();
-    pmm_mark_region_free(0x000000, 512 * 1024 * 1024);
+
+    // Свободно только то, что BIOS назвал пригодным: ACPI, NVS и дыры
+    // оставляем занятыми, иначе ядро рано или поздно затрёт таблицы прошивки.
+    if (e820_count > 0 && e820_count <= 96) {
+        for (uint32_t i = 0; i < e820_count; i++) {
+            if (e820[i].type != E820_USABLE) continue;
+            uint64_t base = e820[i].base, len = e820[i].length;
+            if (base >= ram_top) continue;
+            if (base + len > ram_top) len = ram_top - base;
+            pmm_mark_region_free(base, len);
+        }
+    } else {
+        pmm_mark_region_free(0x000000, ram_top);
+    }
 
     // Защищаем первые 32 МБ физической памяти:
     // 0-1 МБ   — BIOS, IVT, VBE Info
@@ -1349,6 +1559,7 @@ void kernel_main(void) {
     pmm_mark_region_used(0x000000, 36 * 1024 * 1024);
 
     uintptr_t lfb_phys = (uintptr_t)vbe->lfb_ptr;
+    // (g_lfb_wc_entries — сколько записей таблиц переведено в WC, для загрузочного лога)
     size_t fb_size = screen_pitch * screen_height;
 
     for (size_t offset = 0; offset < fb_size; offset += 0x1000) {
@@ -1358,7 +1569,18 @@ void kernel_main(void) {
                      VMM_FLAG_PRESENT | VMM_FLAG_WRITABLE | VMM_FLAG_WC);
     }
 
+    // Цикл выше покрывает только адреса без готового отображения; LFB почти
+    // всегда внутри identity-области из 2 МБ-страниц, поэтому тип WC ставим
+    // прямо в существующих записях — и в identity, и в прямом окне DMAP
+    // (два отображения одной памяти с разными типами процессор не любит)
+    g_lfb_wc_entries = vmm_set_wc(lfb_phys, fb_size);
+    vmm_set_wc(DMAP_BASE + lfb_phys, fb_size);
+
     lfb = (uint32_t*)lfb_phys;
+
+    // Консоль живёт в tty_t, поэтому TTY1 надо поднять ДО первого kputs: иначе
+    // загрузочные сообщения и логотип уходили в никуда (буфера ещё нет)
+    tty_init_core();
 
     g_term_hook = 0;
     de_stream_idx = 0;
@@ -1375,6 +1597,11 @@ void kernel_main(void) {
     __asm__ volatile ("sti");
     tsc_calibrate();
 
+    // Процессор: паспорт, снятие запрета турбо и запрос максимальной частоты.
+    // Строго ПОСЛЕ init_user_mode(): там ставится настоящая таблица прерываний,
+    // а без неё #GP на отсутствующем MSR некому было бы перехватить.
+    cpu_init();
+
     //init_crash_guard_idt();
 
     init_mc_monitor();
@@ -1383,17 +1610,15 @@ void kernel_main(void) {
 
     render_boot_logo();
 
-    input_len = 0;
-    for (int i = 0; i < MAX_INPUT; i++) {
-        input_buffer[i] = '\0';
-    }
-
-    tty_init_core();
     sched_init();
-    init_ps2_mouse();
+    // init_ps2_mouse() теперь поднимает загрузчик (kernel_system_bootstrap),
+    // вместе с остальным железом и с отчётом о результате
 
     task_create_kernel(tty1_task_entry, "tty1_shell")->tty_id = 0;
-    kbd_layout = 0;
+
+    // storaged: горячее подключение USB, тома в /media и сторож корневой
+    // флешки (см. fs/mount.c). Создаётся после sched_init: это поток ядра.
+    mount_start();
 
     uint8_t cursor_visible = 1;
     uint32_t last_blink = 0;
@@ -1411,10 +1636,19 @@ void kernel_main(void) {
             // экраном владеет модуль (gfx_mode) или программа пишет кадры в /dev/fb0 — курсор консоли не трогаем
             int fb_busy = (g_fb_write_tty == tty_get_active_id()) && ((timer_ticks - g_fb_last_write_tick) < 2000);
             if (!(at && at->gfx_mode) && !fb_busy) {
-                draw_cursor(cursor_visible ? 0xFFFFFF : current_bg_color);
+                draw_cursor(cursor_visible ? CON_CURSOR : at->bg_color);
                 flush_dirty();
             }
             last_blink = timer_ticks;
+
+            // init: добираем сирот (родитель умер раньше ребёнка)
+            sched_reap_orphans();
+            smp_poll();                 // упавший на рабочем ядре поток снимает свой процесс
+
+            // Частота меряется по приросту APERF/MPERF, то есть нужен
+            // предыдущий замер. Снимаем его тут, раз в полсекунды: кто бы
+            // потом ни спросил, значение будет свежим, а не паспортным.
+            cpu_current_mhz();
         }
 
         sched_yield();

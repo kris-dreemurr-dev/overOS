@@ -4,6 +4,23 @@
 #include <stdint.h>
 #include "fs.h"
 
+// Запись каталога 8.3 (общая для FAT12/16/32; раньше жила в fat16.h)
+typedef struct {
+    char     filename[8];
+    char     ext[3];
+    uint8_t  attributes;
+    uint8_t  reserved;
+    uint8_t  creation_ms;
+    uint16_t creation_time;
+    uint16_t creation_date;
+    uint16_t last_access_date;
+    uint16_t cluster_high;
+    uint16_t modify_time;
+    uint16_t modify_date;
+    uint16_t cluster_low;
+    uint32_t file_size;
+} __attribute__((packed)) fat_dir_entry_t;
+
 // Структура загрузочного сектора (BPB) для FAT32
 typedef struct {
     uint8_t  jmp[3];
@@ -36,13 +53,28 @@ typedef struct {
     char     fs_type[8];
 } __attribute__((packed)) fat32_bpb_t;
 
-// API драйвера FAT32
-int      fat32_mount(int root_mode);
+// Тома: 0 -- корень, остальные -- съёмные накопители в /media (fs/mount.c)
+#define FAT32_MAX_VOLS 5
+void     fat32_select(int vol);                     // все fat32_* ниже работают с ним
+int      fat32_mount_vol(int vol, int disk, uint32_t lba);
+void     fat32_unmount_vol(int vol);
+void     fat32_detach_disk(int vol);
+int      fat32_vol_mounted(int vol);
+int      fat32_vol_disk(int vol);
+uint32_t fat32_vol_serial(int vol);
+void     fat32_vol_label(int vol, char* out, int max);
+
+// API драйвера FAT32 (выбранный том)
+// Размер тома в МБ без обхода таблицы FAT (быстро)
+uint32_t fat32_total_mb(void);
 int      fat32_touch(const char* name);
 void     fat32_dir(void);
 void     fat32_go_root(void);
 int      fat32_change_dir(const char* name);
 int      fat32_read_file(const char* name, void* out_buffer, uint32_t max_bytes);
+int      fat32_read_at(const char* name, uint32_t offset, void* out_buffer, uint32_t max_bytes);
+uint32_t fat32_file_size(const char* name);
+int      fat32_dir_exists(const char* path);
 int      fat32_write_file(const char* name, const void* in_buffer, uint32_t bytes_to_write);
 int      fat32_remove_file(const char* name);
 int      fat32_make_folder(const char* name);
@@ -50,7 +82,6 @@ int      fat32_file_exists(const char* name);
 int      fat32_is_mounted(void);
 int      fat32_get_dir_files(const char* path, fs_file_info_t* out_list, int max_files);
 const char* fat32_get_last_dir_name(void);
-static int fat32_entry_exists(const char* name);
 void fat32_get_stats(uint32_t* out_used_mb, uint32_t* out_total_mb);
 
 #endif

@@ -1,21 +1,44 @@
+// =============================================================================
+// ehci-msc.c — накопители (USB Mass Storage, Bulk-Only Transport) на EHCI.
+//
+// Раньше накопитель здесь был один, глобальный (g_msc), с одним признаком
+// "пропал" на всех. Теперь это таблица: у каждой флешки свой адрес на шине,
+// свои bulk-точки и свои переключатели DATA0/DATA1. Найденный накопитель
+// регистрируется в реестре дисков (drivers/blk.c) -- дальше система читает
+// его через blk_read и не знает, что под ним EHCI.
+//
+// BOT: CBW -> данные -> CSW, тот же, что в xhci-msc.c; транспорт -- очередь
+// qTD в асинхронном расписании.
+// =============================================================================
+
 #include "ehci-msc.h"
 #include "ehci.h"
+#include "usb.h"
+#include "../blk.h"
 
 extern void kdebug(const char* str, uint32_t color);
 extern void itoa(int n, char* str);
 extern void sleep_ms(uint32_t ms);
-extern void hex_str(uint32_t val, char* out);
 
 extern ehci_op_regs_t* op_regs;
 
-static ehci_msc_device_t g_msc;
-static uint32_t g_cbw_tag = 0x1000;
+typedef struct {
+    int      used;
+    int      gone;              // выдернули: на шину больше не ходим
+    uint8_t  addr;
+    int      root_port;
+    uint8_t  ep_in, ep_out;
+    uint16_t mps_in, mps_out;
+    uint8_t  tog_in, tog_out;   // Data Toggle для Bulk IN и Bulk OUT
+    uint32_t blocks, block_size;
+    uint32_t tag;
+    int      disk;              // номер в реестре дисков
+    char     vendor[9], product[17];
+} msc_dev_t;
 
-// Аппаратные состояния тумблеров Data Toggle для Bulk IN и Bulk OUT
-static uint8_t g_toggle_in  = 0;
-static uint8_t g_toggle_out = 0;
+static msc_dev_t s_msc[EHCI_MSC_MAX];
 
-// Выровненные DMA-дескрипторы и буферы
+// Выровненные DMA-дескрипторы и буферы: общие, обмен идёт по одному за раз
 static volatile ehci_qh_t  qh_bulk __attribute__((aligned(64)));
 static volatile ehci_qtd_t qtd_bulk __attribute__((aligned(32)));
 
@@ -26,6 +49,8 @@ static volatile uint8_t    msc_dma_buf[4096] __attribute__((aligned(4096)));
 // Перевод виртуального адреса Higher-Half в физический для DMA
 #define V2P(va) (((uintptr_t)(va) >= 0xFFFFFFFF80000000ULL) ? \
     (uint32_t)((uintptr_t)(va) - 0xFFFFFFFF80000000ULL) : \
+    ((uintptr_t)(va) >= 0xFFFF800000000000ULL) ? \
+    (uint32_t)((uintptr_t)(va) - 0xFFFF800000000000ULL) : \
     (uint32_t)(uintptr_t)(va))
 
 // Настоящий сброс кэш-линий процессора в ОЗУ (чтобы железо увидело данные)
@@ -39,18 +64,32 @@ static void msc_flush(volatile void* addr, uint32_t size) {
     __asm__ __volatile__("mfence" ::: "memory");
 }
 
-static int ehci_bulk_transfer(uint8_t ep, void* buffer, int len, int is_in) {
+// Флешку выдернули: на шину больше не ходим, все операции отказывают сразу.
+// Без этого каждая команда SCSI -- три передачи по пять секунд ожидания, и
+// система, читающая десятки секторов подряд, выглядела намертво зависшей.
+static int ehci_bulk_transfer(msc_dev_t* m, uint8_t ep, void* buffer, int len, int is_in) {
+    if (m->gone) return 0;
+    // Без поднятого контроллера сюда заходить нельзя. На ноутбуке, где BIOS
+    // переключён в режим "только xHCI", EHCI на шине нет вовсе: op_regs остаётся
+    // нулевым, а ожидание ниже читало единицы и висело вечно -- загрузка
+    // замирала на строке "Mounting Root File System..." без единого слова.
+    if (!op_regs || !m->addr) return 0;
+
     if (op_regs->usbcmd & (1 << 5)) {
         op_regs->usbcmd &= ~(1 << 5);
-        while (op_regs->usbsts & (1 << 15)) { }
+        for (int w = 0; w < 100000; w++) {          // не вечно: железо может молчать
+            if (!(op_regs->usbsts & (1 << 15))) break;
+        }
     }
+    // Корневой порт флешки пуст -- её выдернули (вместе с хабом, если он был)
+    if (!ehci_port_connected(m->root_port)) { m->gone = 1; return 0; }
 
     uint8_t ep_num = ep & 0x0F;
-    uint16_t max_pkt = is_in ? g_msc.max_packet_in : g_msc.max_packet_out;
+    uint16_t max_pkt = is_in ? m->mps_in : m->mps_out;
     if (max_pkt == 0) max_pkt = 512;
 
     // Берём актуальный тумблер для нужного направления
-    uint8_t toggle = is_in ? g_toggle_in : g_toggle_out;
+    uint8_t toggle = is_in ? m->tog_in : m->tog_out;
 
     // 1. Формируем qTD
     qtd_bulk.next_qtd = 1;
@@ -68,7 +107,7 @@ static int ehci_bulk_transfer(uint8_t ep, void* buffer, int len, int is_in) {
     // 2. Формируем QH: H=1 (Head), DTC=1 (взять тоггл из qTD), EPS=2 (High-Speed)
     qh_bulk.horizontal_link = V2P(&qh_bulk) | 0x02;
     qh_bulk.ep_caps[0] = (4 << 28) | ((uint32_t)max_pkt << 16) | (1 << 15) | (1 << 14) |
-                         (2 << 12) | ((uint32_t)ep_num << 8) | (g_msc.dev_addr & 0x7F);
+                         (2 << 12) | ((uint32_t)ep_num << 8) | (m->addr & 0x7F);
     qh_bulk.ep_caps[1] = (1 << 30);
     qh_bulk.current_qtd = 0;
     qh_bulk.next_qtd = V2P(&qtd_bulk);
@@ -86,7 +125,7 @@ static int ehci_bulk_transfer(uint8_t ep, void* buffer, int len, int is_in) {
     // 3. Запуск планировщика
     op_regs->asynclistaddr = V2P(&qh_bulk);
     op_regs->usbcmd |= (1 << 5);
-    while (!(op_regs->usbsts & (1 << 15))) { }
+    for (int w = 0; w < 100000 && !(op_regs->usbsts & (1 << 15)); w++) { }
 
     // 4. Ожидание завершения (увеличено для записи флеш-памяти)
     int timeout_ms = 5000;
@@ -100,9 +139,13 @@ static int ehci_bulk_transfer(uint8_t ep, void* buffer, int len, int is_in) {
         // Бит 6 = Halted, биты 5..1 = ошибки шины (Buffer Err, Babble, XactErr)
         if (token & 0x7E) {
             kdebug("  [!] Bulk Transfer Error/Halted (Device disconnected or STALL)!\n", 0xFF5555);
+            // Чистый STALL (только Halted) -- это ответ живого устройства. А вот
+            // ошибка транзакции, babble или ошибка буфера после всех повторов --
+            // признак того, что на том конце никого нет.
+            if (token & 0x38) m->gone = 1;
             // Останавливаем асинхронное расписание
             op_regs->usbcmd &= ~(1 << 5);
-            while (op_regs->usbsts & (1 << 15)) { }
+            for (int w = 0; w < 100000 && (op_regs->usbsts & (1 << 15)); w++) { }
             return 0;
         }
 
@@ -116,29 +159,33 @@ static int ehci_bulk_transfer(uint8_t ep, void* buffer, int len, int is_in) {
             uint32_t packets = (len + max_pkt - 1) / max_pkt;
             if (packets == 0) packets = 1;
             if (packets & 1) {
-                if (is_in) g_toggle_in ^= 1;
-                else       g_toggle_out ^= 1;
+                if (is_in) m->tog_in ^= 1;
+                else       m->tog_out ^= 1;
             }
 
             // Останавливаем асинхронное расписание
             op_regs->usbcmd &= ~(1 << 5);
-            while (op_regs->usbsts & (1 << 15)) { }
+            for (int w = 0; w < 100000 && (op_regs->usbsts & (1 << 15)); w++) { }
             return 1;
         }
     }
 
     kdebug("  [!] Bulk Transfer Timeout!\n", 0xFF5555);
+    // Пять секунд тишины -- устройство не отвечает. Дальше не ждём на каждой
+    // команде, а считаем его пропавшим; сторож проверит, вернулось ли оно.
+    m->gone = 1;
     op_regs->usbcmd &= ~(1 << 5);
-    while (op_regs->usbsts & (1 << 15)) { }
+    for (int w = 0; w < 100000 && (op_regs->usbsts & (1 << 15)); w++) { }
     return 0;
 }
 
+
 // BOT цикл: CBW -> Data Phase -> CSW
-static int msc_exec_command(void* cdb, uint8_t cdb_len, void* data, uint32_t data_len, int is_in) {
+static int msc_exec_command(msc_dev_t* m, void* cdb, uint8_t cdb_len, void* data, uint32_t data_len, int is_in) {
     for (int i = 0; i < (int)sizeof(usb_cbw_t); i++) ((uint8_t*)&g_cbw)[i] = 0;
 
     g_cbw.signature = CBW_SIGNATURE;
-    g_cbw.tag = ++g_cbw_tag;
+    g_cbw.tag = ++m->tag;
     g_cbw.data_transfer_len = data_len;
     g_cbw.flags = is_in ? CBW_FLAGS_IN : CBW_FLAGS_OUT;
     g_cbw.lun = 0;
@@ -146,212 +193,191 @@ static int msc_exec_command(void* cdb, uint8_t cdb_len, void* data, uint32_t dat
     for (int i = 0; i < cdb_len; i++) g_cbw.cmd[i] = ((uint8_t*)cdb)[i];
 
     msc_flush((void*)&g_cbw, sizeof(usb_cbw_t));
-    
+
     // Шаг 1: CBW через Bulk OUT
-    if (!ehci_bulk_transfer(g_msc.ep_out, (void*)&g_cbw, sizeof(usb_cbw_t), 0)) {
-        return 0;
-    }
+    if (!ehci_bulk_transfer(m, m->ep_out, (void*)&g_cbw, sizeof(usb_cbw_t), 0)) return 0;
 
     // Шаг 2: Данные (если есть)
     if (data_len > 0 && data) {
-        if (!ehci_bulk_transfer(is_in ? g_msc.ep_in : g_msc.ep_out, data, data_len, is_in)) {
-            return 0;
-        }
+        if (!ehci_bulk_transfer(m, is_in ? m->ep_in : m->ep_out, data, data_len, is_in)) return 0;
     }
 
     // Шаг 3: CSW через Bulk IN
     for (int i = 0; i < (int)sizeof(usb_csw_t); i++) ((uint8_t*)&g_csw)[i] = 0;
     msc_flush((void*)&g_csw, sizeof(usb_csw_t));
-    
-    if (!ehci_bulk_transfer(g_msc.ep_in, (void*)&g_csw, sizeof(usb_csw_t), 1)) {
-        return 0;
-    }
-
+    if (!ehci_bulk_transfer(m, m->ep_in, (void*)&g_csw, sizeof(usb_csw_t), 1)) return 0;
     msc_flush((void*)&g_csw, sizeof(usb_csw_t));
 
     if (g_csw.signature != CSW_SIGNATURE || g_csw.tag != g_cbw.tag || g_csw.status != 0) {
         kdebug("  [!] CSW Status Failure!\n", 0xFF5555);
         return 0;
     }
-
     return 1;
 }
 
-static int scsi_inquiry(void) {
-    uint8_t cdb[6] = { 0x12, 0, 0, 0, 36, 0 };
-    if (!msc_exec_command(cdb, 6, (void*)msc_dma_buf, 36, 1)) return 0;
-
-    char vendor[9], product[17], rev[5];
-    for (int i = 0; i < 8; i++) vendor[i] = msc_dma_buf[8 + i];
-    vendor[8] = '\0';
-    for (int i = 0; i < 16; i++) product[i] = msc_dma_buf[16 + i];
-    product[16] = '\0';
-    for (int i = 0; i < 4; i++) rev[i] = msc_dma_buf[32 + i];
-    rev[4] = '\0';
-
-    kdebug("  SCSI Vendor:  [", 0x55FF55); kdebug(vendor, 0xFFFF55); kdebug("]\n", 0x55FF55);
-    kdebug("  SCSI Product: [", 0x55FF55); kdebug(product, 0xFFFF55); kdebug("]\n", 0x55FF55);
-    kdebug("  SCSI Rev:     [", 0x55FF55); kdebug(rev, 0xFFFF55); kdebug("]\n", 0x55FF55);
+static int scsi_inquiry(msc_dev_t* m) {
+    uint8_t cdb[6] = { SCSI_INQUIRY, 0, 0, 0, 36, 0 };
+    if (!msc_exec_command(m, cdb, 6, (void*)msc_dma_buf, 36, 1)) return 0;
+    usb_inquiry_strings((const uint8_t*)msc_dma_buf, m->vendor, m->product);
+    kdebug("  SCSI: [", 0x55FF55); kdebug(m->vendor, 0xFFFF55); kdebug("] [", 0x55FF55);
+    kdebug(m->product, 0xFFFF55); kdebug("]\n", 0x55FF55);
     return 1;
 }
 
-static int scsi_read_capacity(void) {
-    uint8_t cdb[10] = { 0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-    if (!msc_exec_command(cdb, 10, (void*)msc_dma_buf, 8, 1)) return 0;
+// TEST UNIT READY: флешка после включения отвечает "не готова" раз-другой.
+// REQUEST SENSE снимает это состояние, иначе следующая команда тоже упадёт.
+static void scsi_wait_ready(msc_dev_t* m) {
+    for (int t = 0; t < 5; t++) {
+        uint8_t tur[6] = { SCSI_TEST_UNIT_READY, 0, 0, 0, 0, 0 };
+        if (msc_exec_command(m, tur, 6, 0, 0, 0)) return;
+        if (m->gone) return;
+        uint8_t rs[6] = { SCSI_REQUEST_SENSE, 0, 0, 0, 18, 0 };
+        msc_exec_command(m, rs, 6, (void*)msc_dma_buf, 18, 1);
+        sleep_ms(50);
+    }
+}
 
-    uint32_t last_lba = ((uint32_t)msc_dma_buf[0] << 24) | ((uint32_t)msc_dma_buf[1] << 16) | 
+static int scsi_read_capacity(msc_dev_t* m) {
+    uint8_t cdb[10] = { SCSI_READ_CAPACITY, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    if (!msc_exec_command(m, cdb, 10, (void*)msc_dma_buf, 8, 1)) return 0;
+
+    uint32_t last_lba = ((uint32_t)msc_dma_buf[0] << 24) | ((uint32_t)msc_dma_buf[1] << 16) |
                         ((uint32_t)msc_dma_buf[2] << 8)  | (uint32_t)msc_dma_buf[3];
-    uint32_t block_sz = ((uint32_t)msc_dma_buf[4] << 24) | ((uint32_t)msc_dma_buf[5] << 16) | 
+    uint32_t block_sz = ((uint32_t)msc_dma_buf[4] << 24) | ((uint32_t)msc_dma_buf[5] << 16) |
                         ((uint32_t)msc_dma_buf[6] << 8)  | (uint32_t)msc_dma_buf[7];
-
-    g_msc.total_blocks = last_lba + 1;
-    g_msc.block_size = block_sz;
-
-    uint32_t size_mb = (uint32_t)(((uint64_t)g_msc.total_blocks * block_sz) / (1024 * 1024));
+    m->blocks = last_lba + 1;
+    m->block_size = block_sz ? block_sz : 512;
 
     char buf[16];
-    kdebug("  Sector Size:  ", 0x55FF55); itoa(block_sz, buf); kdebug(buf, 0xFFFF55); kdebug(" bytes\n", 0);
-    kdebug("  Total Blocks: ", 0x55FF55); itoa(g_msc.total_blocks, buf); kdebug(buf, 0xFFFF55); kdebug("\n", 0);
-    kdebug("  Capacity:     ~", 0x55FF55); itoa(size_mb, buf); kdebug(buf, 0xFFFF55); kdebug(" MB\n", 0);
+    uint32_t size_mb = (uint32_t)(((uint64_t)m->blocks * m->block_size) / (1024 * 1024));
+    kdebug("  Capacity: ~", 0x55FF55); itoa(size_mb, buf); kdebug(buf, 0xFFFF55); kdebug(" MB\n", 0);
     return 1;
 }
 
-int ehci_msc_read_sectors(uint32_t lba, uint16_t count, void* out_buffer) {
-    if (count == 0 || !out_buffer) return 0;
+static void rw_cdb(uint8_t* cdb, uint8_t op, uint32_t lba, uint16_t cur) {
+    for (int i = 0; i < 10; i++) cdb[i] = 0;
+    cdb[0] = op;
+    cdb[2] = (lba >> 24) & 0xFF;
+    cdb[3] = (lba >> 16) & 0xFF;
+    cdb[4] = (lba >> 8) & 0xFF;
+    cdb[5] = lba & 0xFF;
+    cdb[7] = (cur >> 8) & 0xFF;
+    cdb[8] = cur & 0xFF;
+}
 
-    uint32_t sector_size = g_msc.block_size ? g_msc.block_size : 512;
+static msc_dev_t* msc_get(int h) {
+    if (h < 0 || h >= EHCI_MSC_MAX || !s_msc[h].used || !s_msc[h].blocks) return 0;
+    return &s_msc[h];
+}
+
+// Чтение порциями через физически непрерывный буфер msc_dma_buf
+static int msc_read(int h, uint32_t lba, uint32_t count, void* out_buffer) {
+    msc_dev_t* m = msc_get(h);
+    if (!m || m->gone) return -1;
+    usb_lock();
     uint8_t* dst = (uint8_t*)out_buffer;
-
-    // Читаем безопасно порциями через физически непрерывный буфер msc_dma_buf
-    uint16_t sectors_per_batch = sizeof(msc_dma_buf) / sector_size;
-
+    uint32_t per = sizeof(msc_dma_buf) / m->block_size;
+    int ret = 0;
     while (count > 0) {
-        uint16_t cur = (count > sectors_per_batch) ? sectors_per_batch : count;
-        uint32_t bytes = cur * sector_size;
-
-        uint8_t cdb[10] = {0};
-        cdb[0] = 0x28; // READ (10)
-        cdb[2] = (lba >> 24) & 0xFF;
-        cdb[3] = (lba >> 16) & 0xFF;
-        cdb[4] = (lba >> 8) & 0xFF;
-        cdb[5] = lba & 0xFF;
-        cdb[7] = (cur >> 8) & 0xFF;
-        cdb[8] = cur & 0xFF;
-
-        if (!msc_exec_command(cdb, 10, (void*)msc_dma_buf, bytes, 1)) {
-            return 0;
-        }
-
-        for (uint32_t i = 0; i < bytes; i++) {
-            dst[i] = msc_dma_buf[i];
-        }
-
+        uint32_t cur = (count > per) ? per : count;
+        uint32_t bytes = cur * m->block_size;
+        uint8_t cdb[10];
+        rw_cdb(cdb, SCSI_READ10, lba, (uint16_t)cur);
+        if (!msc_exec_command(m, cdb, 10, (void*)msc_dma_buf, bytes, 1)) { ret = -2; break; }
+        for (uint32_t i = 0; i < bytes; i++) dst[i] = msc_dma_buf[i];
         dst += bytes;
         lba += cur;
         count -= cur;
     }
-
-    return 1;
+    usb_unlock();
+    return ret;
 }
 
-// SCSI WRITE 10 (0x2A) с гарантированной изоляцией DMA через буфер
-int ehci_msc_write_sectors(uint32_t lba, uint16_t count, const void* in_buffer) {
-    if (count == 0 || !in_buffer) return 0;
-
-    uint32_t sector_size = g_msc.block_size ? g_msc.block_size : 512;
+// SCSI WRITE 10 с изоляцией DMA через тот же буфер
+static int msc_write(int h, uint32_t lba, uint32_t count, const void* in_buffer) {
+    msc_dev_t* m = msc_get(h);
+    if (!m || m->gone) return -1;
+    usb_lock();
     const uint8_t* src = (const uint8_t*)in_buffer;
-
-    uint16_t sectors_per_batch = sizeof(msc_dma_buf) / sector_size;
-
+    uint32_t per = sizeof(msc_dma_buf) / m->block_size;
+    int ret = 0;
     while (count > 0) {
-        uint16_t cur = (count > sectors_per_batch) ? sectors_per_batch : count;
-        uint32_t bytes = cur * sector_size;
-
-        // Копируем данные в наш DMA буфер перед отправкой
-        for (uint32_t i = 0; i < bytes; i++) {
-            msc_dma_buf[i] = src[i];
-        }
+        uint32_t cur = (count > per) ? per : count;
+        uint32_t bytes = cur * m->block_size;
+        for (uint32_t i = 0; i < bytes; i++) msc_dma_buf[i] = src[i];
         msc_flush((void*)msc_dma_buf, bytes);
-
-        uint8_t cdb[10] = {0};
-        cdb[0] = 0x2A; // WRITE (10)
-        cdb[2] = (lba >> 24) & 0xFF;
-        cdb[3] = (lba >> 16) & 0xFF;
-        cdb[4] = (lba >> 8) & 0xFF;
-        cdb[5] = lba & 0xFF;
-        cdb[7] = (cur >> 8) & 0xFF;
-        cdb[8] = cur & 0xFF;
-
-        // flags = 0 (Data OUT)
-        if (!msc_exec_command(cdb, 10, (void*)msc_dma_buf, bytes, 0)) {
-            return 0;
-        }
-
+        uint8_t cdb[10];
+        rw_cdb(cdb, SCSI_WRITE10, lba, (uint16_t)cur);
+        if (!msc_exec_command(m, cdb, 10, (void*)msc_dma_buf, bytes, 0)) { ret = -2; break; }
         src += bytes;
         lba += cur;
         count -= cur;
     }
-
-    return 1;
+    usb_unlock();
+    return ret;
 }
 
-int ehci_msc_init_device(uint8_t dev_addr, const uint8_t* cfg_desc, uint16_t cfg_len) {
-    g_msc.dev_addr = dev_addr;
-    g_msc.ep_in = 0;
-    g_msc.ep_out = 0;
+static int msc_present(int h) {
+    msc_dev_t* m = msc_get(h);
+    return m && !m->gone && ehci_port_connected(m->root_port);
+}
 
-    g_toggle_in = 0;
-    g_toggle_out = 0;
+static const blk_ops_t s_ops = { msc_read, msc_write, msc_present };
 
-    uint32_t off = 0;
-    while (off + 2 <= cfg_len) {
-        uint8_t len  = cfg_desc[off];
-        uint8_t type = cfg_desc[off + 1];
+int ehci_msc_attach(uint8_t dev_addr, int root_port, const uint8_t* cfg_desc, uint16_t cfg_len,
+                    uint16_t vid, uint16_t pid) {
+    int idx = -1;
+    for (int i = 0; i < EHCI_MSC_MAX; i++) if (!s_msc[i].used) { idx = i; break; }
+    if (idx < 0) return -1;
+    msc_dev_t* m = &s_msc[idx];
+    for (int i = 0; i < (int)sizeof(*m); i++) ((uint8_t*)m)[i] = 0;
+    m->addr = dev_addr;
+    m->root_port = root_port;
+    m->disk = -1;
+    m->tag = 0x1000;
+
+    for (uint32_t off = 0; off + 2 <= cfg_len; ) {
+        uint8_t len = cfg_desc[off], type = cfg_desc[off + 1];
         if (len == 0) break;
-
-        if (type == 0x05 && off + 7 <= cfg_len) {
+        if (type == USB_DESC_ENDPOINT && off + 7 <= cfg_len) {
             uint8_t ep_addr = cfg_desc[off + 2];
             uint8_t ep_attr = cfg_desc[off + 3];
             uint16_t max_pkt = cfg_desc[off + 4] | (cfg_desc[off + 5] << 8);
-
             if ((ep_attr & 0x03) == 0x02) {
-                if (ep_addr & 0x80) {
-                    g_msc.ep_in = ep_addr & 0x0F;
-                    g_msc.max_packet_in = max_pkt;
-                } else {
-                    g_msc.ep_out = ep_addr & 0x0F;
-                    g_msc.max_packet_out = max_pkt;
-                }
+                if (ep_addr & 0x80) { m->ep_in = ep_addr & 0x0F;  m->mps_in = max_pkt; }
+                else                { m->ep_out = ep_addr & 0x0F; m->mps_out = max_pkt; }
             }
         }
         off += len;
     }
-
-    if (!g_msc.ep_in || !g_msc.ep_out) {
+    if (!m->ep_in || !m->ep_out) {
         kdebug("  [!] Bulk IN/OUT endpoints not found!\n", 0xFF5555);
-        return 0;
+        return -1;
     }
 
-    kdebug("\n[MSC] Bulk Endpoints Configured:\n", 0x55FFFF);
-    char buf[16];
-    kdebug("  Bulk IN:  EP ", 0xAAAAAA); itoa(g_msc.ep_in, buf); kdebug(buf, 0x55FF55);
-    kdebug(" (MaxPacket: ", 0xAAAAAA); itoa(g_msc.max_packet_in, buf); kdebug(buf, 0x55FF55); kdebug(")\n", 0);
-    kdebug("  Bulk OUT: EP ", 0xAAAAAA); itoa(g_msc.ep_out, buf); kdebug(buf, 0x55FF55);
-    kdebug(" (MaxPacket: ", 0xAAAAAA); itoa(g_msc.max_packet_out, buf); kdebug(buf, 0x55FF55); kdebug(")\n", 0);
+    m->used = 1;
+    if (!scsi_inquiry(m)) { kdebug("  [!] SCSI INQUIRY failed!\n", 0xFF5555); m->used = 0; return -1; }
+    scsi_wait_ready(m);
+    if (!scsi_read_capacity(m)) { kdebug("  [!] SCSI READ CAPACITY failed!\n", 0xFF5555); m->used = 0; return -1; }
 
-    if (!scsi_inquiry()) {
-        kdebug("  [!] SCSI INQUIRY failed!\n", 0xFF5555);
-        return 0;
-    }
-
-    if (!scsi_read_capacity()) {
-        kdebug("  [!] SCSI READ CAPACITY failed!\n", 0xFF5555);
-        return 0;
-    }
-
-    return 1;
+    m->disk = blk_add(&s_ops, idx, BLK_BUS_EHCI, vid, pid, m->blocks, m->block_size, m->vendor, m->product);
+    return idx;
 }
 
-ehci_msc_device_t* ehci_msc_get_device(void) {
-    return &g_msc;
+void ehci_msc_detach(int idx) {
+    if (idx < 0 || idx >= EHCI_MSC_MAX || !s_msc[idx].used) return;
+    msc_dev_t* m = &s_msc[idx];
+    m->gone = 1;
+    if (m->disk >= 0) blk_gone(m->disk);
+    m->used = 0;
+}
+
+int ehci_msc_is_gone(int idx) {
+    return idx >= 0 && idx < EHCI_MSC_MAX && s_msc[idx].used && s_msc[idx].gone;
+}
+
+int ehci_msc_alive_count(void) {
+    int n = 0;
+    for (int i = 0; i < EHCI_MSC_MAX; i++) if (s_msc[i].used && !s_msc[i].gone && s_msc[i].blocks) n++;
+    return n;
 }

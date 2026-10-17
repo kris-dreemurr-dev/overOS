@@ -15,6 +15,15 @@
 
 MENU_ENTRY      equ 0x2000          ; menu_main() из vbe_menu.c (первая функция в stage2_menu.ld)
 
+; Карта физической памяти от BIOS (INT 15h, EAX=E820). Кладём её в свободную
+; низкую память: 0x5000-0x57FF занял загрузчик FAT, 0x7000/0x8000 — блоки VBE,
+; 0x7E00 — буфер диска. Остаётся 0x5800-0x7000, нам хватает с запасом.
+;   [0x5800]        dword  — сколько записей получилось
+;   [0x5810 + n*24] запись — base(8) length(8) type(4) attr(4)
+E820_COUNT      equ 0x5800
+E820_LIST       equ 0x5810
+E820_MAX        equ 96
+
 stage2_start:
     cli
     cld
@@ -45,6 +54,10 @@ stage2_start:
     mov si, msg_init_sys
     call print
 
+    ; Карта памяти от BIOS — до всего остального: INT 15h работает только в
+    ; реальном режиме, а знать реальный объём ОЗУ ядру надо обязательно.
+    call detect_memory
+
     ; A20 + Unreal Mode (boot_fat32.asm)
     call enable_a20
     call enter_unreal
@@ -71,6 +84,50 @@ stage2_start:
     or al, 1
     mov cr0, eax
     jmp 0x08:pm_start
+
+; -----------------------------------------------------------------------------
+; Карта физической памяти: INT 15h, EAX=0xE820
+; -----------------------------------------------------------------------------
+detect_memory:
+    pusha
+    push es
+    xor ax, ax
+    mov es, ax
+    mov dword [E820_COUNT], 0
+    mov di, E820_LIST
+    xor ebx, ebx                    ; продолжение обхода: 0 = начать сначала
+    xor bp, bp                      ; сколько записей уже сложили
+.next:
+    mov eax, 0x0000E820
+    mov edx, 0x534D4150             ; 'SMAP'
+    mov ecx, 24
+    mov dword [es:di + 20], 1       ; ACPI 3.0: если BIOS не тронет — считаем запись годной
+    int 0x15
+    jc .done                        ; CF после первого вызова = обход закончен
+    cmp eax, 0x534D4150
+    jne .done
+    jcxz .skip                      ; пустой ответ
+    cmp cl, 20
+    jbe .store                      ; BIOS старого образца, атрибутов нет
+    test byte [es:di + 20], 1       ; ACPI 3.0: бит 0 сброшен = запись игнорировать
+    jz .skip
+.store:
+    mov eax, [es:di + 8]            ; длина == 0 — такую запись тоже выбрасываем
+    or  eax, [es:di + 12]
+    jz .skip
+    inc bp
+    add di, 24
+.skip:
+    test ebx, ebx                   ; EBX == 0 — записей больше нет
+    jz .done
+    cmp bp, E820_MAX
+    jb .next
+.done:
+    movzx eax, bp
+    mov [E820_COUNT], eax
+    pop es
+    popa
+    ret
 
 ; -----------------------------------------------------------------------------
 ; Вывод строки через BIOS и пауза

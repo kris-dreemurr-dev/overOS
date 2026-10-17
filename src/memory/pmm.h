@@ -6,6 +6,21 @@
 
 #define PAGE_SIZE 4096
 
+// Карта памяти от BIOS: stage2 кладёт её сюда до перехода в защищённый режим
+#define E820_COUNT_ADDR 0x5800
+#define E820_LIST_ADDR  0x5810
+#define E820_USABLE     1
+
+typedef struct {
+    uint64_t base;
+    uint64_t length;
+    uint32_t type;
+    uint32_t attr;
+} __attribute__((packed)) e820_entry_t;
+
+// Сколько физической памяти нашлось всего (байт)
+extern uint64_t g_ram_bytes;
+
 // Инициализация PMM (передаем размер доступной памяти в байтах)
 void pmm_init(uint64_t mem_size_bytes);
 

@@ -74,22 +74,10 @@ static uint32_t get_actual_mhz(void) {
     return ratio * 100;
 }
 
-// -------------------------------------------------- Безопасный батут для ядер
-static const uint8_t ap_trampoline_bin[] = {
-    0xFA,                         // [0x00] cli
-    0x31, 0xC0,                   // [0x01] xor ax, ax
-    0x8E, 0xD8,                   // [0x03] mov ds, ax
-    // burn_loop:
-    0x80, 0x3E, 0x20, 0x80, 0x00, // [0x05] cmp byte [0x8020], 0
-    0x75, 0x0A,                   // [0x0A] jne halt_core (прыжок на 10 байт вперед -> к hlt)
-    0x05, 0x37, 0x13,             // [0x0C] add ax, 0x1337
-    0x31, 0xC2,                   // [0x0F] xor dx, ax
-    0xC1, 0xC2, 0x03,             // [0x11] rol dx, 3
-    0xEB, 0xEF,                   // [0x14] jmp burn_loop (прыжок ровно на 0x05!)
-    // halt_core:
-    0xF4,                         // [0x16] hlt
-    0xEB, 0xFD                    // [0x17] jmp halt_core
-};
+// ------------------------------------------- Батут для дополнительных ядер (AP)
+// Код собирается из src/modules/asm/ap_burn.asm (tools/bin2h.py -> build/ap_burn.h):
+// переходы считает ассемблер, а не человек в комментариях к опкодам.
+#include "ap_burn.h"
 
 static void boot_all_cpu_cores(const devos_api_t* api, uint32_t total_cores) {
     api->kputs("[SMP] Injecting verified AP burn loop at 0x00008000...\n", 0xAAAAAA);

@@ -22,7 +22,8 @@ typedef enum {
 typedef struct task {
     uint64_t        rsp;           // Смещение 0: текущий стек (для switch.asm)[cite: 16]
     uint64_t        cr3;           // Смещение 8: физ. адрес PML4 (для switch.asm)[cite: 16]
-    uint64_t        kstack_top;    // Смещение 16: вершина стека[cite: 16]
+    uint64_t        fpu;           // Смещение 16: адрес области FXSAVE (для switch.asm)
+    uint64_t        kstack_top;    // вершина стека[cite: 16]
     uint64_t        kstack_bottom; // Физическое начало стека в RAM[cite: 16]
     uint64_t        mem_size;      // Выделенная память (в байтах)[cite: 16]
     uint64_t        pid;           // Идентификатор процесса[cite: 16]
@@ -49,19 +50,55 @@ typedef struct task {
     int             is_process;    // 1 = процесс Ring 3, а не поток ядра
     uint64_t        user_entry;    // стартовый RIP в Ring 3
     uint64_t        user_stack_top;// стартовый RSP в Ring 3
+
+    // Учётные данные (UNIX DAC): наследуются при spawn/fork, меняются через setuid/login
+    int             uid;
+    int             gid;
+
+    // Ожидание в TASK_SLEEPING: планировщик сам будит по времени и/или по сообщению IPC
+    char            arg[128];      // аргумент запуска (путь к файлу для notepad и т.п.), sys_get_arg
+    uint32_t        wake_tick;     // timer_ticks, когда проснуться (WAIT_TIMER)
+    uint8_t         wait_flags;    // WAIT_*
+    volatile uint8_t ipc_pending;  // в почтовом ящике есть сообщения
+    uint8_t         mm_freed;      // память зомби уже отдана (см. sched_release_mm)
+    // Сколько тиков таймера (а он идёт на 1000 Гц, то есть миллисекунд)
+    // процессор отработал на этой задаче. Начисляет timer_isr_handler тому,
+    // кто был на процессоре в момент прерывания, — так же считает загрузку
+    // /proc/stat в Linux. Отсюда проценты в диспетчере задач.
+    uint64_t        cpu_ticks;
+    // Полный путь к исполняемому файлу (как /proc/<pid>/exe): по нему рабочий
+    // стол берёт из .prg имя и значок программы -- для окна, панели и
+    // уведомлений. Подделать нельзя: пишет его загрузчик, а не программа.
+    char            exe[96];
+    uint8_t         fpu_state[512] __attribute__((aligned(16)));
 } task_t;
+
+// switch.asm читает rsp, cr3 и fpu по жёстко зашитым смещениям — проверяем их
+// на этапе компиляции, иначе новое поле тихо испортило бы переключение задач
+typedef char task_offsets_check[
+    (offsetof(task_t, rsp) == 0 && offsetof(task_t, cr3) == 8 && offsetof(task_t, fpu) == 16) ? 1 : -1];
+
+
+#define WAIT_TIMER 0x01
+#define WAIT_IPC   0x02
 
 // Ядерный стек самостоятельного процесса (sched_spawn_process, sys_fork)
 #define PROC_KSTACK_SIZE (64 * 1024)
 
 int  sched_tty_is_active(void);
 
+void sched_task_fpu_capture(task_t* t);
 void sched_init(void);
 task_t* task_create_kernel(void (*entry)(void), const char* name);
 void sched_yield(void);
 
 // Функция диспетчера задач
 void sched_dump_tasks(void);
+
+// Путь к исполняемому файлу процесса pid (sys_proc_exe). 0 -- нашёлся.
+int  sched_proc_exe(uint64_t pid, char* out, int max);
+// Запомнить путь к исполняемому файлу (относительный -- от каталога cwd)
+void sched_set_exe(task_t* t, const char* path, const char* cwd);
 
 extern void switch_to(task_t* prev, task_t* next);
 
@@ -75,6 +112,7 @@ void    sched_remove_user_task(task_t* task);
 task_t* task_create_user_process(void (*entry_point)(void), uint64_t cr3_val, const char* name);
 
 // Процессы (модель Unix: spawn + wait + exit)
+void sched_start_process(task_t* t);   // пустить на выполнение созданный процесс
 task_t* sched_spawn_process(const char* name, uint64_t cr3, uint64_t mem_size,
                             uint64_t user_entry, uint64_t user_stack_top, uint64_t heap_start);
 int     sched_wait_child(task_t* child);   // родитель спит до завершения; освобождает всё, возвращает код выхода
@@ -108,8 +146,34 @@ void sched_set_foreground_task(task_t* t);
 task_t* sched_get_foreground_task(void);
 
 // Неблокирующий сбор завершившегося потомка (для sys_waitpid и очистки зомби)
+// Запись таблицы задач для ps(1) в Ring 3
+typedef struct {
+    int      pid;
+    int      uid;
+    int      tty;          // -1 — поток ядра без TTY
+    int      state;        // TASK_*
+    int      is_process;   // 1 — процесс Ring 3, 0 — поток ядра
+    uint32_t mem_kb;
+    uint64_t cpu_ms;       // процессорное время с момента запуска (тик = 1 мс)
+    char     name[16];
+} sched_proc_info_t;
+
+int sched_task_list(sched_proc_info_t* out, int max);
+
 int sched_reap_zombie(task_t* parent, int target_pid, int* out_code);
+// init-сборка сирот: зомби без живого родителя (возвращает, сколько собрал)
+int sched_reap_orphans(void);
+// Отдать память завершившегося процесса, не дожидаясь wait() от родителя
+void sched_release_mm(task_t* t);
+// Только адресное пространство и файлы (ядерный стек остаётся): зовётся на выходе
+void sched_release_space(task_t* t);
 
 int sched_pid_alive(uint64_t pid);
+int sched_pid_uid(uint64_t pid);
+int sched_pid_is_process(uint64_t pid);
+// Пришло сообщение IPC: отметить и разбудить, если задача спит в ожидании сообщения
+void sched_wake_ipc(uint64_t pid);
+// Уснуть на ms миллисекунд (задача не выбирается планировщиком, процессор простаивает)
+void sched_sleep_ms(uint32_t ms);
 
 #endif

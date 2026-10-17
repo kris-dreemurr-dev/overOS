@@ -55,6 +55,50 @@ static void print_hex(uint32_t val, uint32_t color) {
     kdebug(hex_str, color);
 }
 
+// Сколько устройств реально отвечает на шине (для отчёта загрузчика)
+int pci_count_devices(void) {
+    int n = 0;
+    for (uint16_t bus = 0; bus < 256; bus++) {
+        for (uint8_t slot = 0; slot < 32; slot++) {
+            for (uint8_t func = 0; func < 8; func++) {
+                uint32_t vd = pci_config_read((uint8_t)bus, slot, func, 0x00);
+                if ((vd & 0xFFFF) == 0xFFFF) continue;
+                n++;
+                if (func == 0) {
+                    uint32_t hdr = pci_config_read((uint8_t)bus, slot, 0, 0x0C);
+                    if (!((hdr >> 16) & 0x80)) break;      // не многофункциональное
+                }
+            }
+        }
+    }
+    return n;
+}
+
+// Контроллер USB заданного типа: 0x20 — EHCI, 0x30 — xHCI, 0x10 — OHCI, 0x00 — UHCI.
+// Нужен для выбора драйвера: при наличии и xHCI, и EHCI берём первый.
+int pci_find_usb_by_progif(uint8_t prog_if, pci_device_t* out) {
+    for (uint16_t bus = 0; bus < 256; bus++) {
+        for (uint8_t slot = 0; slot < 32; slot++) {
+            for (uint8_t func = 0; func < 8; func++) {
+                uint32_t vd = pci_config_read((uint8_t)bus, slot, func, 0x00);
+                if ((vd & 0xFFFF) == 0xFFFF) continue;
+                uint32_t cr = pci_config_read((uint8_t)bus, slot, func, 0x08);
+                if (((cr >> 24) & 0xFF) != 0x0C || ((cr >> 16) & 0xFF) != 0x03) continue;
+                if (((cr >> 8) & 0xFF) != prog_if) continue;
+                if (out) {
+                    out->bus = (uint8_t)bus; out->slot = slot; out->func = func;
+                    out->base_class = 0x0C; out->subclass = 0x03; out->prog_if = prog_if;
+                    out->vendor_id = (uint16_t)(vd & 0xFFFF);
+                    out->device_id = (uint16_t)(vd >> 16);
+                    out->bar0 = pci_config_read((uint8_t)bus, slot, func, 0x10);
+                }
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 void pci_scan_all(void) {
     kdebug("\n=== Scanning PCI Bus (Audio & USB) ===\n", 0x55FFFF);
 
@@ -252,4 +296,118 @@ void pci_enable_bus_master(const pci_device_t* dev) {
     cmd |= (1U << 1) | (1U << 2);
     
     pci_config_write(dev->bus, dev->slot, dev->func, 0x04, cmd);
+}
+// =============================================================================
+// lspci — что стоит на шине. Нужна была для Wi-Fi: пока мы не знаем, какой
+// именно чип в ноутбуке, писать драйвер не для чего, а база имён устройств
+// (у Linux это pci.ids на мегабайт) нам не по карману. Поэтому печатаем то же,
+// что показывает `lspci -nn`: адрес, класс и пару vendor:device, плюс
+// идентификатор подсистемы для сетевых карт — у Intel именно он отличает
+// конкретный модуль (AX200 от AX201 и так далее).
+// =============================================================================
+static const struct { uint16_t id; const char* name; } s_pci_vendors[] = {
+    { 0x8086, "Intel" },        { 0x8087, "Intel" },       { 0x10EC, "Realtek" },
+    { 0x14E4, "Broadcom" },     { 0x168C, "Qualcomm Atheros" },
+    { 0x17CB, "Qualcomm" },     { 0x1969, "Atheros" },     { 0x14C3, "MediaTek" },
+    { 0x1814, "Ralink/MediaTek" }, { 0x10DE, "NVIDIA" },   { 0x1002, "AMD/ATI" },
+    { 0x1022, "AMD" },          { 0x1B21, "ASMedia" },     { 0x11AB, "Marvell" },
+    { 0x197B, "JMicron" },      { 0x1106, "VIA" },         { 0x144D, "Samsung" },
+    { 0x15B7, "SanDisk" },      { 0x1C5C, "SK hynix" },    { 0x126F, "Silicon Motion" },
+    { 0x1AF4, "Virtio" },       { 0x1234, "QEMU" },       { 0x1B36, "Red Hat/QEMU" },        { 0x15AD, "VMware" },
+    { 0x80EE, "VirtualBox" },   { 0x1D6A, "Aquantia" },    { 0x1A3B, "AzureWave" },
+};
+
+static const char* pci_vendor_name(uint16_t v) {
+    for (unsigned i = 0; i < sizeof(s_pci_vendors) / sizeof(s_pci_vendors[0]); i++)
+        if (s_pci_vendors[i].id == v) return s_pci_vendors[i].name;
+    return "";
+}
+
+static const char* pci_class_name(uint8_t c, uint8_t s) {
+    switch (c) {
+        case 0x00: return "Unclassified";
+        case 0x01:
+            if (s == 0x01) return "IDE";
+            if (s == 0x06) return "SATA";
+            if (s == 0x08) return "NVMe";
+            return "Mass storage";
+        case 0x02: return (s == 0x00) ? "Ethernet" : "Network (Wi-Fi?)";
+        case 0x03: return "VGA/Display";
+        case 0x04: return (s == 0x03) ? "Audio (HDA)" : "Multimedia";
+        case 0x05: return "Memory";
+        case 0x06:
+            if (s == 0x00) return "Host bridge";
+            if (s == 0x01) return "ISA bridge";
+            if (s == 0x04) return "PCI bridge";
+            return "Bridge";
+        case 0x07: return "Communication";
+        case 0x08: return "System peripheral";
+        case 0x09: return "Input";
+        case 0x0B: return "Processor";
+        case 0x0C:
+            if (s == 0x03) return "USB";
+            if (s == 0x05) return "SMBus";
+            return "Serial bus";
+        case 0x0D: return "Wireless (BT/other)";
+        case 0x10: return "Encryption";
+        case 0x11: return "Signal processing";
+        default:   return "Device";
+    }
+}
+
+static void pci_put_hex(uint32_t val, int digits, uint32_t color) {
+    char buf[9];
+    const char* hex = "0123456789abcdef";
+    for (int i = digits - 1; i >= 0; i--) { buf[i] = hex[val & 0xF]; val >>= 4; }
+    buf[digits] = '\0';
+    kputs(buf, color);
+}
+
+void cmd_lspci(void) {
+    int wifi_found = 0;
+    for (uint16_t bus = 0; bus < 256; bus++) {
+        for (uint8_t slot = 0; slot < 32; slot++) {
+            for (uint8_t func = 0; func < 8; func++) {
+                uint32_t vd = pci_config_read((uint8_t)bus, slot, func, 0x00);
+                uint16_t vid = (uint16_t)(vd & 0xFFFF);
+                if (vid == 0xFFFF) {
+                    if (func == 0) break;
+                    continue;
+                }
+                uint16_t did = (uint16_t)(vd >> 16);
+                uint32_t cr  = pci_config_read((uint8_t)bus, slot, func, 0x08);
+                uint8_t  bc  = (uint8_t)((cr >> 24) & 0xFF);
+                uint8_t  sc  = (uint8_t)((cr >> 16) & 0xFF);
+                uint32_t sub = pci_config_read((uint8_t)bus, slot, func, 0x2C);
+
+                int net = (bc == 0x02);
+                uint32_t col = net ? 0x55FF55 : 0xFFFFFF;
+
+                pci_put_hex(bus, 2, 0xAAAAAA);  kputs(":", 0xAAAAAA);
+                pci_put_hex(slot, 2, 0xAAAAAA); kputs(".", 0xAAAAAA);
+                pci_put_hex(func, 1, 0xAAAAAA); kputs(" ", 0);
+                kputs(pci_class_name(bc, sc), col);
+                kputs(" [", 0xAAAAAA); pci_put_hex(bc, 2, 0xAAAAAA);
+                pci_put_hex(sc, 2, 0xAAAAAA); kputs("]: ", 0xAAAAAA);
+                const char* vn = pci_vendor_name(vid);
+                if (vn[0]) { kputs(vn, col); kputs(" ", 0); }
+                pci_put_hex(vid, 4, col); kputs(":", col); pci_put_hex(did, 4, col);
+                if (net) {
+                    kputs("  подсистема ", 0xAAAAAA);
+                    pci_put_hex(sub & 0xFFFF, 4, 0xFFFFFF); kputs(":", 0xFFFFFF);
+                    pci_put_hex(sub >> 16, 4, 0xFFFFFF);
+                    if (sc != 0x00) wifi_found = 1;
+                }
+                kputs("\n", 0);
+
+                if (func == 0) {
+                    uint32_t hdr = pci_config_read((uint8_t)bus, slot, 0, 0x0C);
+                    if (!((hdr >> 16) & 0x80)) break;   // не многофункциональное
+                }
+            }
+        }
+    }
+    kputs(wifi_found ? "\nWi-Fi: карта на шине есть (строка Network выше).\n"
+                     : "\nWi-Fi: карты на шине PCI не видно.\n",
+          wifi_found ? 0x55FF55 : 0xFFFF55);
 }
